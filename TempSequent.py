@@ -3268,6 +3268,71 @@ def capture_clipboard_variable(app, action):
     return {'variable': bare, 'scope': scope, 'length': len(contents)}
 
 
+def apply_clipboard_keyword_rules(app, action, clipboard_text=None):
+    """Match clipboard phrases to stored values and scoped destinations.
+
+    New keyword_rules are ordered rows with keyword, value, optional var_name
+    and var_scope. Best Match selects the longest matching keyword (then the
+    earliest row). All Matches writes one result per distinct destination;
+    the most specific rule wins if multiple rules share a destination.
+
+    Actions saved before rules existed keep the old keywords/value meaning.
+    Nothing is overwritten on a miss. Never log the clipboard or matched value.
+    """
+    if clipboard_text is None:
+        clipboard_text = get_clipboard_text()
+    text = str(clipboard_text or '').casefold()
+    default_name = action.get('var_name', 'status')
+    default_scope = action.get('var_scope')
+    rows = action.get('keyword_rules')
+    if rows is None:
+        # Preserve every existing legacy preset with no keyword_rules key.
+        rows = [{'keyword': word, 'value': action.get('value', '')}
+                for word in action.get('keywords', []) if str(word).strip()]
+    if not isinstance(rows, list):
+        raise MacroExecutionError('Clipboard keyword rules must be a list')
+    matches = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise MacroExecutionError(f'Clipboard keyword rule #{index + 1} is invalid')
+        keyword = str(row.get('keyword', '')).strip()
+        if not keyword:
+            # Empty rules cannot match everything; reject malformed presets.
+            raise MacroExecutionError(f'Clipboard keyword rule #{index + 1} has no keyword')
+        name = str(row.get('var_name') or default_name)
+        scope_override = row.get('var_scope')
+        scope = default_scope if scope_override in (None, '', 'default') else scope_override
+        bare_name, actual_scope = variable_identity(name, scope)
+        value = str(row.get('value', ''))
+        if keyword.casefold() in text:
+            matches.append((-len(keyword), index, bare_name, actual_scope, value, keyword))
+    if not matches:
+        return []
+    matches.sort()  # Most specific matching keyword wins; original order breaks ties.
+    match_mode = str(action.get('match_mode', 'best')).strip().lower()
+    if match_mode not in ('best', 'all'):
+        raise MacroExecutionError(f'Unknown clipboard keyword match mode: {match_mode!r}')
+    winners = []
+    seen = set()
+    for _, _, name, scope, value, keyword in matches:
+        key = (scope, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        winners.append((name, scope, value, keyword))
+        if match_mode == 'best':
+            break
+    # Validate all matches before changing any state. A global file error
+    # must not allow the action to silently succeed as if everything saved.
+    if any(scope == 'global' for _, scope, _, _ in winners):
+        _read_global_values(app)
+    results = []
+    for name, scope, value, keyword in winners:
+        set_variable(app, name, value, scope)
+        results.append({'variable': name, 'scope': scope, 'keyword': keyword})
+    return results
+
+
 def get_required_variable_for_typing(app, name, scope=None):
     """Return a real value, not a silent empty string on a missing variable.
 
@@ -3920,7 +3985,7 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
-            ("Read Clipboard", "Save copied text to a Local/Global variable, or check keywords.", "RC"),
+            ("Read Clipboard", "Capture text or route clipboard keywords to scoped variables.", "RC"),
             ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
@@ -5251,17 +5316,16 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def _render_read_clipboard_view(self, line_num, edit_idx=None):
-        """Capture the exact clipboard text, or edit a legacy keyword check."""
+        """Clipboard text capture and editable keyword -> value routing rules."""
         body = self.action_content_frame
         current = (self.app.recorded_actions[edit_idx]
                    if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                    else None)
-        # Existing actions with no mode were keyword checks, not text captures.
-        initial_mode = (current.get('mode', 'keywords') if current else 'capture')
+        initial_mode = current.get('mode', 'keywords') if current else 'capture'
         if initial_mode not in ('capture', 'keywords'):
             initial_mode = 'keywords'
         labels = {'capture': 'Save Entire Clipboard Text',
-                  'keywords': 'Check Keywords (Legacy)'}
+                  'keywords': 'Check Keywords (Rules)'}
         tk.Label(body, text='Clipboard Operation:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
         mode_var = tk.StringVar(value=labels[initial_mode])
@@ -5272,51 +5336,140 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        tk.Label(body, text='Variable Name:', font=('Segoe UI', 8, 'bold'),
+        tk.Label(body, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
         var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                              font=('Consolas', 9, 'bold'),
                              insertbackground=TEXT_PRIMARY, bd=0,
                              highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=3)
-        existing_name = (current.get('var_name', 'clipboard_text')
-                         if current else 'clipboard_text')
+        default_new = 'status' if initial_mode == 'keywords' else 'clipboard_text'
+        existing_name = current.get('var_name', default_new) if current else default_new
         var_entry.insert(0, variable_identity(existing_name,
                               current.get('var_scope') if current else None)[0])
         scope_var = self._add_variable_scope_picker(body, current)
 
-        tk.Label(body, text='The clipboard is read when this action runs. '
-                 'Its text is stored exactly as copied (including spaces and line breaks). '
-                 'Only Unicode text is supported; empty/unavailable text will stop '
-                 'the action without overwriting a saved value.',
-                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
-                 wraplength=450, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 8))
+        help_label = tk.Label(body, font=('Segoe UI', 8), bg=BG_PANEL,
+                              fg=TEXT_MUTED, wraplength=450, justify=tk.LEFT)
+        help_label.pack(fill=tk.X, pady=(0, 8))
 
-        # Legacy feature remains editable; a fixed layout anchor keeps its
-        # controls above the Save button even after switching modes repeatedly.
+        # The action editor already has a vertical scroll area. Dynamic rule
+        # cards live inside that scrollable body; Add/Remove works at any size.
         keyword_anchor = tk.Frame(body, bg=BG_PANEL, height=1)
         keyword_anchor.pack(fill=tk.X)
         keyword_frame = tk.Frame(body, bg=BG_PANEL)
-        tk.Label(keyword_frame, text='Keywords to find (comma separated):',
+        tk.Label(keyword_frame, text='Keyword Routing Rules',
+                 font=('Segoe UI', 10, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_PRIMARY).pack(anchor='w', pady=(2, 3))
+        tk.Label(keyword_frame,
+                 text='Case-insensitive phrase matching. More specific (longer) matches take priority. '
+                      'Blank destination uses the default variable above.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=430, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
+        tk.Label(keyword_frame, text='If the clipboard matches multiple rules:',
                  font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
-                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
-        kw_entry = tk.Entry(keyword_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
-                            font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
-                            bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        kw_entry.pack(fill=tk.X, ipady=2, pady=(0, 7))
-        kw_entry.insert(0, ', '.join(current.get('keywords', []))
-                        if current else 'Please Scrap, Please Return')
-        tk.Label(keyword_frame, text='Value to store when a keyword matches:',
-                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
-                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
-        val_entry = tk.Entry(keyword_frame, bg=BG_INPUT, fg=SYNTAX_GREEN,
-                             font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
-                             bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        val_entry.pack(fill=tk.X, ipady=2, pady=(0, 8))
-        val_entry.insert(0, current.get('value', 'RTS') if current else 'RTS')
+                 fg=TEXT_MUTED).pack(anchor='w')
+        match_labels = {'best': 'Best Match (one value)',
+                        'all': 'All Matches (distinct variables)'}
+        saved_match_mode = current.get('match_mode', 'best') if current else 'best'
+        match_var = tk.StringVar(value=match_labels.get(saved_match_mode, match_labels['best']))
+        match_menu = tk.OptionMenu(keyword_frame, match_var, *match_labels.values())
+        match_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                          highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+        match_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
+        match_menu.pack(fill=tk.X, pady=(3, 8))
+
+        cards = tk.Frame(keyword_frame, bg=BG_PANEL)
+        cards.pack(fill=tk.X)
+        rule_rows = []
+
+        def add_rule(keyword='', value='', dest='', rule_scope='default'):
+            card = tk.Frame(cards, bg=BG_INPUT, highlightbackground=BG_BORDER,
+                            highlightthickness=1, padx=9, pady=7)
+            card.pack(fill=tk.X, pady=(0, 8))
+            heading = tk.Frame(card, bg=BG_INPUT)
+            heading.pack(fill=tk.X, pady=(0, 5))
+            title = tk.Label(heading, text='', font=('Segoe UI', 9, 'bold'),
+                             fg=TEXT_PRIMARY, bg=BG_INPUT)
+            title.pack(side=tk.LEFT)
+            record = {'card':card, 'title':title}
+
+            def remove():
+                rule_rows.remove(record)
+                card.destroy()
+                for idx, item in enumerate(rule_rows, 1):
+                    item['title'].config(text=f'Rule {idx}')
+            tk.Button(heading, text='Remove', command=remove, bg=BG_PANEL,
+                      fg=COLOR_DANGER, bd=0, font=('Segoe UI', 8),
+                      cursor='hand2').pack(side=tk.RIGHT)
+
+            def field(label, initial, color):
+                tk.Label(card, text=label, font=('Segoe UI', 8), bg=BG_INPUT,
+                         fg=TEXT_MUTED).pack(anchor='w', pady=(3, 2))
+                entry = tk.Entry(card, bg=BG_PANEL, fg=color, font=('Consolas', 9),
+                                 insertbackground=TEXT_PRIMARY, bd=0,
+                                 highlightbackground=BG_BORDER, highlightthickness=1)
+                entry.pack(fill=tk.X, ipady=3)
+                entry.insert(0, str(initial))
+                return entry
+
+            record['keyword'] = field('Keyword / phrase to find', keyword, TEXT_PRIMARY)
+            record['value'] = field('Value to store when found', value, SYNTAX_GREEN)
+            record['dest'] = field('Destination variable (blank = default)', dest, SYNTAX_PURPLE)
+            tk.Label(card, text='Destination scope:', font=('Segoe UI', 8),
+                     bg=BG_INPUT, fg=TEXT_MUTED).pack(anchor='w', pady=(4, 2))
+            scope_labels = {'default':'Use Default Scope', 'local':'Local', 'global':'Global'}
+            scope_key = str(rule_scope).lower()
+            rule_scope_var = tk.StringVar(value=scope_labels.get(scope_key, scope_labels['default']))
+            scope_menu = tk.OptionMenu(card, rule_scope_var, *scope_labels.values())
+            scope_menu.config(bg=BG_PANEL, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                              highlightthickness=0, bd=0)
+            scope_menu['menu'].config(bg=BG_PANEL, fg=TEXT_PRIMARY,
+                                      activebackground=COLOR_ACCENT)
+            scope_menu.pack(fill=tk.X)
+            record['scope'] = rule_scope_var
+            rule_rows.append(record)
+            title.config(text=f'Rule {len(rule_rows)}')
+            return record
+
+        # When opening an older saved action, convert all comma-separated
+        # keywords to individual cards with their original shared value.
+        if current and isinstance(current.get('keyword_rules'), list):
+            saved_rules = current['keyword_rules']
+        elif current:
+            saved_rules = [{'keyword': word, 'value': current.get('value', '')}
+                           for word in current.get('keywords', [])]
+        else:
+            saved_rules = [{'keyword':'', 'value':'', 'var_name':''}]
+        for item in saved_rules:
+            if isinstance(item, dict):
+                add_rule(item.get('keyword', ''), item.get('value', ''),
+                         item.get('var_name', ''), item.get('var_scope', 'default'))
+        ModernButton(keyword_frame, text='+ Add Keyword Rule', bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,
+                     command=add_rule).pack(fill=tk.X, pady=(2, 8))
+        tk.Label(keyword_frame,
+                 text='No matches: leave current variables unchanged. In All Matches mode, '
+                      'each destination is written once, using its most specific match.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=430, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
 
         def update_mode(*_):
-            if mode_var.get() == labels['keywords']:
+            is_keywords = mode_var.get() == labels['keywords']
+            if not current:
+                previous_default = 'clipboard_text' if is_keywords else 'status'
+                next_default = 'status' if is_keywords else 'clipboard_text'
+                if var_entry.get() == previous_default:
+                    var_entry.delete(0, tk.END)
+                    var_entry.insert(0, next_default)
+            help_label.config(text=('Check all keyword-to-value rules against the clipboard '
+                                    'when this action runs. Choose Local/Global for each '
+                                    'destination or use the default scope.' if is_keywords else
+                                    'Save the entire Unicode clipboard text, including '
+                                    'spaces and line breaks. Empty clipboard text will '
+                                    'not overwrite a saved value.'))
+            if is_keywords:
                 keyword_frame.pack(fill=tk.X, pady=(6, 8), before=keyword_anchor)
             else:
                 keyword_frame.pack_forget()
@@ -5327,9 +5480,8 @@ class VSCodeQueueViewer(tk.Frame):
             pos_var = tk.StringVar(value=f'Before Line {line_num}')
             pos_menu = tk.OptionMenu(body, pos_var, f'Before Line {line_num}',
                                      f'After Line {line_num}')
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                            font=('Segoe UI', 8), highlightthickness=1,
-                            highlightbackground=BG_BORDER, bd=0)
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 8),
+                            highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
             pos_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
                                     activebackground=COLOR_ACCENT)
             pos_menu.pack(fill=tk.X, pady=(4, 10))
@@ -5346,12 +5498,36 @@ class VSCodeQueueViewer(tk.Frame):
             action = {'type': 'read_clipboard', 'mode': mode,
                       'var_name': name, 'var_scope': scope}
             if mode == 'keywords':
-                keywords = [word.strip() for word in kw_entry.get().split(',')
-                            if word.strip()]
-                if not keywords:
-                    self.app.update_status('Enter at least one clipboard keyword', COLOR_DANGER)
+                rules = []
+                reverse_scope = {'Use Default Scope': None, 'Local': 'local', 'Global': 'global'}
+                for idx, item in enumerate(rule_rows, 1):
+                    keyword = item['keyword'].get().strip()
+                    value = item['value'].get()
+                    destination = item['dest'].get().strip()
+                    if not keyword:
+                        self.app.update_status(f'Rule {idx}: enter a keyword', COLOR_DANGER)
+                        return
+                    if not value:
+                        self.app.update_status(f'Rule {idx}: enter a value to store', COLOR_DANGER)
+                        return
+                    per_scope = reverse_scope[item['scope'].get()]
+                    try:
+                        variable_identity(destination or name, per_scope or scope)
+                    except MacroExecutionError as exc:
+                        self.app.update_status(f'Rule {idx}: {exc}', COLOR_DANGER)
+                        return
+                    row = {'keyword':keyword, 'value':value}
+                    if destination:
+                        row['var_name'] = destination
+                    if per_scope is not None:
+                        row['var_scope'] = per_scope
+                    rules.append(row)
+                if not rules:
+                    self.app.update_status('Add at least one keyword rule', COLOR_DANGER)
                     return
-                action.update(keywords=keywords, value=val_entry.get())
+                action['keyword_rules'] = rules
+                action['match_mode'] = next(k for k, v in match_labels.items()
+                                            if v == match_var.get())
             if edit_idx is not None:
                 self.app.recorded_actions[edit_idx] = action
                 self.app.display_actions_in_queue(self.app.recorded_actions)
@@ -10085,6 +10261,12 @@ class BuiltInMacroApp:
             if action.get('mode', 'keywords') == 'capture':
                 return (f"clipboard.capture() -> {action.get('var_scope', 'local').title()} "
                         f"${action.get('var_name', 'clipboard_text')}")
+            if isinstance(action.get('keyword_rules'), list):
+                rules = action['keyword_rules']
+                preview = (rules[0].get('keyword', '') if len(rules) == 1 and
+                           isinstance(rules[0], dict) else f'{len(rules)} rules')
+                mode = action.get('match_mode', 'best')
+                return f"clipboard.route({preview!r}, {mode}) -> variables"
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
             return f"clipboard.find({preview!r} -> ${action.get('var_name')} [legacy])"
@@ -10380,18 +10562,14 @@ class BuiltInMacroApp:
                 report(f"Clipboard saved to {saved['scope'].title()} variable "
                        f"'{saved['variable']}' ({saved['length']} characters)", COLOR_SUCCESS)
             elif mode == 'keywords':
-                clip_content = get_clipboard_text().casefold()
-                keywords = [str(k).casefold() for k in action.get('keywords', [])]
-                matched = any(kw in clip_content for kw in keywords if kw)
-                var_name = action.get('var_name', 'status')
-                if matched:
-                    val = action.get('value', '')
-                    set_variable(self, var_name, val, action.get('var_scope'))
+                results = apply_clipboard_keyword_rules(self, action)
+                if results:
                     if self.audio_cues: play_cue('match')
-                    # Status never reveals the clipboard content or saved value.
-                    report(f"Clipboard keyword matched; updated '{var_name}'", COLOR_SUCCESS)
+                    # Never reveal the clipboard text or stored values in logs.
+                    names = ', '.join(f"{r['scope']}:{r['variable']}" for r in results)
+                    report(f"Clipboard keyword matched; updated {names}", COLOR_SUCCESS)
                 else:
-                    report(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
+                    report('No clipboard keywords matched; variables unchanged', SYNTAX_ORANGE)
             else:
                 raise MacroExecutionError(f'Unknown Read Clipboard mode: {mode!r}')
         elif act_type == "type_variable":
