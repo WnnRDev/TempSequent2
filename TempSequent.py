@@ -1500,6 +1500,7 @@ def sequent_clean_caption(text):
 def sequent_icon_for_action(name):
     """Map action-picker categories to a stable pictogram, not textual sigils."""
     name = str(name).casefold()
+    if 'run macro' in name: return 'play'
     if any(w in name for w in ('delay', 'wait', 'retry')): return 'clock'
     if any(w in name for w in ('find', 'search', 'ocr', 'pixel', 'smart ui')): return 'target'
     if any(w in name for w in ('clipboard','copy', 'paste')): return 'layers'
@@ -2312,6 +2313,9 @@ DYNAMIC_ACTION_SPECS = {
    ('interval','Polling interval seconds','float',0.5),
    ('on_error','When timed out','choice','stop',['stop','skip','goto']),
    ('fallback_label','Fallback label if goto','text','')]),
+ 'Run Macro':('run_macro',[
+   ('preset','Saved macro name','text',''),
+   ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro'])]),
  'Set Variable':('set_variable',[
    ('var_name','Variable name','text','status'),
    ('var_scope','Variable Scope','choice','Local',['Local','Global']),
@@ -3070,7 +3074,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
-    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check'
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -3826,6 +3830,8 @@ class SequentDynamicEngine:
             name = action.get('var_name','ocr_value')
             self._assign_variable(name, extracted, action.get('var_scope'))
             result = {'value':extracted,'variable':name}
+        elif typ == 'run_macro':
+            raise MacroExecutionError('Run Macro must be executed by the workflow interpreter')
         elif typ == 'set_variable':
             name = action.get('var_name', '')
             variable_identity(name, action.get('var_scope'))
@@ -3932,10 +3938,32 @@ class SequentDynamicEngine:
                             'goto':action.get('fallback_label',self.policy['fallback_label']) if mode=='goto' else None}
                 raise
 
+    def _load_called_macro(self, preset_name):
+        """Read a saved macro without replacing the current editor queue.
+
+        Only names listed in the preset directory are permitted; never treat a
+        configured macro name as an arbitrary filesystem path.
+        """
+        preset_name = str(preset_name or '').strip()
+        if not preset_name or preset_name not in self.app.get_preset_names():
+            raise MacroExecutionError(f"Run Macro: saved macro {preset_name!r} was not found")
+        path = os.path.join(self.app.presets_dir, preset_name + '.json')
+        try:
+            with open(path, 'r', encoding='utf-8') as stream:
+                actions = json.load(stream)
+        except (OSError, ValueError) as exc:
+            raise MacroExecutionError(f"Run Macro: unable to read {preset_name!r}: {exc}") from exc
+        if not isinstance(actions, list) or not actions or any(
+                not isinstance(item, dict) or not isinstance(item.get('type'), str)
+                for item in actions):
+            raise MacroExecutionError(f"Run Macro: {preset_name!r} is not a valid nonempty macro")
+        return actions
+
     def run_program(self, actions, start=0, *, on_step=None, idle=False,
-                    max_actions=None, frames=None):
+                    max_actions=None, frames=None, macro_stack=None):
         """Execute a complete workflow or exactly one debugger step with saved loop frames."""
         frames = [] if frames is None else frames
+        macro_stack = () if macro_stack is None else tuple(macro_stack)
         index = start
         executed = 0
         max_steps = 50000
@@ -4006,6 +4034,32 @@ class SequentDynamicEngine:
                 target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==label),None)
                 if target is None:raise MacroExecutionError(f'Unknown label: {label}')
                 frames.clear();index=target+1;continue
+            if typ == 'run_macro':
+                preset = str(action.get('preset', '')).strip()
+                mode = action.get('mode', 'Run & Return')
+                if mode not in ('Run & Return', 'Switch to Macro'):
+                    raise MacroExecutionError(f'Run Macro: unrecognized mode {mode!r}')
+                # Validate before switching or invoking, so failures are reported
+                # by the current macro rather than silently switching to nothing.
+                nested_actions = self._load_called_macro(preset)
+                if mode == 'Switch to Macro':
+                    return {'switch':'preset', 'target':preset}
+                if preset in macro_stack:
+                    raise MacroExecutionError('Run Macro: recursive macro call: ' +
+                                              ' -> '.join(macro_stack + (preset,)))
+                if len(macro_stack) >= 12:
+                    raise MacroExecutionError('Run Macro: maximum nested call depth (12) reached')
+                # Execute inside the same engine: variables, recovery policy,
+                # loop timing and stop/pause state remain shared. The child does
+                # not replace the parent queue or alter its selected preset.
+                child = self.run_program(nested_actions, idle=idle,
+                                         macro_stack=macro_stack + (preset,))
+                if child.get('cancelled') or child.get('switch'):
+                    return child
+                if not child.get('completed'):
+                    raise MacroExecutionError(f'Run Macro: {preset!r} did not finish')
+                index += 1
+                continue
             if typ=='if_var':
                 actual=str(get_variable(self.app, action.get('var_name',''), action.get('var_scope')))
                 if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
@@ -4125,6 +4179,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
         )),
         ("Logic & Flow", (
+            ("Run Macro", "Run a saved macro and return, or switch to it.", "RM"),
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
@@ -5102,6 +5157,7 @@ class VSCodeQueueViewer(tk.Frame):
             child.destroy()
 
         renderers = {
+            "Run Macro": self._render_run_macro_view,
             "Delay": self._render_delay_view,
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
@@ -6109,6 +6165,97 @@ class VSCodeQueueViewer(tk.Frame):
         ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     
+    def _render_run_macro_view(self, line_num, edit_idx=None):
+        """Dedicated saved-macro selector with explicit call/return semantics."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx]
+               if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+               else {})
+        if old.get('type') != 'run_macro':
+            old = {}
+
+        tk.Label(body, text='SAVED MACRO TO RUN', font=('Segoe UI', 8, 'bold'),
+                 bg=BG_PANEL, fg=SYNTAX_BLUE, anchor='w').pack(fill=tk.X, pady=(2, 6))
+        tk.Label(body, text='Choose a saved macro from your Presets folder. '
+                 'Macros in this list must be saved before they can be run.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 9),
+                 justify='left', anchor='w', wraplength=445).pack(fill=tk.X, pady=(0, 8))
+        names = self.app.get_preset_names()
+        current = str(old.get('preset', '')).strip()
+        chosen = tk.StringVar(value=current if current else
+                              (names[0] if names else '-- No saved macros --'))
+        name_frame = tk.Frame(body, bg=BG_PANEL)
+        name_frame.pack(fill=tk.X)
+        name_menu = tk.OptionMenu(name_frame, chosen, *((names or ['-- No saved macros --'])))
+        name_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Consolas', 9),
+                         bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        name_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                 activebackground=COLOR_ACCENT)
+        name_menu.pack(fill=tk.X)
+
+        tk.Label(body, text='AFTER THE SELECTED MACRO RUNS', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI', 8, 'bold'),
+                 anchor='w').pack(fill=tk.X, pady=(13, 6))
+        mode = tk.StringVar(value=old.get('mode', 'Run & Return'))
+        mode_menu = tk.OptionMenu(body, mode, 'Run & Return', 'Switch to Macro')
+        mode_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Consolas', 9),
+                         bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        mode_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                 activebackground=COLOR_ACCENT)
+        mode_menu.pack(fill=tk.X)
+        explanation = tk.Label(body, bg=BG_PANEL, fg=TEXT_MUTED,
+                               font=('Segoe UI', 8), wraplength=445,
+                               anchor='w', justify='left')
+        explanation.pack(fill=tk.X, pady=(6, 12))
+        def refresh_mode(*_):
+            if mode.get() == 'Run & Return':
+                explanation.config(text='Execute the selected macro, then continue with the next action here. '
+                                   'Both macros share Local and Global variables during this run. '
+                                   'The child macro must finish successfully to resume.')
+            else:
+                explanation.config(text='Replace the current playback with the selected macro. '
+                                   'The original macro will not resume automatically.')
+        mode.trace_add('write', refresh_mode)
+        refresh_mode()
+        error = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                         font=('Segoe UI', 8), wraplength=445, justify='left')
+        error.pack(fill=tk.X, pady=(2, 5))
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f'Before Line {line_num}')
+            picker = tk.OptionMenu(body, pos_var,
+                                   f'Before Line {line_num}', f'After Line {line_num}')
+            picker.config(bg=BG_INPUT, fg=TEXT_PRIMARY, highlightthickness=1,
+                          highlightbackground=BG_BORDER, bd=0)
+            picker['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
+            picker.pack(fill=tk.X, pady=(3, 6))
+
+        def submit():
+            target = chosen.get().strip()
+            if not target or target not in self.app.get_preset_names():
+                error.config(text='Select an existing saved macro from the Presets folder.')
+                return
+            if mode.get() not in ('Run & Return', 'Switch to Macro'):
+                error.config(text='Select a valid run mode.')
+                return
+            action = {'type':'run_macro', 'preset':target, 'mode':mode.get()}
+            if edit_idx is not None:
+                idx = edit_idx
+                self.app.recorded_actions[idx] = action
+            else:
+                idx = line_num-1 if 'After' in pos_var.get() else line_num-2
+                idx = max(0, min(idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, action)
+            self.close_sub_menu()
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.app.update_status(f"Added Run Macro: {target}", COLOR_SUCCESS)
+
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Run Macro',
+                     bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,
+                     command=submit).pack(fill=tk.X, pady=(6, 12))
+
     def _render_dynamic_action_view(self, line_num, edit_idx=None):
         """Consistent JSON-backed property editor for dynamic automation actions."""
         body = self.action_content_frame
@@ -10458,6 +10605,10 @@ class BuiltInMacroApp:
                 return (f'{mode}: {target}' if target and mode in
                         ('Run Saved Macro', 'Jump to Label') else mode)
             return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
+        if act_type == 'run_macro':
+            target = str(action.get('preset', '')).strip()
+            mode = action.get('mode', 'Run & Return')
+            return f"flow.run_macro({target!r}, {mode!r})"
         if act_type in DYNAMIC_ACTION_TYPES:
             kind = next((name for name,spec in DYNAMIC_ACTION_SPECS.items() if spec[0]==act_type),act_type)
             if act_type == 'if_dynamic': return f"◆ IF [{action.get('logic','ALL')}] {len(action.get('conditions',[]))} conditions"
@@ -14039,7 +14190,11 @@ try {{
                         self._playback_ui_pending = True
                         self.root.after(0, lambda i=index, r=run_id:
                                         self._on_playback_step(i, r))
-                result = self.dynamic_engine.run_program(self.recorded_actions,start,on_step=on_step)
+                selected_preset = (self.preset_var.get() if hasattr(self, 'preset_var') else '')
+                stack = ((selected_preset,) if selected_preset in self.get_preset_names()
+                         else ())
+                result = self.dynamic_engine.run_program(
+                    self.recorded_actions, start, on_step=on_step, macro_stack=stack)
                 if result.get('switch'):
                     self.switching_preset=True
                     self.playing=False
