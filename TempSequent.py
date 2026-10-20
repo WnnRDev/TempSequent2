@@ -2311,9 +2311,11 @@ try {
         try {
             $c = $element.Current
             $rect = $c.BoundingRectangle
-            if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0) { return $null }
+            # A bounding rectangle alone does not mean the target is on screen.
+            if ($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0 -or $c.IsOffscreen) { return $null }
             return @{name=[string]$c.Name; automation_id=[string]$c.AutomationId;
                 control_type=[string]$c.ControlType.ProgrammaticName;
+                enabled=[bool]$c.IsEnabled;
                 bounds=@([int][Math]::Round($rect.Left),[int][Math]::Round($rect.Top),
                     [int][Math]::Round($rect.Right),[int][Math]::Round($rect.Bottom))}
         } catch { return $null }
@@ -2321,7 +2323,23 @@ try {
     $found = $null
     if ($q.mode -eq 'point') {
         $point = New-Object System.Windows.Point ([double]$q.x),([double]$q.y)
-        $found = Selector ([System.Windows.Automation.AutomationElement]::FromPoint($point))
+        $element = [System.Windows.Automation.AutomationElement]::FromPoint($point)
+        $found = Selector $element
+        if ($null -ne $found) {
+            # Preserve the containing application's window, not just a generic
+            # button name (many apps expose dozens of identical labels).
+            try {
+                $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                for ($i = 0; $i -lt 32 -and $null -ne $element; $i++) {
+                    $c = $element.Current
+                    if ($c.ControlType -eq [System.Windows.Automation.ControlType]::Window) {
+                        $found.window = [string]$c.Name
+                        break
+                    }
+                    $element = $walker.GetParent($element)
+                }
+            } catch { }
+        }
     } else {
         if ([long]$q.hwnd -ne 0) {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]([long]$q.hwnd))
@@ -2333,7 +2351,11 @@ try {
             $stack = New-Object 'System.Collections.Generic.Stack[object]'
             $stack.Push(@($root, 0))
             $visited = 0
-            while ($stack.Count -gt 0 -and $visited -lt 3500) {
+            $bestPartial = $null
+            # Scope matters: deeper UIA trees are common in modern desktop apps.
+            # The cap still prevents a single malformed provider hanging the scan.
+            $maxNodes = if ([long]$q.hwnd -ne 0) { 8000 } else { 3500 }
+            while ($stack.Count -gt 0 -and $visited -lt $maxNodes) {
                 $item = $stack.Pop()
                 $element = [System.Windows.Automation.AutomationElement]$item[0]
                 $depth = [int]$item[1]
@@ -2344,13 +2366,22 @@ try {
                     $aid = [string]$c.AutomationId
                     $type = ([string]$c.ControlType.ProgrammaticName).Replace('ControlType.','').Replace('Control','')
                     $wantedType = ([string]$q.control_type).Replace('ControlType.','').Replace('Control','')
-                    if ((-not $q.name -or $n.IndexOf([string]$q.name,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+                    if ($depth -gt 0 -and
+                        (-not $q.name -or $n.IndexOf([string]$q.name,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and
                         (-not $q.automation_id -or $aid.Equals([string]$q.automation_id,[StringComparison]::OrdinalIgnoreCase)) -and
                         (-not $wantedType -or $type.Equals($wantedType,[StringComparison]::OrdinalIgnoreCase))) {
-                        $found = Selector $element
-                        if ($null -ne $found) { break }
+                        $candidate = Selector $element
+                        if ($null -ne $candidate) {
+                            # Prefer exact names to substring matches. Otherwise
+                            # 'Save' may pick 'Save As...' even when Save exists.
+                            if (-not $q.name -or $n.Equals([string]$q.name,[StringComparison]::OrdinalIgnoreCase)) {
+                                $found = $candidate
+                                break
+                            }
+                            if ($null -eq $bestPartial) { $bestPartial = $candidate }
+                        }
                     }
-                    if ($depth -lt 14) {
+                    if ($depth -lt 18) {
                         # Reverse siblings for stable visual discovery order.
                         $children = New-Object 'System.Collections.Generic.List[object]'
                         $child = $walker.GetFirstChild($element)
@@ -2365,6 +2396,7 @@ try {
                 } catch { continue }
             }
         }
+        if ($null -eq $found) { $found = $bestPartial }
     }
     if ($null -eq $found) { Write-Output 'null' }
     else { ConvertTo-Json -InputObject $found -Depth 4 -Compress }
@@ -2665,69 +2697,161 @@ def sequent_resize_bgra(pixels,width,height,scaled_width,scaled_height):
 
 
 def sequent_match_bgra(screen, sw, sh, template, tw, th, confidence=0.85):
-    """RGB template match with a fast sampled pass and exact-position verification.
+    """Fast, alpha-aware template matching without external dependencies.
 
-    All candidate pixel coordinates are checked. Using a coarse 3- or 5-pixel
-    grid can miss small or detailed templates when their position is offset.
-    Confidence = 1 - mean_absolute_rgb_difference/255, not OpenCV NCC.
+    Build screen-wide candidate masks using C-implemented byte translation and
+    Python's native big-integer AND. This replaces the old Python loop over
+    every pixel and supports Windows screenshots with arbitrary alpha bytes.
+    Candidate boxes are then checked using RGB samples from *opaque* template
+    pixels.  Confidence is 1 - mean absolute RGB difference / 255.
     """
-    import heapq
-    if tw > sw or th > sh or tw < 2 or th < 2: return None
+    from collections import Counter
+
+    if tw > sw or th > sh or tw < 2 or th < 2:
+        return None
     if len(screen) != sw * sh * 4 or len(template) != tw * th * 4:
         raise ValueError('Malformed BGRA image buffer')
-    pts=[]
-    for gy in range(10):
-        for gx in range(10):
-            tx=min(tw-1,(2*gx+1)*tw//20)
-            ty=min(th-1,(2*gy+1)*th//20)
-            ti=(ty*tw+tx)*4
-            if template[ti+3]>=100:
-                pts.append((tx,ty,template[ti],template[ti+1],template[ti+2]))
-    if not pts: return None
-    avg=[sum(pt[i] for pt in pts)/len(pts) for i in (2,3,4)]
-    distinctive=sorted(pts,key=lambda p:sum(abs(p[i]-avg[i-2]) for i in (2,3,4)),reverse=True)
-    landmarks=distinctive[:10]
-    if len(landmarks)<3: return None
-    # First anchor may be atypical; permit a generous per-pixel difference.
-    anchor_x,anchor_y,ab,ag,ar=landmarks[0]
-    anchor_row_offset=anchor_y*sw*4+anchor_x*4
-    offsets=[(p[1]*sw+p[0])*4 for p in landmarks[1:]]
-    colors=[p[2:] for p in landmarks[1:]]
-    difference_limit=(1.0-confidence)*255
-    coarse_cutoff=max(42,difference_limit*1.65)
-    anchor_cutoff=max(90,difference_limit*3)
-    candidate_heap=[]  # keep the 32 best coarse matches (max-heap via -error)
-    count=len(landmarks)
-    for y in range(sh-th+1):
-        row_offset=y*sw*4
-        for x in range(sw-tw+1):
-            base=row_offset+x*4
-            anchor=base+anchor_row_offset
-            rdiff=abs(screen[anchor]-ab)+abs(screen[anchor+1]-ag)+abs(screen[anchor+2]-ar)
-            if rdiff>anchor_cutoff*3:continue
-            total=rdiff
-            for offset,(b,g,r) in zip(offsets,colors):
-                i=base+offset
-                total+=abs(screen[i]-b)+abs(screen[i+1]-g)+abs(screen[i+2]-r)
-            score=total/(3*count)
-            if score>=coarse_cutoff:continue
-            if len(candidate_heap)<32:
-                heapq.heappush(candidate_heap,(-score,x,y))
-            elif score < -candidate_heap[0][0]:
-                heapq.heapreplace(candidate_heap,(-score,x,y))
-    if not candidate_heap:return None
-    best=None
-    for negative_score,x,y in sorted(candidate_heap,reverse=True):
-        base=(y*sw+x)*4
-        diff=0
-        for tx,ty,b,g,r in pts:
-            i=base+(ty*sw+tx)*4
-            diff+=abs(screen[i]-b)+abs(screen[i+1]-g)+abs(screen[i+2]-r)
-        score=diff/(3*len(pts))
-        if best is None or score<best[0]:best=(score,x,y)
-        if score==0:break
-    if best is None or best[0]>difference_limit:return None
-    return (1.0-best[0]/255.0,(best[1],best[2],best[1]+tw,best[2]+th))
+    confidence = float(confidence)
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError('Image confidence must be a finite value between 0 and 1')
+
+    # Sample at least the entire small icon. Sparse/transparent icons need
+    # visibility-aware samples, not a fixed 10x10 grid of transparent pixels.
+    step = max(1, int(math.sqrt(tw * th / 225)))
+    samples = []
+    for ty in range(0, th, step):
+        for tx in range(0, tw, step):
+            index = (ty * tw + tx) * 4
+            alpha = template[index + 3]
+            if alpha >= 100:
+                samples.append((tx, ty, template[index], template[index+1],
+                                template[index+2], alpha))
+    if len(samples) < 6 and step > 1:
+        samples = []
+        for ty in range(th):
+            for tx in range(tw):
+                index = (ty * tw + tx) * 4
+                alpha = template[index+3]
+                if alpha >= 100:
+                    samples.append((tx,ty,template[index],template[index+1],
+                                    template[index+2],alpha))
+    if not samples:
+        return None
+    # Avoid enormous verification loops for largely opaque high-res images.
+    if len(samples) > 300:
+        stride = max(1, len(samples)//300)
+        samples = samples[::stride][:300]
+
+    # Screenshot alpha is undefined on common Win32 GetDIBits captures. Match
+    # visible colors exclusively, never the alpha channel.
+    planes = (screen[0::4], screen[1::4], screen[2::4])
+    counts = tuple(Counter(channel) for channel in planes)
+    # Prefix histograms let us estimate the rarity of each anchor even when
+    # allowing a wide color tolerance. An exact-color rare pixel can become
+    # incredibly common at +/-100; choosing anchors dynamically avoids scanning
+    # the entire desktop in Python in that case.
+    cumulative = []
+    for histogram in counts:
+        running = 0
+        prefix = [0]
+        for value in range(256):
+            running += histogram[value]
+            prefix.append(running)
+        cumulative.append(prefix)
+
+    def anchors_for_tolerance(tolerance):
+        ranked = []
+        for tx,ty,b,g,r,alpha in samples:
+            channels = (b,g,r)
+            def nearby_count(channel):
+                value = channels[channel]
+                lo = max(0, value-tolerance)
+                hi = min(255, value+tolerance)
+                return cumulative[channel][hi+1]-cumulative[channel][lo]
+            channel = min(range(3), key=nearby_count)
+            ranked.append((nearby_count(channel), -alpha, tx,ty,
+                           channel,channels[channel]))
+        ranked.sort()
+        probes = []
+        separation = max(1, min(tw,th)//5)
+        for rarity,_,tx,ty,channel,value in ranked:
+            if all(abs(tx-other[0])+abs(ty-other[1]) >= separation
+                   for other in probes):
+                probes.append((tx,ty,channel,value))
+                if len(probes)==8:break
+        if len(probes)<3:
+            for _,_,tx,ty,channel,value in ranked:
+                if all((tx,ty)!=(p[0],p[1]) for p in probes):
+                    probes.append((tx,ty,channel,value))
+                if len(probes)==3:break
+        return probes
+
+    allowed = (1.0 - confidence) * 255.0
+    limit = 3.0 * len(samples) * allowed
+    verification = [(ty*sw+tx)*4 for tx,ty,*_ in samples]
+    colors = [(b,g,r) for _,_,b,g,r,_ in samples]
+    best_diff = float('inf')
+    best_xy = None
+    total = sw*sh
+    search_width = sw-tw+1
+    search_height = sh-th+1
+
+    # Progressive cutoffs let exact/near-exact icons match extremely fast,
+    # while still accommodating antialiasing and mild color changes.
+    tolerance_levels = (0, 12, 32, min(255, max(56, math.ceil(allowed * 2.6))))
+    for tolerance in dict.fromkeys(tolerance_levels):
+        # A single probe is enough for a mostly transparent single-pixel glyph.
+        # Other templates get multiple independent masks to eliminate
+        # background candidates without Python-side per-pixel loops.
+        combined = None
+        probes = anchors_for_tolerance(tolerance)
+        for probe_index,(tx,ty,channel,value) in enumerate(probes):
+            palette = bytes(1 if abs(i-value) <= tolerance else 0
+                            for i in range(256))
+            aligned = int.from_bytes(planes[channel].translate(palette), 'little')
+            aligned >>= (ty*sw+tx)*8
+            combined = aligned if combined is None else combined & aligned
+            if not combined:
+                break
+            # Three independent signatures are normally sufficient, but more
+            # are cheap in native code when broad tolerances match a background.
+            if probe_index >= 2 and combined.bit_count() <= 2000:
+                break
+        if not combined:
+            continue
+        # Every byte has either 0 or 1 set. Its byte position is a candidate
+        # template top-left, so row-by-row .find() stays in native C.
+        candidates = combined.to_bytes(total, 'little')
+        for y in range(search_height):
+            rowstart = y*sw
+            rowend = rowstart + search_width
+            pos = candidates.find(b'\x01', rowstart, rowend)
+            while pos >= 0:
+                base = pos*4
+                delta = 0
+                for offset,(b,g,r) in zip(verification, colors):
+                    index = base+offset
+                    delta += (abs(screen[index]-b) + abs(screen[index+1]-g)
+                              + abs(screen[index+2]-r))
+                    if delta > limit or delta >= best_diff:
+                        break
+                else:
+                    best_diff = delta
+                    best_xy = (pos-rowstart, y)
+                    # A very strong match needn't explore every other scale.
+                    if delta <= 3*len(samples)*3:
+                        return (1.0-delta/(3*len(samples)*255.0),
+                                (best_xy[0],best_xy[1],best_xy[0]+tw,best_xy[1]+th))
+                pos = candidates.find(b'\x01', pos+1, rowend)
+        # A merely acceptable candidate may be a similar-looking background
+        # patch. Continue broadening if it is not a high-confidence match.
+        if best_xy is not None and best_diff <= limit and best_diff <= 3*len(samples)*4:
+            break
+
+    if best_xy is None or best_diff > limit:
+        return None
+    quality = 1.0-best_diff/(3*len(samples)*255.0)
+    return (quality,(best_xy[0],best_xy[1],best_xy[0]+tw,best_xy[1]+th))
 
 
 _SEQ_NS_XLSX = {'s':'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
@@ -3244,29 +3368,48 @@ class SequentDynamicEngine:
         return tuple(found['bounds']) if found else None
 
     def find_image(self, action, screen_pixels=None):
-        """Native GDI+ template read + GDI screenshot + stdlib image matching."""
+        """Match an image in one native screenshot with cached decoded templates."""
         path, (x,y,w,h), threshold, scales = sequent_image_action_settings(
             dict(action, path=self.interpolate(action.get('path',''))))
         try:
-            tw,th,template = sequent_load_image_bgra(path)
-        except (OSError,ValueError) as exc:
+            stat = os.stat(path)
+            key = (os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns, stat.st_size)
+            cache = getattr(self, '_sequent_template_cache', None)
+            if cache is None:
+                cache = {}
+                self._sequent_template_cache = cache
+            if key in cache:
+                tw,th,template,scaled_images = cache[key]
+            else:
+                tw,th,template = sequent_load_image_bgra(path)
+                scaled_images = {}
+                # Limit cache to the three most recently used templates, and
+                # invalidate when images are replaced/modified on disk.
+                if len(cache) >= 3:
+                    cache.pop(next(iter(cache)))
+                cache[key] = (tw,th,template,scaled_images)
+        except (OSError, ValueError) as exc:
             raise MacroExecutionError(f'Cannot read image template: {exc}') from exc
-        # A supplied snapshot lets the editor hide itself for one frame, then
-        # restore immediately while matching proceeds on a worker thread.
         screen = screen_pixels if screen_pixels is not None else sequent_capture_bgra(x,y,w,h)
-        if len(screen) != w * h * 4:
+        if len(screen) != w*h*4:
             raise MacroExecutionError('Screen snapshot size differs from selected search area')
-        best=None
+        best = None
         for scale in scales:
             sw,sh=max(1,round(tw*scale)),max(1,round(th*scale))
-            if sw>w or sh>h or min(sw,sh)<2:continue
-            scaled=sequent_resize_bgra(template,tw,th,sw,sh)
-            match=sequent_match_bgra(screen,w,h,scaled,sw,sh,threshold)
+            if sw>w or sh>h or min(sw,sh)<2:
+                continue
+            if (sw,sh) not in scaled_images:
+                scaled_images[(sw,sh)] = sequent_resize_bgra(template,tw,th,sw,sh)
+            match = sequent_match_bgra(screen,w,h,scaled_images[(sw,sh)],sw,sh,threshold)
             if match is not None and (best is None or match[0]>best[0]):
-                best=match
-                if match[0]>=0.999:break
-        if best is None:return None
-        box=best[1]
+                best = match
+                # Strong positive matches avoid scanning four unnecessary
+                # scales. We still test other scales for ambiguous matches.
+                if match[0] >= 0.985:
+                    break
+        if best is None:
+            return None
+        box = best[1]
         return (x+box[0],y+box[1],x+box[2],y+box[3])
 
     def observe(self, condition):
@@ -3439,7 +3582,12 @@ class SequentDynamicEngine:
         typ = action.get('type')
         result = {}
         if typ == 'ui_element':
-            result = self._click_box(action,self.find_ui_element(action))
+            bounds = self.find_ui_element(action)
+            # A user can press Stop while the external UIA query is running.
+            # Never click with a stale result after cancellation.
+            if not idle and not self.app.playing:
+                raise MacroCancelled('UI element lookup was cancelled')
+            result = self._click_box(action,bounds)
         elif typ == 'find_image':
             result = self._recognize_screen_action(action, idle=idle)
             if not result['found'] and 'if_not_found' not in action:
@@ -5636,29 +5784,90 @@ class VSCodeQueueViewer(tk.Frame):
                                  hover_color=BG_HOVER,command=browse_path).pack(fill=tk.X,pady=(3,0))
 
         def capture_last_click():
-            if type_name!='ui_element':return
+            """Sample the original target *without Sequent covering it*.
+
+            UIAutomation.FromPoint sees the TOPMOST element at a coordinate.
+            The old implementation ran synchronously while the topmost action
+            editor was covering the target, capturing Sequent's own widgets.
+            """
+            if type_name != 'ui_element':
+                return
             selected=(self.app.recorded_actions[edit_idx] if edit_idx is not None else None)
             clicks=[a for a in self.app.recorded_actions if a.get('type')=='click']
-            if selected and selected.get('type')=='click':old_click=selected
-            elif clicks:old_click=clicks[-1]
+            if selected and selected.get('type')=='click':
+                old_click=selected
+            elif clicks:
+                old_click=clicks[-1]
             else:
-                error.config(text='Record a mouse click first, then capture its element.')
+                error.config(text='Record a mouse click on the target first.')
                 return
             try:
-                info=sequent_native_uia({'mode':'point','x':int(old_click.get('x',0)),
-                                          'y':int(old_click.get('y',0))})
-                if not info:
-                    raise MacroExecutionError('No accessible UI element at the recorded point')
-                for key in ('name','automation_id','control_type'):
-                    widget=vars_[key][1]
-                    widget.delete(0,tk.END)
-                    value=info.get(key,'')
-                    if key=='control_type':
-                        value=value.replace('ControlType.','')+'Control'
-                    widget.insert(0,str(value))
-                error.config(text='Captured native Windows accessibility selector.',fg=COLOR_SUCCESS)
-            except Exception as exc:
-                error.config(text=f'UI element capture failed: {exc}')
+                if 'x' not in old_click or 'y' not in old_click:
+                    raise ValueError('Recorded click has no screen position')
+                x,y=int(old_click['x']),int(old_click['y'])
+                saved_window=str(old_click.get('win_title','')).strip()
+                if saved_window:
+                    hwnd=find_window_by_title_substr(saved_window)
+                    if hwnd and 'rel_x' in old_click and 'rel_y' in old_click:
+                        x,y=client_to_screen_pos(hwnd,old_click['rel_x'],old_click['rel_y'])
+            except (ValueError, TypeError) as exc:
+                error.config(text=f'Invalid recorded click: {exc}',fg=COLOR_DANGER)
+                return
+            dialog=self.sub_menu
+            root=self.app.root
+            error.config(text='Sampling target with Sequent hidden...',fg=SYNTAX_BLUE)
+            # Hide BOTH windows before FromPoint. Do not freeze Tk during the
+            # PowerShell query; show the editor again even if the call fails.
+            dialog.withdraw()
+            root.withdraw()
+            result_queue=Queue()
+
+            def worker():
+                try:
+                    result_queue.put((sequent_native_uia({'mode':'point','x':x,'y':y}),None))
+                except Exception as exc:
+                    result_queue.put((None,str(exc)))
+
+            def poll():
+                try:
+                    info,exception=result_queue.get_nowait()
+                except Empty:
+                    root.after(60,poll)
+                    return
+                try:
+                    root.deiconify()
+                    if dialog.winfo_exists():
+                        dialog.deiconify()
+                        dialog.lift()
+                    if not dialog.winfo_exists():
+                        return
+                    if exception:
+                        raise MacroExecutionError(exception)
+                    if not info:
+                        raise MacroExecutionError('No visible accessible control at the recorded point')
+                    for key in ('name','automation_id','control_type'):
+                        widget=vars_[key][1]
+                        widget.delete(0,tk.END)
+                        value=info.get(key,'')
+                        if key=='control_type':
+                            value=value.replace('ControlType.','')+'Control'
+                        widget.insert(0,str(value))
+                    # Prefer the recorded window's saved selector when present;
+                    # otherwise use the owning window reported by Windows UIA.
+                    window_title=saved_window or str(info.get('window','')).strip()
+                    if window_title:
+                        widget=vars_['window'][1]
+                        widget.delete(0,tk.END)
+                        widget.insert(0,window_title)
+                    error.config(text=f"Captured {info.get('control_type','UI element')}: "
+                                      f"{info.get('name','')}. Test this selector before playback.",
+                                 fg=COLOR_SUCCESS)
+                except (MacroExecutionError, tk.TclError) as exc:
+                    try: error.config(text=f'UI element capture failed: {exc}',fg=COLOR_DANGER)
+                    except tk.TclError: pass
+
+            # Give Windows time to reveal the underlying target window.
+            root.after(200,lambda:Thread(target=worker,daemon=True).start())
 
         if type_name in ('if_dynamic','loop_start'):
             tk.Label(body,text='Conditions: JSON list of checks. Use ALL or ANY logic.\n'
@@ -5686,9 +5895,53 @@ class VSCodeQueueViewer(tk.Frame):
         for field in fields:
             entry_field(*field)
         if type_name=='ui_element':
-            ModernButton(body,text='⌖ Capture Selector from Recorded Click',
+            ModernButton(body,text='Capture Selector from Recorded Click',
                          bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
                          command=capture_last_click).pack(fill=tk.X,pady=(10,2))
+            def test_selector():
+                # A read-only test; do not send keyboard or mouse input.
+                try:
+                    query={key:vars_[key][1].get().strip() for key in
+                           ('window','name','automation_id','control_type')}
+                    if not (query['name'] or query['automation_id'] or query['control_type']):
+                        raise MacroExecutionError('Enter an accessible name, Automation ID or control type')
+                except (MacroExecutionError, tk.TclError) as exc:
+                    error.config(text=str(exc),fg=COLOR_DANGER)
+                    return
+                error.config(text='Checking Windows UI Automation (no click)...',fg=SYNTAX_BLUE)
+                result_queue=Queue()
+                def worker():
+                    try:
+                        window=query['window']
+                        hwnd=find_window_by_title_substr(window) if window else None
+                        if window and not hwnd:
+                            raise MacroExecutionError(f'Window not found: {window}')
+                        result=sequent_native_uia({'mode':'find','hwnd':int(hwnd or 0),
+                                                   'name':query['name'],
+                                                   'automation_id':query['automation_id'],
+                                                   'control_type':query['control_type']})
+                        result_queue.put((result,None))
+                    except Exception as exc: result_queue.put((None,str(exc)))
+                def poll():
+                    if not self.sub_menu or not self.sub_menu.winfo_exists():
+                        return
+                    try: info,exc=result_queue.get_nowait()
+                    except Empty:
+                        self.app.root.after(70,poll)
+                        return
+                    if exc:
+                        error.config(text=f'UI selector failed: {exc}',fg=COLOR_DANGER)
+                    elif not info:
+                        error.config(text='No visible UI Automation control matched this selector.',fg=COLOR_DANGER)
+                    else:
+                        error.config(text=f"Found: {info.get('name','(unnamed)')}  "
+                                          f"{info.get('control_type','')}  "
+                                          f"Bounds: {info.get('bounds', [])}",fg=COLOR_SUCCESS)
+                Thread(target=worker,daemon=True).start()
+                self.app.root.after(70,poll)
+            ModernButton(body,text='Test Selector (No Click)',
+                         bg_color=BG_BORDER,hover_color=BG_HOVER,
+                         command=test_selector).pack(fill=tk.X,pady=(3,2))
         error=tk.Label(body,text='',bg=BG_PANEL,fg=COLOR_DANGER,
                        font=('Segoe UI',8),wraplength=470,justify='left')
         error.pack(fill=tk.X,pady=6)
@@ -6406,13 +6659,17 @@ class VSCodeQueueViewer(tk.Frame):
         confidence_entry.pack(side=tk.LEFT, padx=(5, 12))
         tk.Label(options_row, text='Scale:', bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8)).pack(side=tk.LEFT)
-        scale_var = tk.StringVar(value=curr.get('scale_mode', 'Auto'))
+        scale_var = tk.StringVar(value=curr.get('scale_mode', 'Exact'))
         scale_menu = tk.OptionMenu(options_row, scale_var, 'Auto', 'Exact', 'Small changes')
         scale_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
                           highlightbackground=BG_BORDER, highlightthickness=1)
         scale_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
                                   activebackground=COLOR_ACCENT)
         scale_menu.pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(body, text='Exact is fastest when the icon stays the same size. '
+                 'Small changes checks three sizes; Auto checks five.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=448).pack(fill=tk.X, pady=(0, 7))
 
         offset_row = tk.Frame(body, bg=BG_PANEL)
         offset_row.pack(fill=tk.X, pady=(0, 7))
@@ -6540,10 +6797,12 @@ class VSCodeQueueViewer(tk.Frame):
                 def search():
                     match = None
                     error = None
+                    started = time.monotonic()
                     try:
                         match = self.app.dynamic_engine.find_image(action, screen_pixels=image)
                     except Exception as exc:
                         error = str(exc)
+                    elapsed = time.monotonic() - started
                     def display_result():
                         self._image_test_active = False
                         if not status_label.winfo_exists():
@@ -6556,11 +6815,11 @@ class VSCodeQueueViewer(tk.Frame):
                             self.app.draw_highlight_box(x1, y1, x2, y2,
                                                         outline_color=COLOR_SUCCESS, duration_ms=1600)
                             status_label.config(text=f'Match at ({x1}, {y1}), {x2-x1}x{y2-y1}. '
-                                                     f'Reticle would target ({tx}, {ty}). No click sent.',
+                                                     f'Reticle would target ({tx}, {ty}). Match in {elapsed:.2f}s. No click sent.',
                                                 fg=COLOR_SUCCESS)
                         else:
-                            status_label.config(text='No image found at this confidence. '
-                                                     'Try smaller search bounds or lower confidence.',
+                            status_label.config(text=f'No image found ({elapsed:.2f}s). '
+                                                     'Try smaller search bounds, another scale mode, or lower confidence.',
                                                 fg=SYNTAX_ORANGE)
                     self.app.root.after(0, display_result)
                 Thread(target=search, daemon=True).start()
@@ -7348,6 +7607,11 @@ class GhostReticle:
         self._live_is_found = False
         self._area_rendered = None
         self._color_rendered = None
+        self._uia_preview_queue = Queue()
+        self._uia_preview_worker = None
+        self._uia_preview_generation = 0
+        self._uia_preview_poll_job = None
+        self._uia_deferred_preview = None
 
     def _set_drag_access(self, enabled):
         if not self.pool:
@@ -7665,6 +7929,68 @@ class GhostReticle:
             self._live_worker.start()
         self._live_timer = self.root.after(60, lambda: self._live_tick(generation))
 
+    def _preview_ui_element_async(self, app, action):
+        """Search UI Automation on a worker; keep Tk responsive.
+
+        Coalesce repeat requests for the same selector so rapid queue refreshes
+        do not spawn a new PowerShell process per frame.
+        """
+        selector = tuple(str(action.get(key,'')) for key in
+                         ('window','name','automation_id','control_type','action','ox','oy'))
+        if self._uia_preview_worker is not None and self._uia_preview_worker.is_alive():
+            if getattr(self,'_uia_pending_selector',None)==selector:
+                return
+            # Queue one *latest* request, rather than launching simultaneous
+            # PowerShell processes or presenting an out-of-date result.
+            self._uia_preview_generation += 1
+            self._uia_deferred_preview=(app,dict(action))
+            self._uia_pending_selector=selector
+            return
+        self._uia_preview_generation += 1
+        generation=self._uia_preview_generation
+        self._uia_pending_selector=selector
+        for window, _canvas in self.pool:
+            if window.winfo_exists(): window.withdraw()
+        if self.color_win is not None and self.color_win.winfo_exists():
+            self.color_win.withdraw()
+        action_snapshot=dict(action)
+        results=self._uia_preview_queue
+        def worker():
+            try: results.put((generation,app.dynamic_engine.find_ui_element(action_snapshot),None))
+            except Exception as exc: results.put((generation,None,str(exc)))
+        self._uia_preview_worker=Thread(target=worker,daemon=True)
+        self._uia_preview_worker.start()
+        if self._uia_preview_poll_job is None:
+            self._uia_preview_poll_job=self.root.after(75,lambda:self._poll_ui_preview(app,action_snapshot))
+
+    def _poll_ui_preview(self,app,action):
+        self._uia_preview_poll_job=None
+        try:
+            while True:
+                generation,box,error=self._uia_preview_queue.get_nowait()
+                if generation!=self._uia_preview_generation:continue
+                if box:
+                    self.last_found_box=box
+                    x1,y1,x2,y2=box
+                    tx,ty=color_click_target(action,box)
+                    self.last_target=(tx,ty)
+                    self.show_multi([(tx,ty,action.get('action') not in ('Detect Only','Move Only'),0.85)],
+                                    color_rect=(x1,y1,x2-x1,y2-y1,0.85))
+                else:
+                    for window, _canvas in self.pool:
+                        if window.winfo_exists(): window.withdraw()
+                    if error: app.update_status(f'Smart UI preview: {error}',COLOR_DANGER)
+                self._uia_pending_selector=None
+        except Empty:
+            pass
+        if self._uia_preview_worker is not None and self._uia_preview_worker.is_alive():
+            self._uia_preview_poll_job=self.root.after(75,lambda:self._poll_ui_preview(app,action))
+        elif self._uia_deferred_preview is not None:
+            next_app,next_action=self._uia_deferred_preview
+            self._uia_deferred_preview=None
+            self._uia_preview_worker=None
+            self._preview_ui_element_async(next_app,next_action)
+
     def update(self, actions, index, app=None):
         if not actions or index < 0 or index >= len(actions):
             self.hide()
@@ -7682,6 +8008,11 @@ class GhostReticle:
                     area_rect = (area[0], area[1], area[2], area[3], 0.85)
                 if self.edit_active:
                     found_box = self.last_found_box
+                elif app is not None and act.get('type') == 'ui_element':
+                    # PowerShell startup/automation tree traversal can take
+                    # seconds. Never run it in the Tk event handler.
+                    self._preview_ui_element_async(app, act)
+                    return
                 elif app is not None:
                     for overlay in (self.area_win, self.color_win):
                         if overlay is not None and overlay.winfo_exists():
@@ -7735,6 +8066,9 @@ class GhostReticle:
             self.hide()
 
     def hide(self):
+        self._uia_preview_generation += 1
+        self._uia_pending_selector = None
+        self._uia_deferred_preview = None
         self.stop_live_preview()
         self.disable_drag()
         self.last_found_box = None
