@@ -15,6 +15,9 @@ from queue import Queue, Empty
 import math
 import colorsys
 import random
+import difflib
+import unicodedata
+from pathlib import Path
 import winsound
 import uuid
 
@@ -282,22 +285,24 @@ def color_click_target(action, box):
     return ax + int(action.get("ox", 0)), ay + int(action.get("oy", 0))
 
 
-def find_ocr_word_match(words, target_text, match_any=False):
-    """Find a text/phrase using WinRT OCR word boxes, not nonexistent line boxes.
+def find_ocr_word_matches(words, target_text, match_any=False, match_mode="Contains"):
+    """Find screen-relative text rectangles using OCR word geometry.
 
-    Return the tight union of matching word rectangles in *capture pixels*,
-    or None. A phrase may span adjacent words on one OCR line. Comparing
-    casefolded alphanumeric text tolerates OCR-inserted spaces/punctuation.
+    Exact words prevent `Save` from matching `Autosave`. OCR may split a word
+    in unexpected places, so compare joined normalized characters and require
+    the outside edges of a whole-word match to line up with OCR word edges.
+    Fuzzy mode only falls back to approximate matches if no exact phrase exists.
     """
-    def compact(text):
-        return "".join(ch for ch in str(text).casefold() if ch.isalnum())
+    def compact(value):
+        value = unicodedata.normalize("NFKC", str(value)).casefold()
+        return "".join(char for char in value if char.isalnum())
 
     target = compact(target_text)
     if not target and not match_any:
-        return None
-
+        return []
+    mode = match_mode if match_mode in ("Contains", "Whole Words", "Fuzzy") else "Contains"
     by_line = {}
-    for word in words:
+    for word in words if isinstance(words, list) else []:
         if not isinstance(word, dict):
             continue
         try:
@@ -307,28 +312,126 @@ def find_ocr_word_match(words, target_text, match_any=False):
             continue
         if not all(math.isfinite(v) for v in rect) or rect[2] <= 0 or rect[3] <= 0:
             continue
-        content = compact(word.get("Text", ""))
-        if content:
-            by_line.setdefault(word.get("Line", 0), []).append((content, rect))
+        txt = compact(word.get("Text", ""))
+        if txt:
+            by_line.setdefault(word.get("Line", 0), []).append((txt, rect))
 
+    exact = []
+    fuzzy = []
     for line_words in by_line.values():
-        joined = ""
         segments = []
-        for content, rect in line_words:
-            start = len(joined)
-            joined += content
-            segments.append((start, len(joined), rect))
-        start = 0 if match_any else joined.find(target)
-        if start < 0:
+        joined = ""
+        for txt, rect in line_words:
+            begin = len(joined)
+            joined += txt
+            segments.append((begin, len(joined), rect))
+        if not segments:
             continue
-        end = start + (1 if match_any else len(target))
-        boxes = [rect for first, last, rect in segments
-                 if first < end and last > start]
-        if boxes:
-            return (min(b[0] for b in boxes), min(b[1] for b in boxes),
-                    max(b[0] + b[2] for b in boxes),
-                    max(b[1] + b[3] for b in boxes))
-    return None
+        if match_any:
+            exact.append((1.0, segments[0][2]))
+            continue
+        offset = 0
+        while True:
+            pos = joined.find(target, offset)
+            if pos < 0:
+                break
+            stop = pos + len(target)
+            bounds_ok = (mode == "Contains" or
+                         (any(a == pos for a, b, r in segments) and
+                          any(b == stop for a, b, r in segments)))
+            if bounds_ok:
+                rects = [r for a,b,r in segments if a < stop and b > pos]
+                exact.append((1.0, (min(r[0] for r in rects),
+                                    min(r[1] for r in rects),
+                                    max(r[0]+r[2] for r in rects),
+                                    max(r[1]+r[3] for r in rects))))
+            offset = pos + 1
+        if mode == "Fuzzy" and len(target) >= 4:
+            # A low-scoring approximation must never displace an exact result.
+            # Compare complete contiguous OCR words, never arbitrary substrings.
+            for i in range(len(segments)):
+                for j in range(i+1, min(len(segments)+1, i+7)):
+                    candidate = joined[segments[i][0]:segments[j-1][1]]
+                    if abs(len(candidate)-len(target)) > max(2, len(target)//4):
+                        continue
+                    score = max(
+                        difflib.SequenceMatcher(None, candidate, target, autojunk=False).ratio(),
+                        difflib.SequenceMatcher(None, candidate.replace('rn', 'm').replace('vv', 'w'),
+                                                target.replace('rn', 'm').replace('vv', 'w'),
+                                                autojunk=False).ratio())
+                    threshold = 0.94 if len(target) < 6 else 0.84
+                    if score < threshold:
+                        continue
+                    rects = [r for _,_,r in segments[i:j]]
+                    fuzzy.append((score, (min(r[0] for r in rects),
+                                          min(r[1] for r in rects),
+                                          max(r[0]+r[2] for r in rects),
+                                          max(r[1]+r[3] for r in rects))))
+    candidates = exact if exact else fuzzy
+    if fuzzy and not exact:
+        best = max(score for score, _ in fuzzy)
+        candidates = [(score, box) for score, box in fuzzy if score >= best - 0.03]
+    unique = []
+    for _, box in candidates:
+        if box not in unique:
+            unique.append(box)
+    return unique
+
+
+def find_ocr_word_match(words, target_text, match_any=False, match_mode="Contains", occurrence="First"):
+    """Return one OCR word rectangle, or None; preserve older three-arg calls."""
+    matches = find_ocr_word_matches(words, target_text, match_any, match_mode)
+    if not matches:
+        return None
+    return matches[-1] if occurrence == "Last" else matches[0]
+
+
+def sequent_ocr_enhance_bmp(contents, invert=False):
+    """Stretch low-contrast 24-bit BMP values using standard-library byte LUTs.
+
+    The bitmap dimensions, row order, and headers remain untouched, so WinRT
+    returns the same pixel coordinates as the original image. Returns None if
+    there's no contrast information in the screenshot.
+    """
+    if len(contents) < 54 or contents[:2] != b'BM':
+        return None
+    try:
+        offset = struct.unpack_from('<I', contents, 10)[0]
+        depth = struct.unpack_from('<H', contents, 28)[0]
+    except struct.error:
+        return None
+    if depth != 24 or offset < 54 or offset >= len(contents):
+        return None
+    step = max(1, (len(contents)-offset)//25000)
+    if step % 3 == 0:
+        step += 1  # Avoid sampling only one B/G/R channel on 24-bit images.
+    samples = contents[offset::step]
+    if not samples:
+        return None
+    hist = [0] * 256
+    for channel in samples:
+        hist[channel] += 1
+    cutoff = max(1, len(samples)//50) # roughly 2% clipped at each end
+    cumulative = 0
+    low = 0
+    for i, count in enumerate(hist):
+        cumulative += count
+        if cumulative >= cutoff:
+            low = i
+            break
+    cumulative = 0
+    high = 255
+    for i in range(255, -1, -1):
+        cumulative += hist[i]
+        if cumulative >= cutoff:
+            high = i
+            break
+    if high <= low + 10:
+        return None
+    table = bytes(255 - max(0,min(255,round((v-low)*255/(high-low)))) if invert
+                  else max(0,min(255,round((v-low)*255/(high-low))))
+                  for v in range(256))
+    return contents[:offset] + contents[offset:].translate(table)
 
 
 def largest_color_component(raw, width, height, stride, rgb, tolerance=8):
@@ -3641,7 +3744,37 @@ class SequentDynamicEngine:
                     *area, str(action.get('color', '#FFFFFF')).upper(),
                     tolerance=action.get('tolerance', 8))
             elif typ == 'find_text':
-                box = self.app.find_text_rect(*area, action.get('text', ''))
+                opts = {'match_mode': action.get('match_mode', 'Contains'),
+                        'scan_mode': action.get('scan_mode', 'Balanced'),
+                        'occurrence': action.get('occurrence', 'First')}
+                try:
+                    attempts = max(1, min(4, int(action.get('scan_attempts', 1))))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise MacroExecutionError('Find Text attempts must be 1–4') from exc
+                box = None
+                for attempt in range(attempts):
+                    if not idle and not self.app.playing:
+                        raise MacroCancelled('Text search cancelled')
+                    box = self.app.find_text_rect(*area, action.get('text', ''), **opts)
+                    if box is not None:
+                        break
+                    if attempt + 1 < attempts:
+                        self._pause(0.15, idle=idle)
+                if box is not None and action.get('confirm_match', False):
+                    self._pause(0.12, idle=idle)
+                    second = self.app.find_text_rect(*area, action.get('text', ''), **opts)
+                    if not idle and not self.app.playing:
+                        raise MacroCancelled('Text confirmation cancelled')
+                    if second is None:
+                        box = None
+                    else:
+                        a = ((box[0]+box[2])/2, (box[1]+box[3])/2)
+                        b = ((second[0]+second[2])/2, (second[1]+second[3])/2)
+                        allowance = max(12, (box[3]-box[1])*0.7)
+                        if math.hypot(a[0]-b[0], a[1]-b[1]) > allowance:
+                            box = None
+                        else:
+                            box = second
             else:
                 box = self.find_image(action)
             if not idle and not self.app.playing:
@@ -7191,6 +7324,49 @@ class VSCodeQueueViewer(tk.Frame):
         act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         act_menu.pack(side=tk.LEFT, padx=(6, 0))
 
+        tuning = tk.Frame(body, bg=BG_PANEL)
+        tuning.pack(fill=tk.X, pady=(0, 7))
+        text_label(tuning, "Match:").pack(side=tk.LEFT)
+        match_var = tk.StringVar(value=curr.get('match_mode', 'Whole Words'))
+        match_menu = tk.OptionMenu(tuning, match_var, 'Whole Words', 'Contains', 'Fuzzy')
+        match_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), bd=0,
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+        match_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        match_menu.pack(side=tk.LEFT, padx=(6, 9))
+        text_label(tuning, "OCR:").pack(side=tk.LEFT)
+        scan_var = tk.StringVar(value=curr.get('scan_mode', 'Balanced'))
+        scan_menu = tk.OptionMenu(tuning, scan_var, 'Fast', 'Balanced', 'Thorough')
+        scan_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), bd=0,
+                         highlightthickness=1, highlightbackground=BG_BORDER)
+        scan_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        scan_menu.pack(side=tk.LEFT, padx=(5, 0))
+
+        settings_row = tk.Frame(body, bg=BG_PANEL)
+        settings_row.pack(fill=tk.X, pady=(0, 8))
+        text_label(settings_row, "If repeated:").pack(side=tk.LEFT)
+        occurrence_var = tk.StringVar(value=curr.get('occurrence', 'First'))
+        occurrence_menu = tk.OptionMenu(settings_row, occurrence_var, 'First', 'Last')
+        occurrence_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), bd=0,
+                               highlightthickness=1, highlightbackground=BG_BORDER)
+        occurrence_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        occurrence_menu.pack(side=tk.LEFT, padx=(6, 10))
+        text_label(settings_row, "Attempts:").pack(side=tk.LEFT)
+        tries_var = tk.StringVar(value=str(curr.get('scan_attempts', 2)))
+        tries_menu = tk.OptionMenu(settings_row, tries_var, '1', '2', '3', '4')
+        tries_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), bd=0,
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+        tries_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        tries_menu.pack(side=tk.LEFT, padx=(5, 0))
+        confirm_var = tk.BooleanVar(value=bool(curr.get('confirm_match', False)))
+        tk.Checkbutton(body, text="Confirm location with a second scan before clicking",
+                       variable=confirm_var, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       activeforeground=TEXT_PRIMARY, font=("Segoe UI", 8)).pack(anchor='w', pady=(0, 5))
+        tk.Label(body, text="Whole Words prevents substring misclicks. Fuzzy tolerates minor OCR errors; "
+                 "Thorough checks inverted/high-contrast text but takes longer.",
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=("Segoe UI",8),
+                 anchor='w', justify='left', wraplength=450).pack(fill=tk.X, pady=(0, 8))
+
         get_outcomes = sequent_add_screen_outcome_editor(body, self.app, curr or {'type':'find_text'})
 
         if edit_idx is None:
@@ -7228,7 +7404,11 @@ class VSCodeQueueViewer(tk.Frame):
                 return
             updated_action.update({"type": "find_text", "area": area,
                                    "text": target_text, "anchor": anchor_var.get(),
-                                   "ox": ox, "oy": oy, "action": act_var.get()})
+                                   "ox": ox, "oy": oy, "action": act_var.get(),
+                                   "match_mode": match_var.get(), "scan_mode": scan_var.get(),
+                                   "occurrence": occurrence_var.get(),
+                                   "scan_attempts": int(tries_var.get()),
+                                   "confirm_match": bool(confirm_var.get())})
             if edit_idx is not None:
                 saved_idx = edit_idx
                 self.app.recorded_actions[edit_idx] = updated_action
@@ -7244,6 +7424,60 @@ class VSCodeQueueViewer(tk.Frame):
             if start_reticle:
                 self.app.root.after(90, self.app.toggle_reticle_edit)
 
+        def test_match():
+            try:
+                coords = [int(field.get().strip()) for field in area_entries]
+                validated_capture_area(coords)
+                target = txt_entry.get().strip()
+                if not target:
+                    raise ValueError('Enter text to search for')
+                options = {'match_mode': match_var.get(), 'scan_mode': scan_var.get(),
+                           'occurrence': occurrence_var.get()}
+            except (ValueError, MacroExecutionError) as exc:
+                error_lbl.config(text=str(exc))
+                return
+            error_lbl.config(text='Testing OCR (no click)…', fg=TEXT_MUTED)
+            # Hide the editor while taking the screenshot so it cannot itself
+            # appear as a false match. The main workspace may still occlude the
+            # user-selected region; tests should target visible applications.
+            editor = self.sub_menu
+            if editor and editor.winfo_exists():
+                editor.withdraw()
+            def task():
+                found = None
+                problem = None
+                started = time.perf_counter()
+                try:
+                    found = self.app.find_text_rect(*coords, target, **options)
+                except Exception as exc:
+                    problem = str(exc)
+                elapsed = time.perf_counter() - started
+                diagnostics = getattr(self.app, '_last_find_text_ocr', {})
+                def show():
+                    if editor and editor.winfo_exists():
+                        editor.deiconify()
+                        editor.lift()
+                    if not body.winfo_exists():
+                        return
+                    if problem:
+                        error_lbl.config(text='OCR error: '+problem, fg=COLOR_DANGER)
+                    elif found:
+                        self.app.draw_highlight_box(*found, outline_color=COLOR_SUCCESS,
+                                                    duration_ms=1700)
+                        error_lbl.config(text=f'Match: {found} in {elapsed:.2f}s (no click).',
+                                         fg=COLOR_SUCCESS)
+                    else:
+                        preview = ' | '.join(diagnostics.get('recognized', []))[:180]
+                        error_lbl.config(text=f'No match ({elapsed:.2f}s). OCR saw: {preview or "nothing"}',
+                                         fg=SYNTAX_ORANGE)
+                try:
+                    self.app.root.after(0, show)
+                except tk.TclError:
+                    pass
+            Thread(target=task, daemon=True).start()
+
+        ModernButton(body, text='Test Text Match (No Click)', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER, command=test_match).pack(fill=tk.X,pady=(0, 6))
         ModernButton(body, text="Save Changes" if edit_idx is not None else "Add Find Text Action",
                      bg_color=COLOR_SUCCESS, hover_color="#1d8a4b",
                      command=save).pack(fill=tk.X, pady=(0, 5))
@@ -8166,7 +8400,11 @@ class GhostReticle:
                         box = app.dynamic_engine.find_image(act)
                     else:
                         text = act.get("text", "")
-                        box = app.find_text_rect(*region, text)
+                        box = app.find_text_rect(
+                            *region, text,
+                            match_mode=act.get('match_mode', 'Contains'),
+                            scan_mode=act.get('scan_mode', 'Balanced'),
+                            occurrence=act.get('occurrence', 'First'))
                     results.put((generation, box, None))
                 except Exception as exc:
                     results.put((generation, None, str(exc)))
@@ -8272,7 +8510,11 @@ class GhostReticle:
                         if act.get("type") == "find_color":
                             found_box = app.search_color_in_area(*area, act.get("color", "#FFFFFF"), tolerance=act.get("tolerance", 8))
                         elif act.get('type') == 'find_text':
-                            found_box = app.find_text_rect(*area, act.get("text", ""))
+                            found_box = app.find_text_rect(
+                                *area, act.get("text", ""),
+                                match_mode=act.get('match_mode','Contains'),
+                                scan_mode=act.get('scan_mode','Balanced'),
+                                occurrence=act.get('occurrence','First'))
                         elif act.get('type') == 'find_image':
                             found_box = app.dynamic_engine.find_image(act)
                         else:
@@ -10638,7 +10880,11 @@ class BuiltInMacroApp:
         elif act_type == "find_text":
             area = action.get("area", [0, 0, 100, 100])
             target_text = action.get("text", "")
-            found_box = self.find_text_rect(*area, target_text)
+            found_box = self.find_text_rect(
+                *area, target_text,
+                match_mode=action.get('match_mode','Contains'),
+                scan_mode=action.get('scan_mode','Balanced'),
+                occurrence=action.get('occurrence','First'))
 
             if not idle and not self.playing:
                 raise MacroCancelled('Playback stopped during target search')
@@ -10913,7 +11159,7 @@ class BuiltInMacroApp:
             f"Search area: ({x}, {y}) · {w} x {h} native screen pixels",
             SYNTAX_BLUE)
 
-    def capture_screen_area_to_bmp(self, x, y, w, h, filepath):
+    def capture_screen_area_to_bmp(self, x, y, w, h, filepath, scale=None):
         """Capture the selected screen rectangle as a BMP for WinRT OCR.
 
         Typed GDI signatures are required for x64 Python. GetDIBits must be
@@ -10922,7 +11168,9 @@ class BuiltInMacroApp:
         x, y, w, h = map(int, (x, y, w, h))
         if w <= 0 or h <= 0:
             raise MacroExecutionError("OCR capture area must have positive width and height")
-        scale = min(6, max(1, int(160 / h)))
+        scale = min(6, max(1, int(160 / h))) if scale is None else int(scale)
+        if not 1 <= scale <= 6:
+            raise MacroExecutionError("OCR capture scale must be between 1 and 6")
         tw, th = w * scale, h * scale
         if tw * th > 32_000_000:
             raise MacroExecutionError("OCR capture region is too large")
@@ -11002,23 +11250,59 @@ class BuiltInMacroApp:
                 gdi32.DeleteDC(mem_dc)
             user32.ReleaseDC(None, screen_dc)
 
-    def find_text_rect(self, x, y, w, h, target_text, match_any=False):
-        """Return the exact matched text's screen bbox (exclusive right/bottom)."""
+    def find_text_rect(self, x, y, w, h, target_text, match_any=False, *,
+                       match_mode="Contains", scan_mode="Balanced", occurrence="First"):
+        """Recognize text in absolute screen pixels with optional enhanced OCR.
+
+        One WinRT/PowerShell process handles all requested preprocessing passes.
+        Scale is capped by image dimensions to avoid exceeding OCR engine limits.
+        No external Python dependencies are used, and screenshots are temporary.
+        """
         x, y, w, h = map(int, (x, y, w, h))
         if w <= 0 or h <= 0:
             raise MacroExecutionError("Find Text requires a positive search area")
+        if w * h > 16_000_000:
+            raise MacroExecutionError("Find Text area exceeds 16 million pixels")
         if not str(target_text).strip() and not match_any:
             raise MacroExecutionError("Find Text requires nonempty target text")
-        scale = min(6, max(1, int(160 / h)))
-        temp_fd, temp_bmp = tempfile.mkstemp(suffix=".bmp")
-        os.close(temp_fd)
+        if scan_mode not in ("Fast", "Balanced", "Thorough"):
+            scan_mode = "Balanced"
+        # WinRT OCR typically rejects oversized bitmaps. Scale *only* if a
+        # selected region fits; never infer glyph size from the box height.
+        scale = 1
+        if max(w, h) <= 1024 and w * h * 4 <= 8_000_000:
+            scale = 2
+        if max(w, h) <= 640 and w * h * 9 <= 8_000_000 and scan_mode == "Thorough":
+            scale = 3
+        temp_files = []
         try:
-            self.capture_screen_area_to_bmp(x, y, w, h, temp_bmp)
-            abs_bmp_path = os.path.abspath(temp_bmp).replace("'", "''")
-            ps_script = f"""
+            handle, primary = tempfile.mkstemp(suffix=".bmp")
+            os.close(handle)
+            temp_files.append(primary)
+            self.capture_screen_area_to_bmp(x, y, w, h, primary, scale=scale)
+            if scan_mode != "Fast":
+                enhanced = sequent_ocr_enhance_bmp(Path(primary).read_bytes(), invert=False)
+                if enhanced is not None:
+                    handle, path = tempfile.mkstemp(suffix=".bmp")
+                    os.close(handle)
+                    Path(path).write_bytes(enhanced)
+                    temp_files.append(path)
+            if scan_mode == "Thorough":
+                enhanced = sequent_ocr_enhance_bmp(Path(primary).read_bytes(), invert=True)
+                if enhanced is not None:
+                    handle, path = tempfile.mkstemp(suffix=".bmp")
+                    os.close(handle)
+                    Path(path).write_bytes(enhanced)
+                    temp_files.append(path)
+
+            # Build an encoded command so every OCR pass can reuse the same
+            # WinRT runtime and engine, avoiding repeated PowerShell startups.
+            literal_paths = ','.join("'"+os.path.abspath(f).replace("'", "''")+"'"
+                                     for f in temp_files)
+            ps_script = r"""
 $ErrorActionPreference = 'Stop'
-$stream = $null
-try {{
+$paths = @(__PATHS__)
+try {
     Add-Type -AssemblyName System.Runtime.WindowsRuntime
     [void][Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime]
     [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
@@ -11027,89 +11311,109 @@ try {{
     [void][Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType=WindowsRuntime]
     [void][Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
     [void][Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType=WindowsRuntime]
-
-    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
         $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
         $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-    }})[0]
-    if (-not $asTaskGeneric) {{ throw 'WinRT AsTask method unavailable' }}
-    function Await-Op($asyncOp, $type) {{
-        $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($asyncOp))
-        if (-not $task.Wait(9000)) {{ throw 'OCR async operation timed out' }}
+    })[0]
+    if (-not $asTask) { throw 'WinRT AsTask unavailable' }
+    function Await-Op($asyncOp, $type) {
+        $task = $asTask.MakeGenericMethod($type).Invoke($null, @($asyncOp))
+        if (-not $task.Wait(9000)) { throw 'OCR operation timed out' }
         return $task.Result
-    }}
-    $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync('{abs_bmp_path}')) ([Windows.Storage.StorageFile])
-    $stream = Await-Op ($file.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
-    $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    }
     $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-    if (-not $engine) {{
+    if (-not $engine) {
         $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US'))
-    }}
-    if (-not $engine) {{
-        $available = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
-        if ($available -and $available.Count -gt 0) {{
-            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($available[0])
-        }}
-    }}
-    if (-not $engine) {{ throw 'No OCR language available on this computer' }}
-    $recognized = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $results = @()
-    $lineIndex = 0
-    if ($recognized -and $recognized.Lines) {{
-        foreach ($line in $recognized.Lines) {{
-            foreach ($word in $line.Words) {{
-                $r = $word.BoundingRect
-                $results += [PSCustomObject]@{{ Line = $lineIndex; Text = $word.Text;
-                    X = $r.X; Y = $r.Y; Width = $r.Width; Height = $r.Height }}
-            }}
-            $lineIndex++
-        }}
-    }}
+    }
+    if (-not $engine) {
+        $languages = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+        if ($languages -and $languages.Count -gt 0) {
+            $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($languages[0])
+        }
+    }
+    if (-not $engine) { throw 'No Windows OCR language is installed' }
+    $all = @()
+    for ($pass = 0; $pass -lt $paths.Count; $pass++) {
+        $stream = $null
+        try {
+            $file = Await-Op ([Windows.Storage.StorageFile]::GetFileFromPathAsync($paths[$pass])) ([Windows.Storage.StorageFile])
+            $stream = Await-Op ($file.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
+            $decoder = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $bitmap = Await-Op ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            $result = Await-Op ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+            $words = @()
+            $lineIndex = 0
+            if ($result -and $result.Lines) {
+                foreach ($line in $result.Lines) {
+                    foreach ($word in $line.Words) {
+                        $box = $word.BoundingRect
+                        $words += [PSCustomObject]@{ Line = $lineIndex; Text = $word.Text;
+                            X = $box.X; Y = $box.Y; Width = $box.Width; Height = $box.Height }
+                    }
+                    $lineIndex++
+                }
+            }
+            $all += [PSCustomObject]@{ Pass = $pass; Words = @($words) }
+        } finally {
+            if ($stream) { $stream.Dispose() }
+        }
+    }
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    ConvertTo-Json -InputObject $results -Compress -Depth 4
-}} catch {{
+    ConvertTo-Json -InputObject @($all) -Compress -Depth 5
+} catch {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     Write-Output ('ERR:' + $_.Exception.Message)
-}} finally {{
-    if ($stream) {{ $stream.Dispose() }}
-}}
-"""
-            encoded_cmd = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+}
+""".replace('__PATHS__', literal_paths)
+            encoded = base64.b64encode(ps_script.encode('utf-16le')).decode('ascii')
             try:
                 proc = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
-                     "Bypass", "-EncodedCommand", encoded_cmd],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    creationflags=0x08000000, timeout=12
-                )
+                    ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy',
+                     'Bypass', '-EncodedCommand', encoded],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    encoding='utf-8', errors='replace', creationflags=0x08000000,
+                    timeout=20 if scan_mode == 'Thorough' else 15)
             except (OSError, subprocess.TimeoutExpired) as exc:
-                raise MacroExecutionError(f"Find Text OCR process failed: {exc}") from exc
-            out = proc.stdout.strip().lstrip("\ufeff")
-            if out.startswith("ERR:"):
-                raise MacroExecutionError(f"Find Text OCR: {out[4:]}")
-            if proc.returncode != 0 or not out:
-                detail = proc.stderr.strip() or "No OCR response"
-                raise MacroExecutionError(f"Find Text OCR failed: {detail[:300]}")
+                raise MacroExecutionError(f'Find Text OCR process failed: {exc}') from exc
+            out = proc.stdout.strip().lstrip('\ufeff')
+            if out.startswith('ERR:'):
+                raise MacroExecutionError(f'Find Text OCR: {out[4:]}')
+            if proc.returncode or not out:
+                raise MacroExecutionError('Find Text OCR failed: '+
+                                          (proc.stderr.strip() or 'No OCR output')[:300])
             try:
-                words = json.loads(out)
+                passes = json.loads(out)
             except json.JSONDecodeError as exc:
-                raise MacroExecutionError(f"Find Text OCR returned invalid data: {out[:160]}") from exc
-            if not isinstance(words, list):
-                words = [words] if words else []
-            rect = find_ocr_word_match(words, target_text, match_any)
-            if rect is None:
-                return None
-            x1, y1, x2, y2 = rect
-            return (x + math.floor(x1 / scale), y + math.floor(y1 / scale),
-                    x + max(math.floor(x1 / scale) + 1, math.ceil(x2 / scale)),
-                    y + max(math.floor(y1 / scale) + 1, math.ceil(y2 / scale)))
+                raise MacroExecutionError('Find Text OCR returned invalid JSON') from exc
+            if not isinstance(passes, list):
+                passes = [passes]
+            self._last_find_text_ocr = {'passes': len(passes), 'recognized': [],
+                                        'matched': False}
+            for item in passes:
+                if not isinstance(item, dict):
+                    continue
+                words = item.get('Words', [])
+                if isinstance(words, dict):
+                    words = [words]
+                if not isinstance(words, list):
+                    continue
+                self._last_find_text_ocr['recognized'].append(
+                    ' '.join(str(word.get('Text','')) for word in words if isinstance(word,dict))[:350])
+                rect = find_ocr_word_match(words, target_text, match_any,
+                                           match_mode, occurrence)
+                if rect is not None:
+                    self._last_find_text_ocr['matched'] = True
+                    x1, y1, x2, y2 = rect
+                    return (x + math.floor(x1 / scale), y + math.floor(y1 / scale),
+                            x + max(math.floor(x1 / scale)+1, math.ceil(x2 / scale)),
+                            y + max(math.floor(y1 / scale)+1, math.ceil(y2 / scale)))
+            return None
         finally:
-            try:
-                os.remove(temp_bmp)
-            except OSError:
-                pass
+            for path in temp_files:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
     def search_color_in_area(self, x, y, w, h, hex_color, tolerance=8):
