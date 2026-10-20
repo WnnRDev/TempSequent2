@@ -4110,12 +4110,40 @@ class SequentDynamicEngine:
             if typ=='trigger_start':index+=1;continue
             
             if typ == 'clip_fallback':
+                # A clipboard fallback only fires when *none* of the keywords
+                # are present. Never overwrite an existing value on a match.
                 cb_text = get_clipboard_text().casefold()
-                keywords = [k.strip().casefold() for k in action.get('keywords', []) if k.strip()]
-                match_found = any(kw in cb_text for kw in keywords)
-                if not match_found:
-                    return {'switch': 'preset', 'target': action.get('preset', '')}
-                index += 1; continue
+                keywords = [str(k).strip().casefold() for k in action.get('keywords', [])
+                            if str(k).strip()]
+                if not keywords:
+                    raise MacroExecutionError('Clipboard Branch / Fallback needs a keyword')
+                if any(keyword in cb_text for keyword in keywords):
+                    index += 1
+                    continue
+
+                # Missing on_miss means this is an older preset: preserve the
+                # original behavior of switching to the configured macro.
+                fallback = action.get('on_miss', 'Run Saved Macro')
+                choices = ('Run Saved Macro', 'Set Variable',
+                           'Set Variable & Run Saved Macro', 'Continue')
+                if fallback not in choices:
+                    raise MacroExecutionError(f'Unsupported clipboard fallback: {fallback!r}')
+                wants_variable = fallback in ('Set Variable', 'Set Variable & Run Saved Macro')
+                wants_macro = fallback in ('Run Saved Macro', 'Set Variable & Run Saved Macro')
+                target = str(action.get('preset', '')).strip()
+                if wants_macro:
+                    if not target or target not in self.app.get_preset_names():
+                        raise MacroExecutionError(f'Clipboard fallback macro {target!r} is missing')
+                if wants_variable:
+                    name = action.get('var_name', '')
+                    scope = action.get('var_scope', 'local')
+                    variable_identity(name, scope)
+                    value = self.interpolate(str(action.get('value', '')))
+                    set_variable(self.app, name, value, scope)
+                if wants_macro:
+                    return {'switch': 'preset', 'target': target}
+                index += 1
+                continue
 
             
             if typ == 'gate_check':
@@ -4173,7 +4201,7 @@ class VSCodeQueueViewer(tk.Frame):
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
             ("Read Clipboard", "Capture text or route clipboard keywords to scoped variables.", "RC"),
-            ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "CB"),
+            ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
             ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
@@ -5739,60 +5767,149 @@ class VSCodeQueueViewer(tk.Frame):
 
     def _render_clipboard_fallback_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
-        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+        curr_act = (self.app.recorded_actions[edit_idx] if
+                    edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+                    else None)
 
-        tk.Label(body, text="Keywords to find (comma separated):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        kw_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        tk.Label(body, text='Keywords to find (comma separated):',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL, fg=TEXT_MUTED,
+                 anchor='w').pack(fill=tk.X, pady=(0, 2))
+        kw_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                            bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
         kw_entry.pack(fill=tk.X, ipady=3, pady=(0, 8))
-        init_kws = ", ".join(curr_act.get("keywords", [])) if (curr_act and curr_act.get("type") == "clip_fallback") else "Success, OK, Done"
-        kw_entry.insert(0, init_kws)
+        previous = ', '.join(curr_act.get('keywords', [])) if curr_act else 'Success, OK, Done'
+        kw_entry.insert(0, previous)
 
-        tk.Label(body, text="If NONE are found, Run Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
+        tk.Label(body, text='If NONE of these keywords are found:',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL, fg=TEXT_MUTED,
+                 anchor='w').pack(fill=tk.X, pady=(0, 2))
+        choices = ('Run Saved Macro', 'Set Variable',
+                   'Set Variable & Run Saved Macro', 'Continue')
+        initial = curr_act.get('on_miss', 'Run Saved Macro') if curr_act else 'Run Saved Macro'
+        result_var = tk.StringVar(value=initial if initial in choices else choices[0])
+        result_menu = tk.OptionMenu(body, result_var, *choices)
+        result_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                           highlightthickness=1, highlightbackground=BG_BORDER,
+                           bd=0, relief='flat')
+        result_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   activebackground=COLOR_ACCENT)
+        result_menu.pack(fill=tk.X, pady=(0, 8))
+
+        # Only show the destination settings when this outcome stores a value.
+        # Scope is explicit and saved with the action, not encoded in its name.
+        variable_panel = tk.Frame(body, bg=BG_PANEL)
+        tk.Label(variable_panel, text='Variable Name:',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 2))
+        var_entry = tk.Entry(variable_panel, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+                             font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                             bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        var_entry.pack(fill=tk.X, ipady=3, pady=(0, 5))
+        existing_name = curr_act.get('var_name', 'status') if curr_act else 'status'
+        var_entry.insert(0, variable_identity(existing_name or 'status',
+                         curr_act.get('var_scope') if curr_act else None)[0])
+        scope_var = self._add_variable_scope_picker(variable_panel, curr_act)
+        tk.Label(variable_panel, text='Value to store when no keyword matches:',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 2))
+        value_entry = tk.Entry(variable_panel, bg=BG_INPUT, fg=SYNTAX_GREEN,
+                               font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                               bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        value_entry.pack(fill=tk.X, ipady=3, pady=(0, 4))
+        value_entry.insert(0, curr_act.get('value', 'UNKNOWN') if curr_act else 'UNKNOWN')
+        tk.Label(variable_panel,
+                 text='Supports ${variable_name}. A Global value is saved in globals.json.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=340, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 8))
+
+        macro_panel = tk.Frame(body, bg=BG_PANEL)
+        tk.Label(macro_panel, text='Saved macro to run:',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL, fg=TEXT_MUTED,
+                 anchor='w').pack(fill=tk.X, pady=(0, 2))
         preset_names = self.app.get_preset_names()
-        init_preset = curr_act.get("preset", "") if (curr_act and curr_act.get("type") == "clip_fallback") else ""
-        chosen_preset = init_preset if init_preset in preset_names else (preset_names[0] if preset_names else "-- No Presets Found --")
-        preset_var = tk.StringVar(value=chosen_preset)
-
-        opt_preset = tk.OptionMenu(body, preset_var, *(preset_names if preset_names else ["-- No Presets Found --"]))
-        opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+        init_preset = curr_act.get('preset', '') if curr_act else ''
+        # Keep a missing saved preset visible, instead of silently selecting a
+        # different macro when editing an old action.
+        options = list(preset_names)
+        if init_preset and init_preset not in options:
+            options.append(init_preset)
+        if not options:
+            options = ['-- No Presets Found --']
+        chosen = init_preset if init_preset else options[0]
+        preset_var = tk.StringVar(value=chosen)
+        opt_preset = tk.OptionMenu(macro_panel, preset_var, *options)
+        opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 8),
+                          highlightthickness=1, highlightbackground=BG_BORDER,
+                          bd=0, relief='flat')
+        opt_preset['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
         opt_preset.pack(fill=tk.X, pady=(0, 8))
 
+        def update_fallback_fields(*_):
+            selection = result_var.get()
+            variable_panel.pack_forget()
+            macro_panel.pack_forget()
+            if selection in ('Set Variable', 'Set Variable & Run Saved Macro'):
+                variable_panel.pack(fill=tk.X, pady=(0, 6))
+            if selection in ('Run Saved Macro', 'Set Variable & Run Saved Macro'):
+                macro_panel.pack(fill=tk.X, pady=(0, 6))
+
+        result_var.trace_add('write', update_fallback_fields)
+        update_fallback_fields()
+
         if edit_idx is None:
-            pos_var = tk.StringVar(value=f"Before Line {line_num}")
-            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_var = tk.StringVar(value=f'Before Line {line_num}')
+            pos_menu = tk.OptionMenu(body, pos_var, f'Before Line {line_num}',
+                                     f'After Line {line_num}')
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 8),
+                            highlightthickness=1, highlightbackground=BG_BORDER,
+                            bd=0, relief='flat')
+            pos_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
             pos_menu.pack(fill=tk.X, pady=(0, 10))
 
         def submit():
-            raw_kws = [k.strip() for k in kw_entry.get().split(",") if k.strip()]
-            target_preset = preset_var.get()
-            if not raw_kws or target_preset == "-- No Presets Found --":
+            keywords = [s.strip() for s in kw_entry.get().split(',') if s.strip()]
+            if not keywords:
+                self.app.update_status('Clipboard fallback requires a keyword', COLOR_DANGER)
                 return
-
-            new_act = {
-                "type": "clip_fallback",
-                "keywords": raw_kws,
-                "preset": target_preset
-            }
-
+            behavior = result_var.get()
+            new_act = {'type': 'clip_fallback', 'keywords': keywords,
+                       'on_miss': behavior}
+            if behavior in ('Set Variable', 'Set Variable & Run Saved Macro'):
+                name = var_entry.get().strip()
+                scope = scope_var.get().lower()
+                try:
+                    variable_identity(name, scope)
+                except MacroExecutionError as exc:
+                    self.app.update_status(str(exc), COLOR_DANGER)
+                    return
+                new_act.update(var_name=name, var_scope=scope, value=value_entry.get())
+            if behavior in ('Run Saved Macro', 'Set Variable & Run Saved Macro'):
+                preset = preset_var.get()
+                if not preset or preset not in self.app.get_preset_names():
+                    self.app.update_status('Choose an existing fallback macro', COLOR_DANGER)
+                    return
+                new_act['preset'] = preset
             if edit_idx is not None:
                 self.app.recorded_actions[edit_idx] = new_act
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
-                self.app.update_status("Updated Clipboard Fallback", COLOR_SUCCESS)
+                self.app.update_status('Updated Clipboard Fallback', COLOR_SUCCESS)
             else:
-                is_after = "After" in pos_var.get()
+                is_after = 'After' in pos_var.get()
                 insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
                 insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
                 self.app.recorded_actions.insert(insert_idx, new_act)
                 self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.update_status("Added Clipboard Fallback", COLOR_SUCCESS)
+                self.app.update_status('Added Clipboard Fallback', COLOR_SUCCESS)
             self.close_sub_menu()
 
-        btn_txt = "Save Changes" if edit_idx is not None else "Add Clipboard Fallback"
-        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        label = 'Save Changes' if edit_idx is not None else 'Add Clipboard Fallback'
+        ModernButton(body, text=label, bg_color=COLOR_SUCCESS if edit_idx is not None
+                     else COLOR_ACCENT, hover_color='#1d8a4b' if edit_idx is not None
+                     else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_type_variable_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -10720,7 +10837,18 @@ class BuiltInMacroApp:
         elif act_type == "clip_fallback":
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
-            return f"clipboard.fallback(miss='{preview}' ➔ preset '{action.get('preset', '')}')"
+            behavior = action.get('on_miss', 'Run Saved Macro')
+            if behavior == 'Continue':
+                outcome = 'continue'
+            else:
+                outcomes = []
+                if behavior in ('Set Variable', 'Set Variable & Run Saved Macro'):
+                    scope = action.get('var_scope', 'local').lower()
+                    outcomes.append(f"set {scope}.{action.get('var_name', 'status')}={action.get('value', '')!r}")
+                if behavior in ('Run Saved Macro', 'Set Variable & Run Saved Macro'):
+                    outcomes.append(f"run {action.get('preset', '')!r}")
+                outcome = ' & '.join(outcomes)
+            return f"clipboard.fallback(no_match={preview!r} ➔ {outcome})"
         return f"{act_type}"
         
 
