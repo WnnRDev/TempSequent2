@@ -1125,8 +1125,11 @@ def perform_color_target_action(action, found_box, playback_speed=1.0):
     """
     tx, ty = color_click_target(action, found_box)
     mode = action.get("action", "Single Click")
-    if mode not in ("Move Only", "Single Click", "Double Click"):
+    if mode not in ("Detect Only", "Move Only", "Single Click", "Double Click"):
         raise MacroExecutionError(f"Unrecognized Find Color action: {mode!r}")
+    if mode == "Detect Only":
+        # The outcome can route to another macro without touching the cursor.
+        return (mode, tx, ty)
     move_mouse(tx, ty)
     # Not proportional to speed: the target UI still needs time to handle
     # mouse movement even when macro playback is accelerated.
@@ -2190,7 +2193,7 @@ DYNAMIC_ACTION_SPECS = {
    ('name','Accessible element name contains','text',''),
    ('automation_id','Automation ID (optional)','text',''),
    ('control_type','Control type e.g. ButtonControl (optional)','text',''),
-   ('action','Mouse action','choice','Single Click',['Move Only','Single Click','Double Click']),
+   ('action','Mouse action','choice','Single Click',['Detect Only','Move Only','Single Click','Double Click']),
    ('ox','Horizontal offset (pixels)','int',0),('oy','Vertical offset (pixels)','int',0)]),
  'Smart Wait & Retry':('smart_wait',[
    ('kind','Watch for','choice','text',['text','window','color','image','ui_element','clipboard','file','variable']),
@@ -2238,7 +2241,7 @@ DYNAMIC_ACTION_SPECS = {
    ('confidence','Match confidence (0–1)','float',0.85),
    ('scale_mode','Image scale range','choice','Auto',['Auto','Exact','Small changes']),
    ('anchor','Target anchor','choice','Center',['Top Left','Top Center','Top Right','Middle Left','Center','Middle Right','Bottom Left','Bottom Center','Bottom Right']),
-   ('action','Mouse action','choice','Single Click',['Move Only','Single Click','Double Click']),
+   ('action','Mouse action','choice','Single Click',['Detect Only','Move Only','Single Click','Double Click']),
    ('ox','Horizontal offset (pixels)','int',0),('oy','Vertical offset (pixels)','int',0)]),
  'Recovery Policy':('recovery',[
    ('on_error','When an action fails','choice','stop',['stop','skip','goto']),
@@ -2845,6 +2848,126 @@ DYNAMIC_ACTION_TYPES = frozenset({
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
 
+SCREEN_RECOGNITION_TYPES = frozenset(('search_area', 'find_color', 'find_text', 'find_image'))
+SCREEN_OUTCOME_OPTIONS = (
+    'Continue', 'Run Saved Macro', 'Jump to Label', 'Stop Macro', 'Stop with Error'
+)
+
+
+def sequent_screen_outcome_config(action, found):
+    """Return (behavior, target), including defaults for old saved presets.
+
+    Old Search Selected Area actions run their saved preset on a match and
+    continue on a miss. Other old screen searches click on match and raise on
+    a miss. New actions store explicit if_found / if_not_found settings.
+    """
+    typ = action.get('type')
+    if typ not in SCREEN_RECOGNITION_TYPES:
+        raise MacroExecutionError(f'Not a screen recognition action: {typ!r}')
+    key = 'if_found' if found else 'if_not_found'
+    if key in action:
+        behavior = action[key]
+        target = action.get(key + '_target', '')
+    elif typ == 'search_area' and found:
+        target = action.get('preset', '')
+        behavior = 'Run Saved Macro' if target else 'Continue'
+    else:
+        target = ''
+        behavior = ('Continue' if found or typ == 'search_area'
+                    else 'Stop with Error')
+    if behavior not in SCREEN_OUTCOME_OPTIONS:
+        raise MacroExecutionError(f'Invalid {key} option: {behavior!r}')
+    return behavior, str(target or '').strip()
+
+
+def sequent_add_screen_outcome_editor(parent, app, action):
+    """Reusable IF FOUND / IF NOT FOUND controls for all four editors.
+
+    The returned reader validates selected targets and serializes stable JSON
+    fields; no code uses hidden prefix or action-specific preset widgets.
+    """
+    tk.Label(parent, text='AFTER SCREEN RECOGNITION', bg=BG_PANEL, fg=SYNTAX_BLUE,
+             font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 5))
+    tk.Label(parent, text='If found, the configured mouse action happens first. '
+             'Run Saved Macro switches to that macro (it does not return). '
+             'Missing matches only follow If Not Found; capture errors still stop playback.',
+             bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+             anchor='w', justify='left', wraplength=445).pack(fill=tk.X, pady=(0, 8))
+
+    presets = list(getattr(app, 'get_preset_names', lambda: [])())
+    labels = [str(a.get('name', '')).strip() for a in getattr(app, 'recorded_actions', [])
+              if isinstance(a, dict) and a.get('type') == 'label' and a.get('name')]
+    settings = {}
+    for found, caption in ((True, 'IF FOUND'), (False, 'IF NOT FOUND')):
+        mode, target = sequent_screen_outcome_config(action, found)
+        frame = tk.Frame(parent, bg=BG_PANEL)
+        frame.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(frame, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(0, 3))
+        choice = tk.StringVar(value=mode)
+        menu = tk.OptionMenu(frame, choice, *SCREEN_OUTCOME_OPTIONS)
+        menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                    highlightthickness=1, highlightbackground=BG_BORDER)
+        menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            activebackground=COLOR_ACCENT)
+        menu.pack(fill=tk.X)
+        target_box = tk.Frame(frame, bg=BG_PANEL)
+        target_box.pack(fill=tk.X, pady=(4, 0))
+        selected = {'variable':None, 'kind':None}
+
+        def render_target(*_args, choice=choice, target_box=target_box,
+                          selected=selected, original=target):
+            prior = selected['variable'].get() if selected['variable'] is not None else original
+            for widget in target_box.winfo_children():
+                widget.destroy()
+            selected['variable'] = None
+            selected['kind'] = None
+            mode = choice.get()
+            if mode not in ('Run Saved Macro', 'Jump to Label'):
+                return
+            values = presets if mode == 'Run Saved Macro' else labels
+            kind = 'Saved macro' if mode == 'Run Saved Macro' else 'Queue label'
+            tk.Label(target_box, text=kind + ':', bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w')
+            candidates = list(dict.fromkeys(([prior] if prior else []) + values))
+            if not candidates:
+                candidates = ['-- None available --']
+            if prior not in candidates:
+                prior = candidates[0]
+            var = tk.StringVar(value=prior or candidates[0])
+            options = tk.OptionMenu(target_box, var, *candidates)
+            options.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                           highlightthickness=1, highlightbackground=BG_BORDER)
+            options['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   activebackground=COLOR_ACCENT)
+            options.pack(fill=tk.X)
+            selected['variable'] = var
+            selected['kind'] = mode
+
+        choice.trace_add('write', render_target)
+        render_target()
+        settings['if_found' if found else 'if_not_found'] = (choice, selected)
+
+    def read_settings():
+        result = {}
+        for key, (choice, selected) in settings.items():
+            mode = choice.get()
+            if mode not in SCREEN_OUTCOME_OPTIONS:
+                raise MacroExecutionError(f'Invalid {key}: {mode}')
+            target = ''
+            if mode in ('Run Saved Macro', 'Jump to Label'):
+                target = selected['variable'].get().strip() if selected['variable'] else ''
+                available = presets if mode == 'Run Saved Macro' else labels
+                if target not in available:
+                    item = 'saved macro' if mode == 'Run Saved Macro' else 'label'
+                    raise MacroExecutionError(f'Select an existing {item} for {key.replace("_", " ")}.')
+            result[key] = mode
+            result[key + '_target'] = target
+        return result
+
+    return read_settings
+
+
 def dynamic_area(value, default=(0, 0, 1200, 800)):
     if value is None or value == '':
         value = default
@@ -3251,6 +3374,63 @@ class SequentDynamicEngine:
         if self.app.audio_cues: play_cue('match')
         return {'bounds':list(box),'mode':result[0],'x':result[1],'y':result[2]}
 
+    def _recognize_screen_action(self, action, *, idle=False):
+        """Detect a screen target once; absence is data, not an exception.
+
+        Errors from OCR/capture/template loading remain errors. A cancelled
+        playback must never dispatch a click or a branch after the scan.
+        """
+        typ = action.get('type')
+        if typ not in SCREEN_RECOGNITION_TYPES:
+            raise MacroExecutionError(f'Unsupported screen detector: {typ}')
+        if typ == 'search_area':
+            target = str(action.get('text', '')).strip()
+            match_any = bool(action.get('match_any', False)) or target in ('*', '<ANY TEXT DETECTED>')
+            normalized = ''.join(ch for ch in target.casefold() if ch.isalnum())
+            if not match_any and not normalized:
+                raise MacroExecutionError('Search Selected Area needs target text or Match Any')
+            found = False
+            for attempt in range(5):
+                if not idle and not self.app.playing:
+                    raise MacroCancelled('Screen search cancelled')
+                raw = self.app.ocr_screen_area(*validated_capture_area(action.get('area')))
+                if raw.startswith('ERR:'):
+                    raise MacroExecutionError(raw)
+                if not idle and not self.app.playing:
+                    raise MacroCancelled('Screen search cancelled after OCR')
+                text = ''.join(ch for ch in raw.casefold() if ch.isalnum())
+                found = (bool(raw.strip()) if match_any else normalized in text)
+                if found:
+                    break
+                if attempt < 4:
+                    self._pause(0.2, idle=idle)
+            result = {'type':typ, 'found':found, 'success':True}
+        else:
+            area = validated_capture_area(action.get('area'))
+            if typ == 'find_color':
+                box = self.app.search_color_in_area(
+                    *area, str(action.get('color', '#FFFFFF')).upper(),
+                    tolerance=action.get('tolerance', 8))
+            elif typ == 'find_text':
+                box = self.app.find_text_rect(*area, action.get('text', ''))
+            else:
+                box = self.find_image(action)
+            if not idle and not self.app.playing:
+                raise MacroCancelled('Screen search cancelled after detection')
+            result = {'type':typ, 'found': bool(box), 'success':True}
+            if box:
+                result.update(self._click_box(action, box))
+        # Stop can also happen while a click/hover is being dispatched.
+        if not idle and not self.app.playing:
+            raise MacroCancelled('Screen search cancelled before branch')
+        self.last_result = result
+        self.app.variables['_last_action'] = typ
+        self.app.variables['_last_screen_found'] = 'true' if result['found'] else 'false'
+        self.app.variables['_last_success'] = 'true' if result['found'] else 'false'
+        if result.get('bounds'):
+            self.app.variables['_last_bounds'] = json.dumps(result['bounds'])
+        return result
+
     def _assign_variable(self, name, value, scope=None):
         set_variable(self.app, name, value, scope)
 
@@ -3261,10 +3441,9 @@ class SequentDynamicEngine:
         if typ == 'ui_element':
             result = self._click_box(action,self.find_ui_element(action))
         elif typ == 'find_image':
-            match = self.find_image(action)
-            if not idle and not self.app.playing:
-                raise MacroCancelled('Playback stopped during image search')
-            result = self._click_box(action, match)
+            result = self._recognize_screen_action(action, idle=idle)
+            if not result['found'] and 'if_not_found' not in action:
+                raise MacroExecutionError('Image not found in selected search area')
         elif typ == 'ocr_extract':
             raw = self.app.ocr_screen_area(*dynamic_area(action.get('area')))
             if raw.startswith('ERR:'): raise MacroExecutionError(raw)
@@ -3473,27 +3652,40 @@ class SequentDynamicEngine:
                         raise MacroExecutionError(f'Unsupported IF Variable target: {target_type}')
                     return {'switch':target_type,'target':action.get('target','')}
                 index+=1;continue
-            if typ=='search_area':
-                target=action.get('text','').strip()
-                match_found = False
-                
-                # Check up to 5 times over 1 second to account for UI loading lag
-                for _ in range(5):
-                    raw=self.app.ocr_screen_area(*validated_capture_area(action.get('area')))
-                    if raw.startswith('ERR:'):raise MacroExecutionError(raw)
-                    clean_target = "".join(ch for ch in target.casefold() if ch.isalnum())
-                    clean_raw = "".join(ch for ch in raw.casefold() if ch.isalnum())
-                    if ((action.get('match_any') and bool(raw.strip())) or
-                        (clean_target and clean_target in clean_raw)):
-                        match_found = True
-                        break
-                    self._pause(0.2, idle=idle)
-                    
-                if match_found:
-                    # Use the native 'preset' router, which automatically handles the paths and .json extensions
-                    return {'switch': 'preset', 'target': action.get('preset', '')}
-                index+=1;continue
-            
+            if typ in SCREEN_RECOGNITION_TYPES:
+                match = self._recognize_screen_action(action, idle=idle)
+                behavior, target = sequent_screen_outcome_config(action, match['found'])
+                if behavior == 'Continue':
+                    index += 1
+                    if not idle:
+                        delay = max(0.01, self.app.action_delay / max(0.1, self.app.playback_speed))
+                        if self.app.delay_jitter:
+                            delay *= random.uniform(0.85, 1.15)
+                        self._pause(delay, idle=False)
+                    continue
+                if behavior == 'Run Saved Macro':
+                    available = self.app.get_preset_names()
+                    if not target or target not in available:
+                        raise MacroExecutionError(f'Screen branch macro {target!r} is missing')
+                    return {'switch':'preset', 'target':target}
+                if behavior == 'Jump to Label':
+                    destination = next((i for i, item in enumerate(actions)
+                                        if item.get('type') == 'label'
+                                        and item.get('name') == target), None)
+                    if destination is None:
+                        raise MacroExecutionError(f'Screen branch label {target!r} is missing')
+                    frames.clear()
+                    index = destination + 1
+                    continue
+                if behavior == 'Stop Macro':
+                    return {'cancelled':True}
+                if behavior == 'Stop with Error':
+                    name = {'search_area':'Search Selected Area', 'find_color':'Find Color',
+                            'find_text':'Find Text', 'find_image':'Find Image'}[typ]
+                    outcome = 'found' if match['found'] else 'not found'
+                    raise MacroExecutionError(f'{name}: {outcome}; configured to stop with error')
+                raise MacroExecutionError(f'Unknown screen branch behavior: {behavior}')
+
             if typ=='trigger_start':index+=1;continue
             
             if typ == 'clip_fallback':
@@ -5789,16 +5981,11 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=BG_BORDER, hover_color=BG_HOVER,
                      command=preview_area).pack(fill=tk.X, pady=(0, 8))
 
-        tk.Label(body, text="If Found, Stop & Run Preset:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        preset_names = self.app.get_preset_names()
-        init_preset = curr_act.get("preset", "") if (curr_act and curr_act.get("type") == "search_area") else ""
-        chosen_preset = init_preset if init_preset in preset_names else (preset_names[0] if preset_names else "-- No Presets Found --")
-        preset_var = tk.StringVar(value=chosen_preset)
-
-        opt_preset = tk.OptionMenu(body, preset_var, *(preset_names if preset_names else ["-- No Presets Found --"]))
-        opt_preset.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-        opt_preset["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-        opt_preset.pack(fill=tk.X, pady=(0, 8))
+        # Older area-search presets run their stored preset when a match occurs;
+        # newly configured branches are independent for either outcome.
+        start_action = curr_act if curr_act and curr_act.get('type') == 'search_area' else {
+            'type':'search_area', 'preset': (self.app.get_preset_names() or [''])[0]}
+        get_outcomes = sequent_add_screen_outcome_editor(body, self.app, start_action)
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f"Before Line {line_num}")
@@ -5821,27 +6008,30 @@ class VSCodeQueueViewer(tk.Frame):
             except MacroExecutionError as exc:
                 lbl_area_status.config(text=str(exc), fg=COLOR_DANGER)
                 return
-            target_preset = preset_var.get()
-            if target_preset == "-- No Presets Found --": return
-
+            try:
+                outcomes = get_outcomes()
+            except MacroExecutionError as exc:
+                lbl_area_status.config(text=str(exc), fg=COLOR_DANGER)
+                return
+            updated_action = dict(curr_act or {})
+            updated_action.update({
+                "type": "search_area", "text": "*" if is_match_any else search_str,
+                "area": [int(v) for v in selected_box["area"]],
+                "match_any": bool(is_match_any), **outcomes})
+            # Retain the old preset field for backward compatibility on export.
+            if outcomes['if_found'] == 'Run Saved Macro':
+                updated_action['preset'] = outcomes['if_found_target']
             if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = {
-                    "type": "search_area",
-                    "text": "*" if is_match_any else search_str,
-                    "area": [int(v) for v in selected_box["area"]],
-                    "preset": str(target_preset),
-                    "match_any": bool(is_match_any)
-                }
-                self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.set_active_action_index(edit_idx)
-                desc = "Any Text" if is_match_any else f"'{search_str}'"
-                self.app.update_status(f"Updated Area Search: {desc}", COLOR_SUCCESS)
+                index = edit_idx
+                self.app.recorded_actions[index] = updated_action
             else:
                 is_after = "After" in pos_var.get()
-                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
-
-                self.app.insert_search_area_action(insert_idx, "*" if is_match_any else search_str, selected_box["area"], target_preset, match_any=is_match_any)
+                index = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
+                index = max(0, min(index, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(index, updated_action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(index)
+            self.app.update_status('Search Selected Area and branch outcomes saved', COLOR_SUCCESS)
             self.close_sub_menu()
 
         text_entry.bind("<Return>", submit_search_area)
@@ -5981,12 +6171,14 @@ class VSCodeQueueViewer(tk.Frame):
         act_row.pack(fill=tk.X, pady=(0, 8))
         text_label(act_row, "When found:").pack(side=tk.LEFT)
         act_var = tk.StringVar(value=curr.get("action", "Single Click"))
-        act_menu = tk.OptionMenu(act_row, act_var, "Move Only", "Single Click", "Double Click")
+        act_menu = tk.OptionMenu(act_row, act_var, "Detect Only", "Move Only", "Single Click", "Double Click")
         act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
                         highlightthickness=1, highlightbackground=BG_BORDER,
                         bd=0, relief="flat", cursor="hand2")
         act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         act_menu.pack(side=tk.LEFT, padx=(6, 0))
+
+        get_outcomes = sequent_add_screen_outcome_editor(body, self.app, curr or {'type':'find_color'})
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f"Before Line {line_num}")
@@ -6020,6 +6212,11 @@ class VSCodeQueueViewer(tk.Frame):
 
             # Preserve any future action options that we don't expose yet.
             updated_action = dict(curr)
+            try:
+                updated_action.update(get_outcomes())
+            except MacroExecutionError as exc:
+                error_lbl.config(text=str(exc))
+                return
             updated_action.update({"type": "find_color", "area": area,
                                    "color": color, "anchor": anchor_var.get(),
                                    "tolerance": tolerance, "ox": ox, "oy": oy,
@@ -6243,7 +6440,7 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(click_row, text='When found:', bg=BG_PANEL, fg=TEXT_MUTED,
                  font=('Segoe UI', 8)).pack(side=tk.LEFT)
         click_var = tk.StringVar(value=curr.get('action', 'Single Click'))
-        click_menu = tk.OptionMenu(click_row, click_var, 'Move Only', 'Single Click', 'Double Click')
+        click_menu = tk.OptionMenu(click_row, click_var, 'Detect Only', 'Move Only', 'Single Click', 'Double Click')
         click_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
                           highlightbackground=BG_BORDER, highlightthickness=1)
         click_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
@@ -6253,6 +6450,8 @@ class VSCodeQueueViewer(tk.Frame):
                  'Reticle offsets are relative to your selected anchor.',
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  justify='left', wraplength=450).pack(fill=tk.X, pady=(0, 8))
+
+        get_outcomes = sequent_add_screen_outcome_editor(body, self.app, curr or {'type':'find_image'})
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f'Before Line {line_num}')
@@ -6273,6 +6472,7 @@ class VSCodeQueueViewer(tk.Frame):
             except ValueError as exc:
                 raise MacroExecutionError('Offset X and Y must be whole numbers') from exc
             action = dict(curr)
+            action.update(get_outcomes())
             action.update({'type':'find_image', 'area':area,
                            'path':path_entry.get().strip(),
                            'confidence':confidence_entry.get().strip(),
@@ -6479,12 +6679,14 @@ class VSCodeQueueViewer(tk.Frame):
         act_row.pack(fill=tk.X, pady=(0, 8))
         text_label(act_row, "When found:").pack(side=tk.LEFT)
         act_var = tk.StringVar(value=curr.get("action", "Single Click"))
-        act_menu = tk.OptionMenu(act_row, act_var, "Move Only", "Single Click", "Double Click")
+        act_menu = tk.OptionMenu(act_row, act_var, "Detect Only", "Move Only", "Single Click", "Double Click")
         act_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8),
                         highlightthickness=1, highlightbackground=BG_BORDER,
                         bd=0, relief="flat", cursor="hand2")
         act_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
         act_menu.pack(side=tk.LEFT, padx=(6, 0))
+
+        get_outcomes = sequent_add_screen_outcome_editor(body, self.app, curr or {'type':'find_text'})
 
         if edit_idx is None:
             pos_var = tk.StringVar(value=f"Before Line {line_num}")
@@ -6514,6 +6716,11 @@ class VSCodeQueueViewer(tk.Frame):
                 return
 
             updated_action = dict(curr)
+            try:
+                updated_action.update(get_outcomes())
+            except MacroExecutionError as exc:
+                error_lbl.config(text=str(exc))
+                return
             updated_action.update({"type": "find_text", "area": area,
                                    "text": target_text, "anchor": anchor_var.get(),
                                    "ox": ox, "oy": oy, "action": act_var.get()})
@@ -9414,6 +9621,21 @@ class BuiltInMacroApp:
     def get_action_summary(self, action):
         if not action: return "// No action"
         act_type = action.get("type", "")
+        if act_type in SCREEN_RECOGNITION_TYPES:
+            if act_type == 'search_area':
+                name = 'Search Area'
+            elif act_type == 'find_color':
+                name = 'Find Color'
+            elif act_type == 'find_text':
+                name = 'Find Text'
+            else:
+                name = 'Find Image'
+            found, found_target = sequent_screen_outcome_config(action, True)
+            missing, missing_target = sequent_screen_outcome_config(action, False)
+            def describe(mode, target):
+                return (f'{mode}: {target}' if target and mode in
+                        ('Run Saved Macro', 'Jump to Label') else mode)
+            return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
         if act_type in DYNAMIC_ACTION_TYPES:
             kind = next((name for name,spec in DYNAMIC_ACTION_SPECS.items() if spec[0]==act_type),act_type)
             if act_type == 'if_dynamic': return f"◆ IF [{action.get('logic','ALL')}] {len(action.get('conditions',[]))} conditions"
