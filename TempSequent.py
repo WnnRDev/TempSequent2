@@ -3247,6 +3247,27 @@ def set_variable(app, name, value, scope=None):
         app.variables[name] = str(value)
 
 
+def capture_clipboard_variable(app, action):
+    """Save current Unicode clipboard text to the selected variable namespace.
+
+    The capture happens at playback time; it does not modify the clipboard.
+    A missing/empty text clipboard is treated as a failure so a previously
+    saved global value cannot be silently replaced with an empty string.
+    Clipboard text is never included in diagnostics or status messages.
+    """
+    name = action.get('var_name', 'clipboard_text')
+    bare, scope = variable_identity(name, action.get('var_scope'))
+    contents = get_clipboard_text()
+    if not isinstance(contents, str) or not contents:
+        raise MacroExecutionError(
+            'Clipboard has no text (or is temporarily unavailable). '
+            f"{scope.title()} variable '{bare}' was not changed. "
+            'Copy some text and run Read Clipboard again.'
+        )
+    set_variable(app, name, contents, action.get('var_scope'))
+    return {'variable': bare, 'scope': scope, 'length': len(contents)}
+
+
 def get_required_variable_for_typing(app, name, scope=None):
     """Return a real value, not a silent empty string on a missing variable.
 
@@ -3899,7 +3920,7 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
-            ("Read Clipboard", "Capture and inspect clipboard contents.", "RC"),
+            ("Read Clipboard", "Save copied text to a Local/Global variable, or check keywords.", "RC"),
             ("Clipboard Branch / Fallback", "If keywords are missing, run a preset.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
@@ -5230,77 +5251,126 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def _render_read_clipboard_view(self, line_num, edit_idx=None):
+        """Capture the exact clipboard text, or edit a legacy keyword check."""
         body = self.action_content_frame
-        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+        current = (self.app.recorded_actions[edit_idx]
+                   if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+                   else None)
+        # Existing actions with no mode were keyword checks, not text captures.
+        initial_mode = (current.get('mode', 'keywords') if current else 'capture')
+        if initial_mode not in ('capture', 'keywords'):
+            initial_mode = 'keywords'
+        labels = {'capture': 'Save Entire Clipboard Text',
+                  'keywords': 'Check Keywords (Legacy)'}
+        tk.Label(body, text='Clipboard Operation:', font=('Segoe UI', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
+        mode_var = tk.StringVar(value=labels[initial_mode])
+        mode_menu = tk.OptionMenu(body, mode_var, *labels.values())
+        mode_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                         highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+        mode_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                 activebackground=COLOR_ACCENT)
+        mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        tk.Label(body, text="Keywords to find (comma separated):", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        kw_entry = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        kw_entry.pack(fill=tk.X, ipady=2, pady=(0, 6))
-        init_kws = ", ".join(curr_act.get("keywords", [])) if (curr_act and curr_act.get("type") == "read_clipboard") else "Please Scrap, Please Return"
-        kw_entry.insert(0, init_kws)
+        tk.Label(body, text='Variable Name:', font=('Segoe UI', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
+        var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+                             font=('Consolas', 9, 'bold'),
+                             insertbackground=TEXT_PRIMARY, bd=0,
+                             highlightbackground=BG_BORDER, highlightthickness=1)
+        var_entry.pack(fill=tk.X, ipady=3)
+        existing_name = (current.get('var_name', 'clipboard_text')
+                         if current else 'clipboard_text')
+        var_entry.insert(0, variable_identity(existing_name,
+                              current.get('var_scope') if current else None)[0])
+        scope_var = self._add_variable_scope_picker(body, current)
 
-        var_row = tk.Frame(body, bg=BG_PANEL)
-        var_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(body, text='The clipboard is read when this action runs. '
+                 'Its text is stored exactly as copied (including spaces and line breaks). '
+                 'Only Unicode text is supported; empty/unavailable text will stop '
+                 'the action without overwriting a saved value.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=450, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 8))
 
-        v_left = tk.Frame(var_row, bg=BG_PANEL)
-        v_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Label(v_left, text="Variable Name:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, variable_identity(curr_act.get("var_name", "status"), curr_act.get("var_scope"))[0] if curr_act else "status")
-        scope_var = self._add_variable_scope_picker(body, curr_act)
+        # Legacy feature remains editable; a fixed layout anchor keeps its
+        # controls above the Save button even after switching modes repeatedly.
+        keyword_anchor = tk.Frame(body, bg=BG_PANEL, height=1)
+        keyword_anchor.pack(fill=tk.X)
+        keyword_frame = tk.Frame(body, bg=BG_PANEL)
+        tk.Label(keyword_frame, text='Keywords to find (comma separated):',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
+        kw_entry = tk.Entry(keyword_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                            bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        kw_entry.pack(fill=tk.X, ipady=2, pady=(0, 7))
+        kw_entry.insert(0, ', '.join(current.get('keywords', []))
+                        if current else 'Please Scrap, Please Return')
+        tk.Label(keyword_frame, text='Value to store when a keyword matches:',
+                 font=('Segoe UI', 8, 'bold'), bg=BG_PANEL,
+                 fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
+        val_entry = tk.Entry(keyword_frame, bg=BG_INPUT, fg=SYNTAX_GREEN,
+                             font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                             bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        val_entry.pack(fill=tk.X, ipady=2, pady=(0, 8))
+        val_entry.insert(0, current.get('value', 'RTS') if current else 'RTS')
 
-        v_right = tk.Frame(var_row, bg=BG_PANEL)
-        v_right.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
-        tk.Label(v_right, text="Value if Matched:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        val_entry = tk.Entry(v_right, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        val_entry.pack(fill=tk.X, ipady=2)
-        val_entry.insert(0, curr_act.get("value", "RTS") if (curr_act and curr_act.get("type") == "read_clipboard") else "RTS")
+        def update_mode(*_):
+            if mode_var.get() == labels['keywords']:
+                keyword_frame.pack(fill=tk.X, pady=(6, 8), before=keyword_anchor)
+            else:
+                keyword_frame.pack_forget()
+        mode_var.trace_add('write', update_mode)
+        update_mode()
 
         if edit_idx is None:
-            pos_var = tk.StringVar(value=f"Before Line {line_num}")
-            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            pos_var = tk.StringVar(value=f'Before Line {line_num}')
+            pos_menu = tk.OptionMenu(body, pos_var, f'Before Line {line_num}',
+                                     f'After Line {line_num}')
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            font=('Segoe UI', 8), highlightthickness=1,
+                            highlightbackground=BG_BORDER, bd=0)
+            pos_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
             pos_menu.pack(fill=tk.X, pady=(4, 10))
 
         def submit():
-            raw_kws = [k.strip() for k in kw_entry.get().split(",") if k.strip()]
-            v_name = var_entry.get().strip()
-            v_val = val_entry.get().strip()
-
-            if not raw_kws or not v_name:
+            name = var_entry.get().strip()
+            scope = scope_var.get().lower()
+            try:
+                variable_identity(name, scope)
+            except MacroExecutionError as exc:
+                self.app.update_status(str(exc), COLOR_DANGER)
                 return
-
+            mode = 'capture' if mode_var.get() == labels['capture'] else 'keywords'
+            action = {'type': 'read_clipboard', 'mode': mode,
+                      'var_name': name, 'var_scope': scope}
+            if mode == 'keywords':
+                keywords = [word.strip() for word in kw_entry.get().split(',')
+                            if word.strip()]
+                if not keywords:
+                    self.app.update_status('Enter at least one clipboard keyword', COLOR_DANGER)
+                    return
+                action.update(keywords=keywords, value=val_entry.get())
             if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = {
-                    "type": "read_clipboard",
-                    "keywords": raw_kws,
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "value": v_val
-                }
+                self.app.recorded_actions[edit_idx] = action
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
-                self.app.update_status(f"Updated Clipboard Check for '{v_name}'", COLOR_SUCCESS)
+                msg = 'Updated Read Clipboard action'
             else:
-                is_after = "After" in pos_var.get()
+                is_after = 'After' in pos_var.get()
                 insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
                 insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
-
-                self.app.recorded_actions.insert(insert_idx, {
-                    "type": "read_clipboard",
-                    "keywords": raw_kws,
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "value": v_val
-                })
+                self.app.recorded_actions.insert(insert_idx, action)
                 self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.update_status(f"Added Clipboard Check for '{v_name}'", COLOR_SUCCESS)
+                msg = 'Added Read Clipboard action'
+            self.app.update_status(msg, COLOR_SUCCESS)
             self.close_sub_menu()
 
-        btn_txt = "Save Changes" if edit_idx is not None else "Add Clipboard Search"
-        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        label = 'Save Changes' if edit_idx is not None else 'Add Clipboard Action'
+        ModernButton(body, text=label, bg_color=COLOR_SUCCESS if edit_idx is not None
+                     else COLOR_ACCENT, hover_color='#1d8a4b' if edit_idx is not None
+                     else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
 
     def _render_clipboard_fallback_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -10011,10 +10081,13 @@ class BuiltInMacroApp:
             return f"condition.wait_pixel(x={action.get('x', 0)}, y={action.get('y', 0)}, color='{action.get('color', '#FFFFFF')}')"
         elif act_type == "wait_text":
             return f"ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
-        elif act_type == "read_clipboard": 
+        elif act_type == "read_clipboard":
+            if action.get('mode', 'keywords') == 'capture':
+                return (f"clipboard.capture() -> {action.get('var_scope', 'local').title()} "
+                        f"${action.get('var_name', 'clipboard_text')}")
             kws = action.get('keywords', [])
             preview = kws[0] if len(kws) == 1 else f"{len(kws)} keywords"
-            return f"clipboard.find('{preview}' ➔ ${action.get('var_name')}='{action.get('value')}')"
+            return f"clipboard.find({preview!r} -> ${action.get('var_name')} [legacy])"
         elif act_type == "prompt_input": 
             return f"user.prompt('{action.get('prompt', '')}' ➔ ${action.get('var_name', '')})"
         elif act_type == "type_variable": 
@@ -10299,17 +10372,28 @@ class BuiltInMacroApp:
             scope_name = variable_identity(var_name, action.get("var_scope"))[1]
             report(f"Saved '{var_name}' as {scope_name.title()} ({len(str(entered_val))} characters)", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
-            clip_content = get_clipboard_text().lower()
-            keywords = [k.lower() for k in action.get("keywords", [])]
-            matched = any(kw in clip_content for kw in keywords)
-            var_name = action.get("var_name", "status")
-            if matched:
-                val = action.get("value", "")
-                set_variable(self, var_name, val, action.get("var_scope"))
-                if self.audio_cues: play_cue("match")
-                report(f"Var '{var_name}' = '{val}'", COLOR_SUCCESS)
+            # Pre-existing presets without mode still perform keyword checks.
+            mode = action.get('mode', 'keywords')
+            if mode == 'capture':
+                saved = capture_clipboard_variable(self, action)
+                if self.audio_cues: play_cue('match')
+                report(f"Clipboard saved to {saved['scope'].title()} variable "
+                       f"'{saved['variable']}' ({saved['length']} characters)", COLOR_SUCCESS)
+            elif mode == 'keywords':
+                clip_content = get_clipboard_text().casefold()
+                keywords = [str(k).casefold() for k in action.get('keywords', [])]
+                matched = any(kw in clip_content for kw in keywords if kw)
+                var_name = action.get('var_name', 'status')
+                if matched:
+                    val = action.get('value', '')
+                    set_variable(self, var_name, val, action.get('var_scope'))
+                    if self.audio_cues: play_cue('match')
+                    # Status never reveals the clipboard content or saved value.
+                    report(f"Clipboard keyword matched; updated '{var_name}'", COLOR_SUCCESS)
+                else:
+                    report(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
             else:
-                report(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
+                raise MacroExecutionError(f'Unknown Read Clipboard mode: {mode!r}')
         elif act_type == "type_variable":
             var_name = action.get("var_name", "status")
             val = get_required_variable_for_typing(self, var_name, action.get("var_scope"))
