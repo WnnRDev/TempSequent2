@@ -2886,6 +2886,71 @@ def set_variable(app, name, value, scope=None):
         app.variables[name] = str(value)
 
 
+def get_required_variable_for_typing(app, name, scope=None):
+    """Return a real value, not a silent empty string on a missing variable.
+
+    The global store is intentionally selected by an action's scope; silently
+    falling back to local data could type the wrong (possibly private) value.
+    """
+    bare, selected = variable_identity(name, scope)
+    if selected == 'global':
+        values = _read_global_values(app)
+        if bare not in values:
+            raise MacroExecutionError(
+                f"Global variable '{bare}' not found in {_global_variable_path(app)}. "
+                "Run the macro that saves it with scope Global, then select "
+                "Global for this Type Variable action."
+            )
+        value = values[bare]
+    else:
+        if bare not in app.variables:
+            # Give a targeted hint if the user accidentally left the reader Local.
+            if bare in _read_global_values(app):
+                raise MacroExecutionError(
+                    f"Variable '{bare}' is saved as Global, but Type Variable "
+                    "is set to Local. Change its Variable Scope to Global."
+                )
+            raise MacroExecutionError(
+                f"Local variable '{bare}' has not been set this session. "
+                "Choose Global if it was saved by a different macro."
+            )
+        value = app.variables[bare]
+    if value is None or str(value) == '':
+        raise MacroExecutionError(
+            f"{selected.title()} variable '{bare}' is empty; nothing was typed. "
+            "Check that Request Input received a nonempty value."
+        )
+    return str(value)
+
+
+def sequent_has_keyboard_focus(app):
+    """Prevent Type Variable from silently typing into Sequent's own editor.
+
+    A Run-button click leaves Sequent focused. A preceding mouse click on the
+    desired application or starting via a global hotkey can focus the target.
+    """
+    if os.name != 'nt' or not getattr(app, 'root', None):
+        return False
+    try:
+        # Captured on Tk's main thread at playback start to avoid Tk calls
+        # from the worker thread while checking the active input target.
+        hwnd = getattr(app, '_sequent_window_hwnd', None)
+        if not hwnd:
+            hwnd = native_toplevel_hwnd(app.root)
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
+            return False
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        top = user32.GetAncestor(ctypes.c_void_p(foreground), 2) or foreground
+        return bool(hwnd and top == hwnd)
+    except (AttributeError, OSError, ValueError, TypeError):
+        return False
+
+
 def interpolate_variable(app, name):
     """Bare ${name} uses a local value first, then a persisted global value.
     Explicit ${global.name} stays available for old saved workflows.
@@ -4844,6 +4909,33 @@ class VSCodeQueueViewer(tk.Frame):
         var_entry.pack(fill=tk.X, ipady=3, pady=(0, 8))
         var_entry.insert(0, variable_identity(curr_act.get("var_name", "status"), curr_act.get("var_scope"))[0] if curr_act else "status")
         scope_var = self._add_variable_scope_picker(body, curr_act)
+        availability = tk.StringVar(value='')
+        tk.Label(body, textvariable=availability, bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 anchor='w', justify='left', wraplength=280).pack(fill=tk.X, pady=(0, 7))
+
+        def refresh_variable_availability(*_args):
+            name = var_entry.get().strip()
+            if not name:
+                availability.set('Enter a variable name.')
+                return
+            if scope_var.get().lower() != 'global':
+                availability.set('Local: must be set during this Sequent session.')
+                return
+            try:
+                bare, _ = variable_identity(name, 'global')
+                existing = _read_global_values(self.app)
+                if bare in existing:
+                    availability.set('Global: saved value found in globals.json.'
+                                     if str(existing[bare]) else
+                                     'Global: variable exists but contains an empty value.')
+                else:
+                    availability.set('Global: not saved yet. Run Request Input with Global scope first.')
+            except MacroExecutionError as exc:
+                availability.set(f'Global storage error: {exc}')
+        scope_var.trace_add('write', refresh_variable_availability)
+        var_entry.bind('<KeyRelease>', refresh_variable_availability, add='+')
+        refresh_variable_availability()
         var_entry.focus_set()
 
         if edit_idx is None:
@@ -9187,10 +9279,13 @@ class BuiltInMacroApp:
             default_val = action.get("default", "")
             var_name = action.get("var_name", "user_data")
             entered_val = self.prompt_user_input(prompt_txt, default_val)
-            if entered_val is not None:
-                set_variable(self, var_name, str(entered_val), action.get("var_scope"))
-                if self.audio_cues: play_cue("match")
-                report(f"Var '{var_name}' = '{entered_val}'", COLOR_SUCCESS)
+            if entered_val is None:
+                # Cancellation is not an assignment, even when a default exists.
+                raise MacroCancelled('Request Input cancelled; variable was not changed')
+            set_variable(self, var_name, str(entered_val), action.get("var_scope"))
+            if self.audio_cues: play_cue("match")
+            scope_name = variable_identity(var_name, action.get("var_scope"))[1]
+            report(f"Saved '{var_name}' as {scope_name.title()} ({len(str(entered_val))} characters)", COLOR_SUCCESS)
         elif act_type == "read_clipboard":
             clip_content = get_clipboard_text().lower()
             keywords = [k.lower() for k in action.get("keywords", [])]
@@ -9205,12 +9300,15 @@ class BuiltInMacroApp:
                 report(f"Var '{var_name}': No match in clipboard", SYNTAX_ORANGE)
         elif act_type == "type_variable":
             var_name = action.get("var_name", "status")
-            val = str(get_variable(self, var_name, action.get("var_scope")))
-            if val:
-                type_string(val, self.playback_speed)
-                report(f"Typed '{val}'", COLOR_SUCCESS)
-            else:
-                report(f"Var '{var_name}' is empty", SYNTAX_ORANGE)
+            val = get_required_variable_for_typing(self, var_name, action.get("var_scope"))
+            if sequent_has_keyboard_focus(self):
+                raise MacroExecutionError(
+                    f"Variable '{var_name}' was found, but Sequent has keyboard focus. "
+                    "Click the destination field before Type Variable, or start "
+                    "playback with the global hotkey while the destination is focused."
+                )
+            type_string(val, self.playback_speed)
+            report(f"Typed variable '{var_name}' ({len(val)} characters)", COLOR_SUCCESS)
         elif act_type == "key":
             type_string(str(action.get("key", "")), self.playback_speed)
         elif act_type == "press":
@@ -12006,6 +12104,10 @@ try {{
         if not self.recorded_actions:
             self.update_status("Queue Empty", COLOR_DANGER)
             return
+        if os.name == 'nt':
+            # Snapshot the native HWND on the Tk main thread. Keyboard-focus
+            # checks in the playback worker won't need to call into Tk.
+            self._sequent_window_hwnd = native_toplevel_hwnd(self.root)
         self._prepare_mouse_execution()
         self.dynamic_engine = SequentDynamicEngine(self)
         self.playing = True
@@ -12050,7 +12152,8 @@ try {{
     def prompt_user_input(self, prompt_text, default_val=""):
         import threading
         evt = threading.Event()
-        result = [default_val]
+        # None means Cancel; never turn a cancelled dialog into a blank value.
+        result = [None]
 
         def _show():
             dlg = tk.Toplevel(self.root)
@@ -12177,8 +12280,7 @@ try {{
             if (not self.playing and not self.recording and
                     not getattr(self, '_debugger_modal_active', False)):
                 break
-
-        return result[0]
+        return result[0] if evt.is_set() else None
         
     def show_disclaimer_modal(self, title_text, message_text):
         """Displays a centered, draggable warning/disclaimer modal with Proceed and Abort options."""
