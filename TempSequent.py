@@ -16,6 +16,7 @@ import math
 import colorsys
 import random
 import winsound
+import uuid
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -2232,9 +2233,11 @@ DYNAMIC_ACTION_SPECS = {
    ('conditions','While/Until conditions','json',[{'kind':'variable','name':'status','op':'!=','value':'done'}])]),
  'LOOP End':('loop_end',[]),
  'Find Image & Click':('find_image',[
-   ('path','Template image (PNG/JPG)','path',''),
+   ('path','Image template (PNG/JPG/BMP)','path',''),
    ('area','Screen area: x,y,width,height','area',[0,0,1200,800]),
    ('confidence','Match confidence (0–1)','float',0.85),
+   ('scale_mode','Image scale range','choice','Auto',['Auto','Exact','Small changes']),
+   ('anchor','Target anchor','choice','Center',['Top Left','Top Center','Top Right','Middle Left','Center','Middle Right','Bottom Left','Bottom Center','Bottom Right']),
    ('action','Mouse action','choice','Single Click',['Move Only','Single Click','Double Click']),
    ('ox','Horizontal offset (pixels)','int',0),('oy','Vertical offset (pixels)','int',0)]),
  'Recovery Policy':('recovery',[
@@ -2463,6 +2466,87 @@ def sequent_save_bmp(filename, pixels, width, height):
         f.write(pixels)
 
 
+
+def sequent_capture_image_template(app, area):
+    """Save a user-selected on-screen image in the configured preset directory.
+
+    The calling selector MUST hide itself and Sequent before capture; otherwise
+    the translucent selector gets baked into the template. The image path is
+    stored in the action JSON and works in subsequent sessions/macros.
+    """
+    x, y, w, h = validated_capture_area(area)
+    if w < 9 or h < 9 or w * h > 1_000_000:
+        raise MacroExecutionError('Image template must be at least 9x9 and at most 1,000,000 pixels')
+    pixels = sequent_capture_bgra(x, y, w, h)
+    folder = os.path.join(app.presets_dir, 'image_templates')
+    os.makedirs(folder, exist_ok=True)
+    name = 'template_' + uuid.uuid4().hex + '.bmp'
+    target = os.path.join(folder, name)
+    # Never overwrite another template, even if two pickers are used quickly.
+    # Desktop GetDIBits leaves the fourth byte undefined, often zero.
+    # A 32-bit BMP could therefore be decoded as fully transparent and never
+    # match. Save a packed 24-bit BMP instead: GDI+ will read it as opaque.
+    stride = ((w * 3 + 3) // 4) * 4
+    raw = bytearray(stride * h)
+    for row in range(h):
+        src = row * w * 4
+        dst = row * stride
+        for col in range(w):
+            raw[dst + col*3:dst + col*3 + 3] = pixels[src + col*4:src + col*4 + 3]
+    with open(target, 'xb') as f:
+        size = len(raw)
+        f.write(struct.pack('<2sIHHI', b'BM', 54 + size, 0, 0, 54))
+        f.write(struct.pack('<IiiHHIIiiII', 40, w, -h, 1, 24,
+                            0, size, 2835, 2835, 0, 0))
+        f.write(raw)
+    return target
+
+
+def sequent_image_action_settings(action):
+    """Normalize Find Image settings for editor, player and debugger."""
+    path = str(action.get('path', '')).strip()
+    if not path:
+        raise MacroExecutionError('Choose an image or capture an icon from the desktop')
+    resolved = dynamic_resolve_path(path)
+    if not os.path.isfile(resolved):
+        raise MacroExecutionError(f'Image template not found: {resolved}')
+    area = validated_capture_area(action.get('area'))
+    try:
+        confidence = float(action.get('confidence', 0.85))
+    except (ValueError, TypeError) as exc:
+        raise MacroExecutionError('Image confidence must be a number from 0 to 1') from exc
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise MacroExecutionError('Image confidence must be between 0 and 1')
+    scale_mode = action.get('scale_mode', 'Auto')
+    scales = {'Auto': (1.0, 0.9, 1.1, 0.75, 1.25),
+              'Exact': (1.0,),
+              'Small changes': (1.0, 0.9, 1.1)}.get(scale_mode)
+    if scales is None:
+        raise MacroExecutionError(f'Unknown image scaling mode: {scale_mode}')
+    return resolved, area, confidence, scales
+
+
+def sequent_image_thumbnail(path, max_width=136, max_height=88):
+    """Make a Tk PhotoImage from native GDI+/BMP pixels, no Pillow required."""
+    width, height, pixels = sequent_load_image_bgra(dynamic_resolve_path(path))
+    target_w = max(1, min(max_width, round(width * min(1, max_width / width, max_height / height))))
+    target_h = max(1, min(max_height, round(height * min(1, max_width / width, max_height / height))))
+    scaled = sequent_resize_bgra(pixels, width, height, target_w, target_h)
+    picture = tk.PhotoImage(width=target_w, height=target_h)
+    bg = tuple(int(BG_INPUT[i:i+2], 16) for i in (1, 3, 5))
+    for row in range(target_h):
+        values = []
+        for col in range(target_w):
+            start = (row * target_w + col) * 4
+            b, g, r, alpha = scaled[start:start + 4]
+            rr = (r * alpha + bg[0] * (255 - alpha)) // 255
+            gg = (g * alpha + bg[1] * (255 - alpha)) // 255
+            bb = (b * alpha + bg[2] * (255 - alpha)) // 255
+            values.append(f'#{rr:02x}{gg:02x}{bb:02x}')
+        picture.put('{' + ' '.join(values) + '}', to=(0, row))
+    return picture, width, height
+
+
 def sequent_load_image_bgra(filename):
     """Read PNG/JPEG/BMP using inbox Windows GDI+ without Pillow."""
     if os.name != 'nt':
@@ -2472,12 +2556,24 @@ def sequent_load_image_bgra(filename):
             raise MacroExecutionError('Template decoding requires Windows GDI+ (PNG/JPG/BMP)')
         offset=struct.unpack_from('<I',data,10)[0]
         w,h,planes,bpp,compression=struct.unpack_from('<iiHHI',data,18)
-        if w<=0 or not h or abs(h)*w>1000000 or planes!=1 or bpp!=32 or compression!=0:
+        if w<=0 or not h or abs(h)*w>1000000 or planes!=1 or bpp not in (24,32) or compression!=0:
             raise MacroExecutionError('Unsupported BMP format')
-        stride=w*4
+        stride=((w*(bpp//8)+3)//4)*4
         raw=data[offset:offset+stride*abs(h)]
         if len(raw)!=stride*abs(h): raise MacroExecutionError('Truncated BMP')
         if h>0: raw=b''.join(raw[i:i+stride] for i in range((h-1)*stride,-1,-stride))
+        if bpp==24:
+            opaque=bytearray(w*abs(h)*4)
+            for row in range(abs(h)):
+                for col in range(w):
+                    source=row*stride+col*3
+                    dest=(row*w+col)*4
+                    opaque[dest:dest+3]=raw[source:source+3]
+                    opaque[dest+3]=255
+            raw=bytes(opaque)
+        else:
+            # 32bpp BMPs written by Sequent are tightly packed.
+            raw=b''.join(raw[row*stride:row*stride+w*4] for row in range(abs(h)))
         return (w,abs(h),raw)
     gdip = ctypes.windll.gdiplus
     H = ctypes.c_void_p
@@ -2496,6 +2592,8 @@ def sequent_load_image_bgra(filename):
     gdip.GdiplusShutdown.argtypes=[ctypes.c_size_t]
     gdip.GdipCreateBitmapFromFile.argtypes=[ctypes.c_wchar_p,ctypes.POINTER(H)]
     gdip.GdipCreateBitmapFromFile.restype=ctypes.c_int
+    gdip.GdipCreateBitmapFromHICON.argtypes=[H, ctypes.POINTER(H)]
+    gdip.GdipCreateBitmapFromHICON.restype=ctypes.c_int
     gdip.GdipDisposeImage.argtypes=[H]
     gdip.GdipGetImageWidth.argtypes=[H,ctypes.POINTER(ctypes.c_uint32)]
     gdip.GdipGetImageHeight.argtypes=[H,ctypes.POINTER(ctypes.c_uint32)]
@@ -2509,9 +2607,24 @@ def sequent_load_image_bgra(filename):
     if gdip.GdiplusStartup(ctypes.byref(token),ctypes.byref(options),None):
         raise MacroExecutionError('GDI+ initialization failed')
     bitmap=H()
+    icon_handle=None
     locked=False
     try:
-        if gdip.GdipCreateBitmapFromFile(os.path.abspath(filename),ctypes.byref(bitmap)):
+        if str(filename).lower().endswith('.ico'):
+            # Native Windows ICO loader + GDI+ conversion. A .ico is not a
+            # PNG file, so bypass regular image codecs without Pillow.
+            user32=ctypes.windll.user32
+            user32.LoadImageW.argtypes=[H, ctypes.c_wchar_p,
+                                       ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_uint]
+            user32.LoadImageW.restype=H
+            user32.DestroyIcon.argtypes=[H]
+            user32.DestroyIcon.restype=ctypes.c_int
+            icon_handle=user32.LoadImageW(None, os.path.abspath(filename),
+                                            1, 0, 0, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+            if not icon_handle or gdip.GdipCreateBitmapFromHICON(icon_handle,ctypes.byref(bitmap)):
+                raise MacroExecutionError(f'Cannot open .ico icon: {filename}')
+        elif gdip.GdipCreateBitmapFromFile(os.path.abspath(filename),ctypes.byref(bitmap)):
             raise MacroExecutionError(f'Cannot open template image: {filename}')
         width,height=ctypes.c_uint32(),ctypes.c_uint32()
         if gdip.GdipGetImageWidth(bitmap,ctypes.byref(width)) or gdip.GdipGetImageHeight(bitmap,ctypes.byref(height)):
@@ -2530,6 +2643,7 @@ def sequent_load_image_bgra(filename):
     finally:
         if locked: gdip.GdipBitmapUnlockBits(bitmap,ctypes.byref(data))
         if bitmap: gdip.GdipDisposeImage(bitmap)
+        if icon_handle: ctypes.windll.user32.DestroyIcon(icon_handle)
         gdip.GdiplusShutdown(token)
 
 
@@ -3006,20 +3120,21 @@ class SequentDynamicEngine:
                                     'control_type':control_type})
         return tuple(found['bounds']) if found else None
 
-    def find_image(self, action):
+    def find_image(self, action, screen_pixels=None):
         """Native GDI+ template read + GDI screenshot + stdlib image matching."""
-        path = dynamic_resolve_path(self.interpolate(action.get('path','')))
+        path, (x,y,w,h), threshold, scales = sequent_image_action_settings(
+            dict(action, path=self.interpolate(action.get('path',''))))
         try:
             tw,th,template = sequent_load_image_bgra(path)
         except (OSError,ValueError) as exc:
             raise MacroExecutionError(f'Cannot read image template: {exc}') from exc
-        x,y,w,h = dynamic_area(action.get('area'))
-        threshold = float(action.get('confidence',0.85))
-        if not 0 <= threshold <= 1:
-            raise MacroExecutionError('Image confidence must be between 0 and 1')
-        screen = sequent_capture_bgra(x,y,w,h)
+        # A supplied snapshot lets the editor hide itself for one frame, then
+        # restore immediately while matching proceeds on a worker thread.
+        screen = screen_pixels if screen_pixels is not None else sequent_capture_bgra(x,y,w,h)
+        if len(screen) != w * h * 4:
+            raise MacroExecutionError('Screen snapshot size differs from selected search area')
         best=None
-        for scale in (1.0,0.9,1.1,0.75,1.25):
+        for scale in scales:
             sw,sh=max(1,round(tw*scale)),max(1,round(th*scale))
             if sw>w or sh>h or min(sw,sh)<2:continue
             scaled=sequent_resize_bgra(template,tw,th,sw,sh)
@@ -3146,7 +3261,10 @@ class SequentDynamicEngine:
         if typ == 'ui_element':
             result = self._click_box(action,self.find_ui_element(action))
         elif typ == 'find_image':
-            result = self._click_box(action,self.find_image(action))
+            match = self.find_image(action)
+            if not idle and not self.app.playing:
+                raise MacroCancelled('Playback stopped during image search')
+            result = self._click_box(action, match)
         elif typ == 'ocr_extract':
             raw = self.app.ocr_screen_area(*dynamic_area(action.get('area')))
             if raw.startswith('ERR:'): raise MacroExecutionError(raw)
@@ -4435,6 +4553,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Search selected area": self._render_search_area_view,
             "Find Color & Click": self._render_find_color_view,
             "Find Text & Click": self._render_find_text_view,
+            "Find Image & Click": self._render_find_image_view,
             "Wait for Text": self._render_wait_text_view,
             "Wait Pixel": self._render_wait_pixel_view,
             "Gate Check": self._render_gate_check_view,
@@ -5929,6 +6048,335 @@ class VSCodeQueueViewer(tk.Frame):
                      bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
                      command=lambda: save(start_reticle=True)).pack(fill=tk.X)
 
+    def _render_find_image_view(self, line_num, edit_idx=None):
+        """Screen-search style image/icon editor with an anchored live reticle."""
+        body = self.action_content_frame
+        curr = (self.app.recorded_actions[edit_idx]
+                if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
+                and self.app.recorded_actions[edit_idx].get('type') == 'find_image'
+                else {})
+
+        def heading(text):
+            tk.Label(body, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(7, 3))
+
+        def edit_field(parent, value, width=8):
+            field = tk.Entry(parent, width=width, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             insertbackground=TEXT_PRIMARY, font=('Consolas', 9), bd=0,
+                             highlightbackground=BG_BORDER, highlightthickness=1)
+            field.insert(0, str(value))
+            return field
+
+        def reset_field(field, value):
+            field.delete(0, tk.END)
+            field.insert(0, str(value))
+
+        tk.Label(body, text=('EDIT IMAGE / ICON DETECTION' if curr else 'NEW IMAGE / ICON DETECTION'),
+                 bg=BG_PANEL, fg=SYNTAX_BLUE,
+                 font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill=tk.X, pady=(0, 7))
+        tk.Label(body, text=('Choose an image file or capture a visible icon, then define where to '
+                             'search for it. Preview the match and drag the Ghost Reticle to set '
+                             'your click point—even outside the matched image.'),
+                 bg=BG_PANEL, fg=TEXT_MUTED, justify='left',
+                 font=('Segoe UI', 8), wraplength=458).pack(fill=tk.X, pady=(0, 7))
+
+        heading('SEARCH REGION (NATIVE SCREEN PIXELS)')
+        region = curr.get('area', [0, 0, 0, 0])
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            region = [0, 0, 0, 0]
+        area_row = tk.Frame(body, bg=BG_PANEL)
+        area_row.pack(fill=tk.X, pady=(0, 6))
+        area_entries = []
+        for caption, initial in zip(('X', 'Y', 'Width', 'Height'), region):
+            column = tk.Frame(area_row, bg=BG_PANEL)
+            column.pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(column, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w')
+            field = edit_field(column, initial, width=8)
+            field.pack(pady=(3, 0))
+            area_entries.append(field)
+        area_message = tk.Label(body, text='Pick a desktop region; negative X/Y are supported.',
+                                bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                                wraplength=452, justify='left')
+        area_message.pack(fill=tk.X, pady=(0, 5))
+        status_label = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                                font=('Segoe UI', 8), wraplength=450, justify='left')
+
+        def read_area():
+            try:
+                value = [int(f.get().strip()) for f in area_entries]
+                return list(validated_capture_area(value))
+            except ValueError as exc:
+                raise MacroExecutionError('Search coordinates must be whole numbers') from exc
+
+        def update_area(selected):
+            if not body.winfo_exists():
+                return
+            for field, value in zip(area_entries, selected):
+                reset_field(field, value)
+            area_message.config(text=f'Selected: {selected[2]}x{selected[3]} at ({selected[0]}, {selected[1]})',
+                                fg=COLOR_SUCCESS)
+
+        def choose_area():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            try:
+                self.app.start_screen_selection(update_area)
+            except Exception as exc:
+                self.app.restore_after_desktop_picker()
+                status_label.config(text=f'Search selection failed: {exc}', fg=COLOR_DANGER)
+
+        ModernButton(body, text='Redefine Search Box on Desktop' if curr else 'Define Search Box on Desktop',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=choose_area).pack(fill=tk.X, pady=(0, 5))
+
+        def preview_region():
+            try:
+                self.app.preview_screen_search_area(read_area())
+            except (MacroExecutionError, ValueError) as exc:
+                status_label.config(text=str(exc), fg=COLOR_DANGER)
+
+        ModernButton(body, text='Preview Actual Search Area', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER, command=preview_region).pack(fill=tk.X, pady=(0, 8))
+
+        heading('TARGET IMAGE / ICON')
+        file_row = tk.Frame(body, bg=BG_PANEL)
+        file_row.pack(fill=tk.X, pady=(0, 5))
+        path_entry = edit_field(file_row, curr.get('path', ''), width=38)
+        path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
+        display = tk.Label(body, text='No image selected', bg=BG_INPUT,
+                           fg=TEXT_MUTED, font=('Segoe UI', 8),
+                           height=6, justify='center')
+        display.pack(fill=tk.X, pady=(1, 5))
+
+        def redraw_template():
+            filename = path_entry.get().strip()
+            if not filename:
+                display.config(image='', text='Choose PNG / JPG / BMP / ICO or capture an icon')
+                display.image = None
+                return
+            try:
+                thumb, width, height = sequent_image_thumbnail(filename)
+                display.image = thumb
+                display.config(image=thumb, text='', height=0)
+                area_message.config(text=f'Template size: {width}x{height} pixels', fg=SYNTAX_BLUE)
+            except Exception as exc:
+                display.image = None
+                display.config(image='', text=f'Preview unavailable: {exc}', height=5)
+
+        def browse_template():
+            filename = filedialog.askopenfilename(parent=self.sub_menu,
+                title='Choose an image or icon screenshot',
+                filetypes=[('Image and icon templates', '*.png *.jpg *.jpeg *.bmp *.ico'),
+                           ('All files', '*.*')])
+            if filename:
+                reset_field(path_entry, filename)
+                redraw_template()
+
+        ModernButton(file_row, text='Browse...', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER, command=browse_template).pack(side=tk.RIGHT)
+
+        def template_selected(area, path):
+            if not body.winfo_exists():
+                return
+            reset_field(path_entry, path)
+            redraw_template()
+            status_label.config(text=(f'Captured icon at ({area[0]}, {area[1]}), '
+                                      f'{area[2]}x{area[3]}px. Saved to image_templates.'),
+                                fg=COLOR_SUCCESS)
+
+        def capture_icon():
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            try:
+                self.app.start_screen_selection(template_selected, capture_template=True)
+            except Exception as exc:
+                self.app.restore_after_desktop_picker()
+                status_label.config(text=f'Image capture failed: {exc}', fg=COLOR_DANGER)
+
+        ModernButton(body, text='Capture Image / Icon from Desktop',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=capture_icon).pack(fill=tk.X, pady=(0, 7))
+        redraw_template()
+        path_entry.bind('<FocusOut>', lambda event: redraw_template())
+
+        heading('IMAGE MATCH SETTINGS')
+        options_row = tk.Frame(body, bg=BG_PANEL)
+        options_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(options_row, text='Confidence (0-1):', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+        confidence_entry = edit_field(options_row, curr.get('confidence', 0.85), width=7)
+        confidence_entry.pack(side=tk.LEFT, padx=(5, 12))
+        tk.Label(options_row, text='Scale:', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+        scale_var = tk.StringVar(value=curr.get('scale_mode', 'Auto'))
+        scale_menu = tk.OptionMenu(options_row, scale_var, 'Auto', 'Exact', 'Small changes')
+        scale_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                          highlightbackground=BG_BORDER, highlightthickness=1)
+        scale_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
+        scale_menu.pack(side=tk.LEFT, padx=(5, 0))
+
+        offset_row = tk.Frame(body, bg=BG_PANEL)
+        offset_row.pack(fill=tk.X, pady=(0, 7))
+        for_label = lambda name: tk.Label(offset_row, text=name, bg=BG_PANEL,
+                                          fg=TEXT_MUTED, font=('Segoe UI', 8))
+        for_label('Offset X:').pack(side=tk.LEFT)
+        ox_entry = edit_field(offset_row, curr.get('ox', 0))
+        ox_entry.pack(side=tk.LEFT, padx=(4, 12))
+        for_label('Offset Y:').pack(side=tk.LEFT)
+        oy_entry = edit_field(offset_row, curr.get('oy', 0))
+        oy_entry.pack(side=tk.LEFT, padx=(4, 0))
+        anchor_row = tk.Frame(body, bg=BG_PANEL)
+        anchor_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(anchor_row, text='Anchor:', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+        anchor_var = tk.StringVar(value=curr.get('anchor', 'Center'))
+        anchor_menu = tk.OptionMenu(anchor_row, anchor_var, *COLOR_ANCHORS)
+        anchor_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                           highlightbackground=BG_BORDER, highlightthickness=1)
+        anchor_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   activebackground=COLOR_ACCENT)
+        anchor_menu.pack(side=tk.LEFT, padx=(5, 0))
+        click_row = tk.Frame(body, bg=BG_PANEL)
+        click_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(click_row, text='When found:', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+        click_var = tk.StringVar(value=curr.get('action', 'Single Click'))
+        click_menu = tk.OptionMenu(click_row, click_var, 'Move Only', 'Single Click', 'Double Click')
+        click_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0,
+                          highlightbackground=BG_BORDER, highlightthickness=1)
+        click_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   activebackground=COLOR_ACCENT)
+        click_menu.pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(body, text='The green outline tracks the matched image. '
+                 'Reticle offsets are relative to your selected anchor.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 justify='left', wraplength=450).pack(fill=tk.X, pady=(0, 8))
+
+        if edit_idx is None:
+            pos_var = tk.StringVar(value=f'Before Line {line_num}')
+            pos_menu = tk.OptionMenu(body, pos_var,
+                                     f'Before Line {line_num}', f'After Line {line_num}')
+            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            highlightbackground=BG_BORDER, highlightthickness=1, bd=0)
+            pos_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
+            pos_menu.pack(fill=tk.X, pady=(0, 6))
+        status_label.pack(fill=tk.X, pady=(2, 6))
+
+        def settings():
+            area = read_area()
+            try:
+                ox = int(ox_entry.get().strip())
+                oy = int(oy_entry.get().strip())
+            except ValueError as exc:
+                raise MacroExecutionError('Offset X and Y must be whole numbers') from exc
+            action = dict(curr)
+            action.update({'type':'find_image', 'area':area,
+                           'path':path_entry.get().strip(),
+                           'confidence':confidence_entry.get().strip(),
+                           'scale_mode':scale_var.get(), 'anchor':anchor_var.get(),
+                           'ox':ox, 'oy':oy, 'action':click_var.get()})
+            _path, _, confidence, _ = sequent_image_action_settings(action)
+            # Fail at edit time, not ten minutes into playback.
+            template_w, template_h, pixels = sequent_load_image_bgra(_path)
+            if template_w < 2 or template_h < 2:
+                raise MacroExecutionError('Template must be at least 2x2 pixels')
+            if not any(pixels[i+3] >= 100 for i in range(0,len(pixels),4)):
+                raise MacroExecutionError('Image is fully transparent; there is nothing to match')
+            action['confidence'] = confidence
+            return action
+
+        def save(open_reticle=False):
+            try:
+                action = settings()
+            except (MacroExecutionError, ValueError, OSError) as exc:
+                status_label.config(text=str(exc), fg=COLOR_DANGER)
+                return
+            if edit_idx is not None:
+                index = edit_idx
+                self.app.recorded_actions[index] = action
+            else:
+                index = line_num - 1 if 'After' in pos_var.get() else line_num - 2
+                index = max(0, min(index, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(index, action)
+            self.close_sub_menu()
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(index)
+            self.app.update_status('Find Image settings saved', COLOR_SUCCESS)
+            if open_reticle:
+                self.app.root.after(90, self.app.toggle_reticle_edit)
+
+        def test_match():
+            try:
+                action = settings()
+            except (MacroExecutionError, ValueError, OSError) as exc:
+                status_label.config(text=str(exc), fg=COLOR_DANGER)
+                return
+            if getattr(self, '_image_test_active', False):
+                return
+            self._image_test_active = True
+            status_label.config(text='Capturing selected area for an image match...', fg=SYNTAX_BLUE)
+            if self.sub_menu and self.sub_menu.winfo_exists():
+                self.sub_menu.withdraw()
+            self.app.root.withdraw()
+
+            def snapshot():
+                image = None
+                failure = None
+                try:
+                    image = sequent_capture_bgra(*validated_capture_area(action['area']))
+                except Exception as exc:
+                    failure = str(exc)
+                finally:
+                    self.app.restore_after_desktop_picker()
+                if failure:
+                    self._image_test_active = False
+                    if status_label.winfo_exists():
+                        status_label.config(text=f'Could not capture: {failure}', fg=COLOR_DANGER)
+                    return
+
+                def search():
+                    match = None
+                    error = None
+                    try:
+                        match = self.app.dynamic_engine.find_image(action, screen_pixels=image)
+                    except Exception as exc:
+                        error = str(exc)
+                    def display_result():
+                        self._image_test_active = False
+                        if not status_label.winfo_exists():
+                            return
+                        if error:
+                            status_label.config(text=f'Image test failed: {error}', fg=COLOR_DANGER)
+                        elif match:
+                            x1, y1, x2, y2 = match
+                            tx, ty = color_click_target(action, match)
+                            self.app.draw_highlight_box(x1, y1, x2, y2,
+                                                        outline_color=COLOR_SUCCESS, duration_ms=1600)
+                            status_label.config(text=f'Match at ({x1}, {y1}), {x2-x1}x{y2-y1}. '
+                                                     f'Reticle would target ({tx}, {ty}). No click sent.',
+                                                fg=COLOR_SUCCESS)
+                        else:
+                            status_label.config(text='No image found at this confidence. '
+                                                     'Try smaller search bounds or lower confidence.',
+                                                fg=SYNTAX_ORANGE)
+                    self.app.root.after(0, display_result)
+                Thread(target=search, daemon=True).start()
+
+            self.app.root.after(120, snapshot)
+
+        ModernButton(body, text='Test Match (Preview Only — No Click)',
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=test_match).pack(fill=tk.X, pady=(0, 5))
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Find Image Action',
+                     bg_color=COLOR_SUCCESS, hover_color=COLOR_SUCCESS,
+                     command=save).pack(fill=tk.X, pady=(0, 5))
+        ModernButton(body, text='Save & Open Live Reticle Editor',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=lambda: save(open_reticle=True)).pack(fill=tk.X)
+
     def _render_find_text_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
         curr = (self.app.recorded_actions[edit_idx]
@@ -6953,7 +7401,7 @@ class GhostReticle:
         idx = self._live_index
         if (idx is None or idx >= len(app.recorded_actions) or
                 getattr(app, "_reticle_edit_index", None) != idx or
-                app.recorded_actions[idx].get("type") not in ("find_color", "find_text") or
+                app.recorded_actions[idx].get("type") not in ("find_color", "find_text", "find_image") or
                 app.playing or app.recording or app.chain_running):
             app.stop_reticle_edit()
             return
@@ -6997,6 +7445,8 @@ class GhostReticle:
                         color = act.get("color", "#FFFFFF")
                         tolerance = act.get("tolerance", 8)
                         box = app.search_color_in_area(*region, color, tolerance=tolerance)
+                    elif act.get("type") == "find_image":
+                        box = app.dynamic_engine.find_image(act)
                     else:
                         text = act.get("text", "")
                         box = app.find_text_rect(*region, text)
@@ -8008,10 +8458,10 @@ class BuiltInMacroApp:
             return "break"
 
         act = self.recorded_actions[self.current_action_idx]
-        if act.get("type") not in ("move", "click", "wait_pixel", "scroll", "find_color", "find_text"):
+        if act.get("type") not in ("move", "click", "wait_pixel", "scroll", "find_color", "find_text", "find_image"):
             return "break"
             
-        if act.get("type") in ("find_color", "find_text"):
+        if act.get("type") in ("find_color", "find_text", "find_image"):
             act["ox"] = int(act.get("ox", 0)) + dx
             act["oy"] = int(act.get("oy", 0)) + dy
         else:
@@ -8032,7 +8482,7 @@ class BuiltInMacroApp:
             fg=SYNTAX_GREEN
         )
 
-        if act.get("type") in ("find_color", "find_text") and self._reticle_edit_index is not None:
+        if act.get("type") in ("find_color", "find_text", "find_image") and self._reticle_edit_index is not None:
             tx, ty = self.ghost_reticle._move_target_only(act)
             self._set_color_live_label(
                 f"● LIVE {'MATCH' if self.ghost_reticle._live_is_found else 'SEARCH'}"
@@ -8074,8 +8524,8 @@ class BuiltInMacroApp:
             self.update_status("Stop playback/recording before editing the reticle", COLOR_DANGER)
             return
         idx = self.current_action_idx
-        if not 0 <= idx < len(self.recorded_actions) or self.recorded_actions[idx].get("type") not in ("find_color", "find_text"):
-            self.update_status("Select a Find Color or Find Text action first", SYNTAX_ORANGE)
+        if not 0 <= idx < len(self.recorded_actions) or self.recorded_actions[idx].get("type") not in ("find_color", "find_text", "find_image"):
+            self.update_status("Select a Find Color, Find Text, or Find Image action first", SYNTAX_ORANGE)
             return
         try:
             self.ghost_reticle.update(self.recorded_actions, idx, app=self)
@@ -9034,6 +9484,12 @@ class BuiltInMacroApp:
             sub_action = action.get('action', 'Single Click')
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
             return f"ocr.find_color('{action.get('color', '')}', offset=({action.get('ox', 0)},{action.get('oy', 0)}), do='{verb}')"
+        elif act_type == "find_image":
+            sub_action = action.get('action', 'Single Click')
+            verb = 'move' if sub_action == 'Move Only' else ('double_click' if sub_action == 'Double Click' else 'click')
+            return (f"image.find({os.path.basename(action.get('path', ''))!r}, "
+                    f"confidence={action.get('confidence', 0.85)}, "
+                    f"offset=({action.get('ox', 0)},{action.get('oy', 0)}), do={verb!r})")
         elif act_type == "find_text":
             sub_action = action.get("action", "Single Click")
             verb = "move" if sub_action == "Move Only" else ("double_click" if sub_action == "Double Click" else "click")
@@ -9501,7 +9957,7 @@ class BuiltInMacroApp:
         snipper.bind("<Escape>", cancel)
         snipper.focus_force()
 
-    def start_screen_selection(self, callback):
+    def start_screen_selection(self, callback, *, capture_template=False):
         """Select exact native Win32 virtual-screen pixels used by GDI/OCR.
 
         Tk x_root/y_root may be DPI-virtualized on a different monitor. Only
@@ -9539,14 +9995,15 @@ class BuiltInMacroApp:
         state = {"start_screen": None, "start_canvas": None,
                  "rect": None, "closed": False}
 
-        def close_selector():
+        def close_selector(*, restore=True):
             if state["closed"]:
                 return False
             state["closed"] = True
             try:
                 snipper.destroy()
             finally:
-                self.restore_after_desktop_picker()
+                if restore:
+                    self.restore_after_desktop_picker()
             return True
 
         def cancel_snipping(event=None):
@@ -9583,6 +10040,25 @@ class BuiltInMacroApp:
                 return
             end_screen = get_mouse_pos()
             region = screen_selection_rect(state["start_screen"], end_screen, desktop)
+            if capture_template and region[2] >= 9 and region[3] >= 9:
+                # Keep BOTH the screen selector and Sequent hidden while the
+                # image is captured. Otherwise the template includes our UI.
+                if close_selector(restore=False):
+                    def capture_after_overlay_closes():
+                        filepath = None
+                        error = None
+                        try:
+                            filepath = sequent_capture_image_template(self, region)
+                        except (OSError, ValueError, MacroExecutionError) as exc:
+                            error = str(exc)
+                        finally:
+                            self.restore_after_desktop_picker()
+                        if error:
+                            self.update_status('Image capture failed: ' + error, COLOR_DANGER)
+                        elif filepath is not None:
+                            callback(list(region), filepath)
+                    self.root.after(120, capture_after_overlay_closes)
+                return
             if close_selector():
                 if region[2] >= 9 and region[3] >= 9:
                     # Defer until the picker is destroyed and editor refocused.
