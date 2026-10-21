@@ -9733,13 +9733,19 @@ class BuiltInMacroApp:
         ModernTooltip(btn_expand, "Expand Sequent")
 
     def update_status(self, text, fg_color=TEXT_MUTED):
+        """Show action notices and errors in the bottom-left footer only.
+
+        The Mini HUD retains its compact status when the main window is hidden.
+        All callers keep using this one method so status updates stay consistent.
+        """
         def _apply():
-            if hasattr(self, 'status_text') and self.status_text.winfo_exists():
-                self.status_text.config(text=f"● {text}", fg=fg_color)
             if hasattr(self, "footer_status") and self.footer_status.winfo_exists():
                 self.footer_status.config(text=str(text), fg=fg_color)
-            if self.mini_hud and self.mini_hud.winfo_exists() and hasattr(self, 'hud_status_lbl'):
-                trunc = (text[:14] + "..") if len(text) > 16 else text
+            if (self.mini_hud and self.mini_hud.winfo_exists()
+                    and hasattr(self, 'hud_status_lbl')
+                    and self.hud_status_lbl.winfo_exists()):
+                message = str(text)
+                trunc = (message[:14] + "..") if len(message) > 16 else message
                 self.hud_status_lbl.config(text=f"● {trunc}", fg=fg_color)
         self.root.after(0, _apply)
 
@@ -9941,9 +9947,8 @@ class BuiltInMacroApp:
             # Windows handles double-click-to-maximize on the custom caption.
             top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
-        self.status_text = tk.Label(top_bar, text="● Ready", bg=BG_HEADER,
-                                    fg=COLOR_SUCCESS, font=("Segoe UI", 9, "bold"))
-        self.status_text.pack(side=tk.RIGHT, padx=(4, 16))
+        # Notifications live exclusively in the bottom-left footer. Keep the
+        # top-right area available for the preset selector and window controls.
 
         preset_card = ModernCard(top_bar, bg_card=BG_INPUT)
         self.preset_card = preset_card  # Walkthrough highlights the complete preset selector.
