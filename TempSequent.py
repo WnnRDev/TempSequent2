@@ -1269,6 +1269,45 @@ def send_unicode_char(char):
                 raise MacroExecutionError('Windows rejected Unicode keyboard input')
 
 
+
+def type_variable_text(text, speed_multiplier=1.0):
+    """Type saved variable text as Unicode, independent of keyboard layout.
+
+    Values are used verbatim: quotes, apostrophes, backslashes, dollar signs,
+    JSON punctuation, emoji and non-ASCII characters are *data*, not commands.
+    SendInput KEYEVENTF_UNICODE avoids dead keys and Shift/AltGr combinations
+    from VkKeyScanW. CRLF is one Enter; lone CR/LF is one Enter. Tabs are sent
+    using Tab. A NUL can't be typed into a Windows text field; raise an error
+    instead of silently losing part of the stored description.
+
+    No text is ever copied into the Windows clipboard or logged.
+    """
+    text = str(text)
+    if '\x00' in text:
+        raise MacroExecutionError(
+            'Saved variable contains a NUL character, which cannot be '
+            'typed into a Windows text field. The stored value was not changed.'
+        )
+    speed = max(0.1, float(speed_multiplier))
+    # Reasonably paced events for editors that can't handle instantaneous typing.
+    pause = max(0.001, 0.012 / speed)
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == '\r':
+            if index + 1 < len(text) and text[index + 1] == '\n':
+                index += 1
+            press_virtual_key(VK_RETURN)
+        elif ch == '\n':
+            press_virtual_key(VK_RETURN)
+        elif ch == '\t':
+            press_virtual_key(VK_TAB)
+        else:
+            send_unicode_char(ch)
+        index += 1
+        time.sleep(pause)
+
+
 def type_string(text, speed_multiplier=1.0):
     for char in text:
         # VkKeyScanW only accepts one UTF-16 code unit.
@@ -3327,7 +3366,12 @@ def set_global_var(app, name, value):
             raise MacroExecutionError(f'Unable to prepare global variable file: {exc}') from exc
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                json.dump(data, stream, indent=2, ensure_ascii=False)
+                # JSON escaping protects embedded double quotes, backslashes,
+                # CR/LF, tabs and all other control characters. Using ASCII
+                # escapes also makes malformed UTF-16 surrogate data from
+                # Windows clipboard input round-trip without a UTF-8 write
+                # error. json.load reconstructs the original Python string.
+                json.dump(data, stream, indent=2, ensure_ascii=True)
                 stream.write('\n')
             os.replace(temporary, path)
         except (OSError, TypeError, ValueError) as exc:
@@ -11102,7 +11146,9 @@ class BuiltInMacroApp:
                     "Click the destination field before Type Variable, or start "
                     "playback with the global hotkey while the destination is focused."
                 )
-            type_string(val, self.playback_speed)
+            # A persisted description may contain arbitrary punctuation;
+            # don't translate it through the active keyboard layout.
+            type_variable_text(val, self.playback_speed)
             report(f"Typed variable '{var_name}' ({len(val)} characters)", COLOR_SUCCESS)
         elif act_type == "key":
             type_string(str(action.get("key", "")), self.playback_speed)
