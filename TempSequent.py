@@ -2355,6 +2355,10 @@ DYNAMIC_ACTION_SPECS = {
  'Run Macro':('run_macro',[
    ('preset','Saved macro name','text',''),
    ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro'])]),
+ 'Load Text File → Variable':('load_text_variable',[
+   ('path','Text file to read (.txt; relative paths use presets/text_files)','path','defect_description.txt'),
+   ('var_name','Destination variable name','text','defect_description'),
+   ('var_scope','Variable Scope','choice','Global',['Local','Global'])]),
  'Set Variable':('set_variable',[
    ('var_name','Variable name','text','status'),
    ('var_scope','Variable Scope','choice','Local',['Local','Global']),
@@ -3113,7 +3117,8 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
-    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro'
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro',
+    'load_text_variable'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -3417,6 +3422,93 @@ def capture_clipboard_variable(app, action):
         )
     set_variable(app, name, contents, action.get('var_scope'))
     return {'variable': bare, 'scope': scope, 'length': len(contents)}
+
+
+
+# Text files are optional, human-readable companions to globals.json. Relative
+# filenames live beside presets in text_files; absolute paths are explicit.
+SEQUENT_TEXT_FILE_LIMIT = 16 * 1024 * 1024  # 16 MiB, protect the editor and JSON store
+
+
+def sequent_text_file_path(app, filename):
+    value = os.path.expandvars(os.path.expanduser(str(filename or '').strip()))
+    if not value:
+        raise MacroExecutionError('Choose a text file path before running this action')
+    if os.path.isabs(value):
+        path = os.path.abspath(value)
+    else:
+        root = os.path.abspath(os.path.join(app.presets_dir, 'text_files'))
+        path = os.path.abspath(os.path.join(root, value))
+        if os.path.commonpath((root, path)) != root:
+            raise MacroExecutionError('Relative text file paths must stay in the presets/text_files folder')
+    if os.path.normcase(path) == os.path.normcase(_global_variable_path(app)):
+        raise MacroExecutionError('globals.json is reserved for Sequent variables; select a .txt file')
+    return path
+
+
+def sequent_clipboard_to_file(app, action):
+    """Copy current Unicode clipboard text verbatim to a UTF-8 file atomically.
+
+    Unlike JSON, the file is plain readable text. No templating, stripping,
+    keyword matching, newline normalization, or command execution is applied.
+    Optional scoped assignment uses the same text after the file is written.
+    """
+    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
+    assign = bool(action.get('also_set_variable', False))
+    if assign:
+        name, scope = variable_identity(action.get('var_name', 'defect_description'),
+                                        action.get('var_scope', 'global'))
+        # Fail early if global JSON is damaged; do not touch the text file.
+        if scope == 'global':
+            _read_global_values(app)
+    value = get_clipboard_text()
+    if not isinstance(value, str) or not value:
+        raise MacroExecutionError('Clipboard has no text; text file and variables were not changed')
+    try:
+        data = value.encode('utf-8', errors='surrogatepass')
+    except UnicodeError as exc:
+        raise MacroExecutionError('Clipboard text cannot be encoded as UTF-8') from exc
+    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
+        raise MacroExecutionError('Clipboard text exceeds the 16 MiB text-file limit')
+    folder = os.path.dirname(path)
+    temp_path = None
+    try:
+        os.makedirs(folder, exist_ok=True)
+        descriptor, temp_path = tempfile.mkstemp(prefix='.sequent-text-', suffix='.tmp', dir=folder)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(data)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise MacroExecutionError(f'Could not save clipboard to text file: {exc}') from exc
+    finally:
+        if temp_path and os.path.isfile(temp_path):
+            os.unlink(temp_path)
+    if assign:
+        set_variable(app, name, value, scope)
+    return {'path':path, 'length':len(value), 'variable':name if assign else None,
+            'scope':scope if assign else None}
+
+
+def sequent_text_file_to_variable(app, action):
+    """Read a text file verbatim and assign to a Local or Global variable."""
+    path = sequent_text_file_path(app, action.get('path', 'defect_description.txt'))
+    name, scope = variable_identity(action.get('var_name', 'defect_description'),
+                                    action.get('var_scope', 'global'))
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(SEQUENT_TEXT_FILE_LIMIT + 1)
+    except OSError as exc:
+        raise MacroExecutionError(f'Unable to open text file {path!r}: {exc}') from exc
+    if len(data) > SEQUENT_TEXT_FILE_LIMIT:
+        raise MacroExecutionError('Text file exceeds the 16 MiB text-file limit')
+    try:
+        value = data.decode('utf-8', errors='surrogatepass')
+    except UnicodeError as exc:
+        raise MacroExecutionError('Text file must contain UTF-8 text') from exc
+    if not value:
+        raise MacroExecutionError('Text file is empty; existing variable was not changed')
+    set_variable(app, name, value, scope)
+    return {'path':path, 'length':len(value), 'variable':name, 'scope':scope}
 
 
 def apply_clipboard_keyword_rules(app, action, clipboard_text=None):
@@ -3876,6 +3968,8 @@ class SequentDynamicEngine:
             result = {'value':extracted,'variable':name}
         elif typ == 'run_macro':
             raise MacroExecutionError('Run Macro must be executed by the workflow interpreter')
+        elif typ == 'load_text_variable':
+            result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'set_variable':
             name = action.get('var_name', '')
             variable_identity(name, action.get('var_scope'))
@@ -4244,7 +4338,8 @@ class VSCodeQueueViewer(tk.Frame):
         )),
         ("Variables & Inputs", (
             ("Set Variable", "Create or update a local/global variable.", "SV"),
-            ("Read Clipboard", "Capture text or route clipboard keywords to scoped variables.", "RC"),
+            ("Read Clipboard", "Capture text, save to a text file, or route clipboard keywords.", "RC"),
+            ("Load Text File → Variable", "Read a UTF-8 text file into a Local or Global variable.", "LF"),
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
@@ -5583,10 +5678,11 @@ class VSCodeQueueViewer(tk.Frame):
                    if edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)
                    else None)
         initial_mode = current.get('mode', 'keywords') if current else 'capture'
-        if initial_mode not in ('capture', 'keywords'):
+        if initial_mode not in ('capture', 'keywords', 'file'):
             initial_mode = 'keywords'
         labels = {'capture': 'Save Entire Clipboard Text',
-                  'keywords': 'Check Keywords (Rules)'}
+                  'keywords': 'Check Keywords (Rules)',
+                  'file': 'Save Clipboard Text to File'}
         tk.Label(body, text='Clipboard Operation:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
         mode_var = tk.StringVar(value=labels[initial_mode])
@@ -5597,22 +5693,58 @@ class VSCodeQueueViewer(tk.Frame):
                                  activebackground=COLOR_ACCENT)
         mode_menu.pack(fill=tk.X, pady=(0, 10))
 
-        tk.Label(body, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
+        variable_frame = tk.Frame(body, bg=BG_PANEL)
+        variable_frame.pack(fill=tk.X)
+        tk.Label(variable_frame, text='Default Destination Variable:', font=('Segoe UI', 8, 'bold'),
                  bg=BG_PANEL, fg=TEXT_MUTED, anchor='w').pack(fill=tk.X, pady=(0, 3))
-        var_entry = tk.Entry(body, bg=BG_INPUT, fg=SYNTAX_PURPLE,
+        var_entry = tk.Entry(variable_frame, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                              font=('Consolas', 9, 'bold'),
                              insertbackground=TEXT_PRIMARY, bd=0,
                              highlightbackground=BG_BORDER, highlightthickness=1)
         var_entry.pack(fill=tk.X, ipady=3)
-        default_new = 'status' if initial_mode == 'keywords' else 'clipboard_text'
+        default_new = 'status' if initial_mode == 'keywords' else ('defect_description' if initial_mode == 'file' else 'clipboard_text')
         existing_name = current.get('var_name', default_new) if current else default_new
         var_entry.insert(0, variable_identity(existing_name,
                               current.get('var_scope') if current else None)[0])
-        scope_var = self._add_variable_scope_picker(body, current)
+        scope_var = self._add_variable_scope_picker(variable_frame, current or
+                                                    {'var_name': 'defect_description',
+                                                     'var_scope': 'Global'} if initial_mode == 'file' else current)
 
         help_label = tk.Label(body, font=('Segoe UI', 8), bg=BG_PANEL,
                               fg=TEXT_MUTED, wraplength=450, justify=tk.LEFT)
         help_label.pack(fill=tk.X, pady=(0, 8))
+
+        file_frame = tk.Frame(body, bg=BG_PANEL)
+        tk.Label(file_frame, text='Text File to Write:', font=('Segoe UI', 8, 'bold'),
+                 bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w', pady=(0, 3))
+        file_path_entry = tk.Entry(file_frame, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                   insertbackground=TEXT_PRIMARY, font=('Consolas', 9),
+                                   bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+        file_path_entry.pack(fill=tk.X, ipady=4)
+        file_path_entry.insert(0, current.get('path', 'defect_description.txt')
+                               if current else 'defect_description.txt')
+
+        def choose_save_file():
+            candidate = filedialog.asksaveasfilename(parent=self.sub_menu,
+                defaultextension='.txt', filetypes=[('Text files', '*.txt'), ('All files', '*.*')],
+                title='Choose file to overwrite with clipboard text')
+            if candidate:
+                file_path_entry.delete(0, tk.END)
+                file_path_entry.insert(0, candidate)
+
+        ModernButton(file_frame, text='Browse / Choose File...', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER, command=choose_save_file).pack(fill=tk.X, pady=(4, 4))
+        tk.Label(file_frame,
+                 text='Relative names save under presets/text_files. The file is replaced '
+                      'on each run; the original clipboard text is preserved.',
+                 font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
+                 wraplength=440, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 7))
+        also_set_var = tk.BooleanVar(value=bool(current.get('also_set_variable', False))
+                                     if current else False)
+        tk.Checkbutton(file_frame, text='Also save clipboard as a variable now',
+                       variable=also_set_var, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=BG_INPUT, activebackground=BG_PANEL,
+                       command=lambda: update_mode()).pack(anchor='w', pady=(0, 6))
 
         # The action editor already has a vertical scroll area. Dynamic rule
         # cards live inside that scrollable body; Add/Remove works at any size.
@@ -5716,20 +5848,39 @@ class VSCodeQueueViewer(tk.Frame):
                  font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED,
                  wraplength=430, justify=tk.LEFT).pack(fill=tk.X, pady=(0, 6))
 
+        file_first_selected = [False]
         def update_mode(*_):
             is_keywords = mode_var.get() == labels['keywords']
+            is_file = mode_var.get() == labels['file']
+            if is_file and not current and not file_first_selected[0]:
+                # Global is the useful default for reusing a defect description
+                # between separately saved macros; the user may choose Local.
+                if scope_var.get() == 'Local':
+                    scope_var.set('Global')
+                file_first_selected[0] = True
             if not current:
-                previous_default = 'clipboard_text' if is_keywords else 'status'
-                next_default = 'status' if is_keywords else 'clipboard_text'
+                defaults = {'capture': 'clipboard_text', 'keywords': 'status',
+                            'file': 'defect_description'}
+                next_default = defaults['keywords' if is_keywords else 'file' if is_file else 'capture']
+                previous_default = next((v for v in defaults.values()
+                                         if v != next_default and var_entry.get() == v), None)
                 if var_entry.get() == previous_default:
                     var_entry.delete(0, tk.END)
                     var_entry.insert(0, next_default)
-            help_label.config(text=('Check all keyword-to-value rules against the clipboard '
-                                    'when this action runs. Choose Local/Global for each '
-                                    'destination or use the default scope.' if is_keywords else
-                                    'Save the entire Unicode clipboard text, including '
-                                    'spaces and line breaks. Empty clipboard text will '
-                                    'not overwrite a saved value.'))
+            help_label.config(text=('Check keyword-to-value rules; choose Local/Global for each '
+                                    'destination.' if is_keywords else
+                                    'Write the full Unicode clipboard text into a UTF-8 file '
+                                    'without changing punctuation or line breaks.' if is_file else
+                                    'Save all clipboard text, including spaces and line breaks, '
+                                    'as a Local or Global variable.'))
+            if is_file:
+                file_frame.pack(fill=tk.X, pady=(2, 10), before=keyword_anchor)
+            else:
+                file_frame.pack_forget()
+            if is_file and not also_set_var.get():
+                variable_frame.pack_forget()
+            else:
+                variable_frame.pack(fill=tk.X, before=help_label)
             if is_keywords:
                 keyword_frame.pack(fill=tk.X, pady=(6, 8), before=keyword_anchor)
             else:
@@ -5750,14 +5901,23 @@ class VSCodeQueueViewer(tk.Frame):
         def submit():
             name = var_entry.get().strip()
             scope = scope_var.get().lower()
-            try:
-                variable_identity(name, scope)
-            except MacroExecutionError as exc:
-                self.app.update_status(str(exc), COLOR_DANGER)
-                return
-            mode = 'capture' if mode_var.get() == labels['capture'] else 'keywords'
-            action = {'type': 'read_clipboard', 'mode': mode,
-                      'var_name': name, 'var_scope': scope}
+            mode = next(k for k, v in labels.items() if v == mode_var.get())
+            action = {'type': 'read_clipboard', 'mode': mode}
+            if mode != 'file' or also_set_var.get():
+                try:
+                    variable_identity(name, scope)
+                except MacroExecutionError as exc:
+                    self.app.update_status(str(exc), COLOR_DANGER)
+                    return
+                action.update(var_name=name, var_scope=scope)
+            if mode == 'file':
+                filename = file_path_entry.get().strip()
+                try:
+                    sequent_text_file_path(self.app, filename)
+                except (MacroExecutionError, ValueError) as exc:
+                    self.app.update_status(str(exc), COLOR_DANGER)
+                    return
+                action.update(path=filename, also_set_variable=also_set_var.get())
             if mode == 'keywords':
                 rules = []
                 reverse_scope = {'Use Default Scope': None, 'Local': 'local', 'Global': 'global'}
@@ -6431,7 +6591,7 @@ class VSCodeQueueViewer(tk.Frame):
             tk.Label(body, text=label, font=('Segoe UI',8,'bold'),
                      bg=BG_PANEL,fg=TEXT_MUTED,anchor='w').pack(fill=tk.X,pady=(7,2))
             if kind=='choice':
-                val = tk.StringVar(value=str(variable_identity(old.get('var_name') or 'status', old.get('var_scope'))[1].title() if key=='var_scope' else old.get(key,default)))
+                val = tk.StringVar(value=str(variable_identity(old.get('var_name') or 'status', old.get('var_scope', default))[1].title() if key=='var_scope' else old.get(key,default)))
                 menu = tk.OptionMenu(body,val,*(options or []))
                 menu.config(bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',9),
                             highlightbackground=BG_BORDER, highlightthickness=1,bd=0)
@@ -6568,6 +6728,13 @@ class VSCodeQueueViewer(tk.Frame):
                          'Use the queue to order your IF / ELSE / END IF and LOOP / END LOOP actions.',
                      bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9),wraplength=450,
                      justify='left').pack(fill=tk.X,pady=(4,8))
+        if type_name=='load_text_variable':
+            tk.Label(body, text='Reads the complete UTF-8 file on every run and stores its '
+                         'text unchanged in the selected Local or Global variable. '
+                         'Relative filenames refer to presets/text_files. A missing, '
+                         'empty, or invalid file leaves the variable unchanged.',
+                     bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                     wraplength=460, justify='left').pack(fill=tk.X, pady=4)
         if type_name=='trigger_start':
             tk.Label(body,text='Place this as the FIRST action in the sequence to arm auto-start. '
                          'Sequent checks for a new window, changed clipboard, or a new/modified file '
@@ -10812,6 +10979,11 @@ class BuiltInMacroApp:
         elif act_type == "wait_text":
             return f"ocr.wait_text({action.get('text', '')!r}, {action.get('mode', 'appears')})"
         elif act_type == "read_clipboard":
+            if action.get('mode', 'keywords') == 'file':
+                name = os.path.basename(str(action.get('path', 'defect_description.txt')))
+                suffix = (f" + {action.get('var_scope', 'local')} variable"
+                          if action.get('also_set_variable') else '')
+                return f'clipboard.to_file({name!r}){suffix}'
             if action.get('mode', 'keywords') == 'capture':
                 return (f"clipboard.capture() -> {action.get('var_scope', 'local').title()} "
                         f"${action.get('var_name', 'clipboard_text')}")
@@ -11126,6 +11298,13 @@ class BuiltInMacroApp:
                 if self.audio_cues: play_cue('match')
                 report(f"Clipboard saved to {saved['scope'].title()} variable "
                        f"'{saved['variable']}' ({saved['length']} characters)", COLOR_SUCCESS)
+            elif mode == 'file':
+                saved = sequent_clipboard_to_file(self, action)
+                if self.audio_cues: play_cue('match')
+                destination = (f"; also saved to {saved['scope'].title()} variable '{saved['variable']}'"
+                               if saved['variable'] else '')
+                report(f"Clipboard saved to {os.path.basename(saved['path'])!r} "
+                       f"({saved['length']} characters){destination}", COLOR_SUCCESS)
             elif mode == 'keywords':
                 results = apply_clipboard_keyword_rules(self, action)
                 if results:
