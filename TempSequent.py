@@ -1613,6 +1613,16 @@ class SequentIcon(tk.Canvas):
             self.create_arc(*xy(2,5,18,15), start=180, extent=180, style='arc',
                             outline=c, width=1.8*s)
             oval(8,8,12,12,fill=c)
+        elif n in ('undo', 'redo'):
+            # Crisp, mirror-image undo/redo arrows; no icon font required.
+            if n == 'undo':
+                line(8,5,3,10,8,15)
+                self.create_arc(*xy(4,5,18,17), start=280, extent=205,
+                                style='arc', outline=c, width=2*s)
+            else:
+                line(12,5,17,10,12,15)
+                self.create_arc(*xy(2,5,16,17), start=55, extent=205,
+                                style='arc', outline=c, width=2*s)
         elif n == 'refresh':
             self.create_arc(*xy(3,3,17,17), start=55, extent=265, style='arc',
                             outline=c, width=1.9*s)
@@ -4653,6 +4663,27 @@ class VSCodeQueueViewer(tk.Frame):
             self.close_sub_menu()
 
     def _on_key_press(self, event):
+        # The read-only queue consumes normal keystrokes; intercept undo first.
+        ctrl = bool(event.state & 0x0004 or event.state & 0x0080)
+        if ctrl and event.keysym.lower() == 'z':
+            if bool(event.state & 0x0001):
+                self.app.redo_deleted_actions()
+            else:
+                self.app.undo_deleted_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'y':
+            self.app.redo_deleted_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'c':
+            self.app.copy_queue_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'v':
+            self.app.paste_queue_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 'a':
+            self.select_all_actions()
+            return 'break'
+
         # 1. Feature 5: In-Place Coordinate Nudge via Alt / Alt+Shift
         alt_pressed = bool(event.state & 0x20000) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_MENU) & 0x8000)
         shift_pressed = bool(event.state & 0x0001) or bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
@@ -4685,9 +4716,7 @@ class VSCodeQueueViewer(tk.Frame):
             return "break"
 
         # 3. Standard Text Shortcuts
-        ctrl = bool(event.state & 0x0004 or event.state & 0x0080)
-        if ctrl and event.keysym.lower() in ("c", "a"): 
-            return None
+        # Ctrl+A/C/V above operate on actual action objects, not displayed text.
             
         if event.keysym in ("Up", "Down", "Prior", "Next"): 
             return None
@@ -4699,6 +4728,46 @@ class VSCodeQueueViewer(tk.Frame):
 
         return "break"
     
+    def selected_action_indices(self):
+        """Return all action rows touched by Tk's selection, never the header.
+
+        When there is no text selection use the playhead, so a normal click
+        followed by Ctrl+C or Ctrl+V always has a predictable target.
+        """
+        actions = self.app.recorded_actions
+        if not actions:
+            return []
+        try:
+            first, last = self.code_text.tag_ranges('sel')[:2]
+            start_line = int(self.code_text.index(first).split('.')[0])
+            end_index = self.code_text.index(last)
+            end_line, end_column = map(int, end_index.split('.'))
+            if end_column == 0 and end_line > start_line:
+                end_line -= 1
+            start = max(0, start_line - 2)
+            end = min(len(actions) - 1, end_line - 2)
+            if start <= end:
+                return list(range(start, end + 1))
+        except (tk.TclError, IndexError, ValueError):
+            pass
+        return [max(0, min(self.app.current_action_idx, len(actions) - 1))]
+
+    def select_action_range(self, first_index, last_index):
+        """Make pasted actions visible and selected without selecting the header."""
+        if first_index > last_index:
+            return
+        self.code_text.tag_remove('sel', '1.0', 'end')
+        self.code_text.tag_add('sel', f'{first_index + 2}.0',
+                               f'{last_index + 3}.0')
+        self.code_text.mark_set('insert', f'{first_index + 2}.0')
+        self.code_text.see(f'{first_index + 2}.0')
+
+    def select_all_actions(self):
+        if self.app.recorded_actions:
+            self.select_action_range(0, len(self.app.recorded_actions) - 1)
+            return True
+        return False
+
     def _handle_delete_key(self):
         if not self.interactive_enabled or not self.app.recorded_actions:
             return
@@ -4722,7 +4791,10 @@ class VSCodeQueueViewer(tk.Frame):
             self.app.delete_action_range(start_idx, end_idx)
 
     def _on_right_click(self, event):
-        if not self.interactive_enabled or not self.app.recorded_actions:
+        if not self.interactive_enabled:
+            return
+        if (not self.app.recorded_actions and not self.app._queue_undo_history
+                and not self.app._queue_action_clipboard):
             return
 
         rel_y = event.y_root - self.gutter.winfo_rooty()
@@ -4736,6 +4808,9 @@ class VSCodeQueueViewer(tk.Frame):
         self.code_text.mark_set("insert", f"{line_num}.0")
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY, bd=1, relief="flat", font=("Segoe UI", 9))
 
+        if self.app._queue_undo_history:
+            menu.add_command(label="Undo Delete (Ctrl+Z)", command=self.app.undo_deleted_actions)
+            menu.add_separator()
         if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
             act_idx = line_num - 2
             act = self.app.recorded_actions[act_idx]
@@ -4743,6 +4818,15 @@ class VSCodeQueueViewer(tk.Frame):
             is_bp = act_idx in self.app.breakpoints
             bp_label = f"Remove Breakpoint (Line {line_num})" if is_bp else f"Toggle Breakpoint (Line {line_num})"
 
+            # Copy the full highlighted range when the context row is selected.
+            selected = self.selected_action_indices()
+            to_copy = selected if act_idx in selected else [act_idx]
+            menu.add_command(label="Copy Action(s) (Ctrl+C)",
+                             command=lambda indices=to_copy: self.app.copy_queue_actions(indices))
+            if self.app._queue_action_clipboard:
+                menu.add_command(label="Paste After This Action (Ctrl+V)",
+                                 command=lambda idx=act_idx + 1: self.app.paste_queue_actions(idx))
+            menu.add_separator()
             # Direct edit option
             menu.add_command(label=f"Edit Action '{act_type}' (Line {line_num})...", command=lambda: self.open_action_submenu(line_num, event, edit_idx=act_idx))
             menu.add_command(label=bp_label, command=lambda: self.app.toggle_breakpoint(act_idx))
@@ -4751,6 +4835,10 @@ class VSCodeQueueViewer(tk.Frame):
                 menu.add_command(label="Delete All Mouse Movements", command=self.app.remove_all_mouse_moves)
             menu.add_separator()
 
+        if self.app._queue_action_clipboard and not self.app.recorded_actions:
+            menu.add_command(label="Paste Actions Here (Ctrl+V)",
+                             command=lambda: self.app.paste_queue_actions(0))
+            menu.add_separator()
         menu.add_command(label=f"Insert Action at Line {line_num}...", command=lambda: self.open_action_submenu(line_num, event))
         if any(a.get("type") == "move" for a in self.app.recorded_actions):
             menu.add_command(label="Remove All Mouse Movements", command=self.app.remove_all_mouse_moves)
@@ -4841,6 +4929,10 @@ class VSCodeQueueViewer(tk.Frame):
 
         self._dnd_start_idx = None
         self._dnd_active = False
+
+        # Shift-click is for range selection, not dragging a queue action.
+        if event.state & 0x0001:
+            return
 
         # Synchronize playhead & reticle to the clicked queue line
         try:
@@ -9355,6 +9447,15 @@ class BuiltInMacroApp:
         self.is_binding = False
         self.active_hotkey_field = None
         self.recorded_actions = []
+        # Queue deletions and pastes are journaled; typing in editors uses native
+        # Tk undo and is deliberately not captured by queue Ctrl+Z.
+        self._queue_undo_history = []
+        self._queue_redo_history = []
+        self._queue_undo_limit = 30
+        # Action-only clipboard: deliberately separate from the Windows text
+        # clipboard used by Read Clipboard and Type Variable workflows.
+        # Retained when switching presets, cleared only when Sequent closes.
+        self._queue_action_clipboard = None
         self.active_keys = []
         self.variables = {}
         self.breakpoints = set()
@@ -9746,6 +9847,15 @@ class BuiltInMacroApp:
         self.root.bind("<Home>", lambda e: self._on_scrub_nav("home"))
         self.root.bind("<End>", lambda e: self._on_scrub_nav("end"))
         self.root.bind("<space>", lambda e: self._on_scrub_nav("run_step"))
+        # Toplevel bindings work from the queue toolbar too; entry/text fields
+        # keep their ordinary Ctrl+Z behavior. The queue Text handles its own
+        # shortcuts because its read-only KeyPress binding consumes key events.
+        self.root.bind('<Control-z>', self._on_queue_undo_shortcut, add='+')
+        self.root.bind('<Control-Z>', self._on_queue_undo_shortcut, add='+')
+        self.root.bind('<Control-y>', self._on_queue_redo_shortcut, add='+')
+        self.root.bind('<Control-Y>', self._on_queue_redo_shortcut, add='+')
+        # Only the queue itself handles Ctrl+C/V; normal Entry/Text widgets
+        # (and other applications) retain their regular Windows clipboard.
         for seq, dx, dy in [
             ("<Alt-Left>", -1, 0), ("<Alt-Right>", 1, 0),
             ("<Alt-Up>", 0, -1), ("<Alt-Down>", 0, 1),
@@ -10426,13 +10536,19 @@ class BuiltInMacroApp:
         self.import_macro_button = sequent_toolbar_button(filebar, "Import", self.load_macro_from_file)
         self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
         sequent_toolbar_button(filebar, "Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        self.queue_undo_btn = sequent_toolbar_button(
+            filebar, "Undo", self.undo_deleted_actions, icon='undo')
+        self.queue_undo_btn.pack(side=tk.LEFT, padx=(5, 0))
+        ModernTooltip(self.queue_undo_btn, "Restore deleted queue actions", "Ctrl+Z")
         
         # The lengthy instruction consumed more width than the queue could
         # supply at its default size. Keep the help accessible via a tooltip.
         help_label = tk.Label(filebar, text="?", bg=BG_PANEL, fg=TEXT_MUTED,
                               font=("Segoe UI", 9, "bold"), padx=7)
         help_label.pack(side=tk.RIGHT)
-        ModernTooltip(help_label, "Double-click to edit • Right-click for options")
+        ModernTooltip(help_label,
+                      "Double-click to edit • Right-click: Copy/Paste • "
+                      "Ctrl+A select all • Ctrl+C copy • Ctrl+V paste • Ctrl+Z undo")
 
         # --- NEW SEARCH BAR UI ---
         search_frame = tk.Frame(filebar, bg=BG_INPUT, highlightbackground=BG_BORDER, highlightthickness=1)
@@ -11440,36 +11556,222 @@ class BuiltInMacroApp:
         desc = "Any Text" if match_any else f"'{text}'"
         self.update_status(f"Added Area Search: {desc}", COLOR_SUCCESS)
 
+    def _snapshot_queue_for_undo(self):
+        """Copy complete queue state for undo of deletion or paste."""
+        return {
+            'actions': copy.deepcopy(self.recorded_actions),
+            'breakpoints': set(self.breakpoints),
+            'playhead': self.current_action_idx,
+            'source': self.current_source_label,
+        }
+
+    def _queue_matches_snapshot(self, snapshot):
+        # Navigation alone shouldn't invalidate an action deletion undo.
+        return (self.recorded_actions == snapshot['actions'] and
+                self.breakpoints == snapshot['breakpoints'] and
+                self.current_source_label == snapshot['source'])
+
+    def _clear_queue_undo(self):
+        self._queue_undo_history.clear()
+        self._queue_redo_history.clear()
+
+    def _begin_queue_deletion(self):
+        """Break history if another editor changed the queue since the last edit."""
+        before = self._snapshot_queue_for_undo()
+        if (self._queue_undo_history and
+                not self._queue_matches_snapshot(self._queue_undo_history[-1]['after'])):
+            self._queue_undo_history.clear()
+        self._queue_redo_history.clear()
+        return before
+
+    def _finish_queue_deletion(self, before, description):
+        self._queue_undo_history.append({
+            'before': before,
+            'after': self._snapshot_queue_for_undo(),
+            'description': description,
+        })
+        if len(self._queue_undo_history) > self._queue_undo_limit:
+            self._queue_undo_history.pop(0)
+        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+        self.update_status(f"{description} — Ctrl+Z to undo", COLOR_SUCCESS)
+
+    def _restore_queue_snapshot(self, snapshot):
+        # Restores deleted actions at their exact index, nested configuration,
+        # breakpoints, and the pre-deletion playhead.
+        self.recorded_actions = copy.deepcopy(snapshot['actions'])
+        self.breakpoints = set(snapshot['breakpoints'])
+        self.current_action_idx = snapshot['playhead']
+        self.current_source_label = snapshot['source']
+        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+
+    def undo_deleted_actions(self):
+        """Ctrl+Z: undo the latest queue delete/paste without undoing text editing."""
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before undoing deletion', COLOR_DANGER)
+            return False
+        if not self._queue_undo_history:
+            self.update_status('Nothing to undo', TEXT_MUTED)
+            return False
+        entry = self._queue_undo_history[-1]
+        if not self._queue_matches_snapshot(entry['after']):
+            self._clear_queue_undo()
+            self.update_status('Undo history expired: queue was edited or replaced', COLOR_DANGER)
+            return False
+        self._queue_undo_history.pop()
+        self._restore_queue_snapshot(entry['before'])
+        self._queue_redo_history.append(entry)
+        self.update_status(f"Undid: {entry['description']} (Ctrl+Y to redo)", COLOR_SUCCESS)
+        return True
+
+    def redo_deleted_actions(self):
+        """Ctrl+Y (or Ctrl+Shift+Z): redo the last undone queue edit."""
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before redoing deletion', COLOR_DANGER)
+            return False
+        if not self._queue_redo_history:
+            self.update_status('Nothing to redo', TEXT_MUTED)
+            return False
+        entry = self._queue_redo_history[-1]
+        if not self._queue_matches_snapshot(entry['before']):
+            self._clear_queue_undo()
+            self.update_status('Redo history expired: queue was edited or replaced', COLOR_DANGER)
+            return False
+        self._queue_redo_history.pop()
+        self._restore_queue_snapshot(entry['after'])
+        self._queue_undo_history.append(entry)
+        self.update_status(f"Redid: {entry['description']}", TEXT_MUTED)
+        return True
+
+    def _queue_shortcut_allowed(self, event):
+        """Keep Ctrl+Z native in entry widgets and in secondary dialogs."""
+        widget = event.widget
+        if widget.winfo_toplevel() != self.root:
+            return False
+        if (widget is not getattr(getattr(self, 'queue_viewer', None), 'code_text', None) and
+                widget.winfo_class() in
+                ('Entry', 'TEntry', 'Text', 'Spinbox', 'TSpinbox', 'TCombobox',
+                 'Listbox', 'TListbox')):
+            return False
+        return True
+
+    def _on_queue_undo_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        if bool(event.state & 0x0001):
+            self.redo_deleted_actions()  # Ctrl+Shift+Z
+        else:
+            self.undo_deleted_actions()
+        return 'break'
+
+    def _on_queue_redo_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        self.redo_deleted_actions()
+        return 'break'
+
+    def copy_queue_actions(self, indices=None):
+        """Copy complete action dictionaries, not the formatted queue text.
+
+        Clipboard content stays in Sequent and survives loading another macro;
+        it never overwrites CF_UNICODETEXT used by real clipboard actions.
+        """
+        if indices is None:
+            indices = self.queue_viewer.selected_action_indices()
+        indices = sorted(set(i for i in indices
+                             if isinstance(i, int) and 0 <= i < len(self.recorded_actions)))
+        if not indices:
+            self.update_status('No queue actions to copy', TEXT_MUTED)
+            return False
+        self._queue_action_clipboard = {
+            'actions': copy.deepcopy([self.recorded_actions[i] for i in indices]),
+            'breakpoints': [position for position, i in enumerate(indices)
+                            if i in self.breakpoints],
+        }
+        count = len(indices)
+        self.update_status(f'Copied {count} action(s) — Ctrl+V to paste', COLOR_SUCCESS)
+        return True
+
+    def paste_queue_actions(self, index=None):
+        """Insert independent action copies after the selection or at *index*.
+
+        Explicit index means insert BEFORE that zero-based action (used by the
+        right-click menu). The normal shortcut pastes AFTER the last selected
+        action, or at index zero into an empty queue.
+        """
+        if self.recording or self.playing or self.chain_running:
+            self.update_status('Stop recording/playback before pasting actions', COLOR_DANGER)
+            return False
+        clip = self._queue_action_clipboard
+        if not clip or not clip.get('actions'):
+            self.update_status('Copy an Action Queue item first (Ctrl+C)', TEXT_MUTED)
+            return False
+        if index is None:
+            selected = self.queue_viewer.selected_action_indices()
+            index = selected[-1] + 1 if selected else 0
+        index = max(0, min(int(index), len(self.recorded_actions)))
+        pasted = copy.deepcopy(clip['actions'])
+        amount = len(pasted)
+        before = self._begin_queue_deletion()  # Shared undo/redo snapshot journal.
+        self.recorded_actions[index:index] = pasted
+        self.breakpoints = ({bp + amount if bp >= index else bp
+                             for bp in self.breakpoints} |
+                            {index + relative for relative in clip.get('breakpoints', ())
+                             if 0 <= relative < amount})
+        self.current_action_idx = index
+        self._finish_queue_deletion(before, f'Pasted {amount} action(s)')
+        self.queue_viewer.select_action_range(index, index + amount - 1)
+        return True
+
     def delete_action(self, index):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         if 0 <= index < len(self.recorded_actions):
+            before = self._begin_queue_deletion()
             act = self.recorded_actions.pop(index)
-            if self.current_action_idx >= len(self.recorded_actions):
-                self.current_action_idx = max(0, len(self.recorded_actions) - 1)
-            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-            act_type = act.get("type", "action")
-            self.update_status(f"Deleted {act_type} (Action #{index + 1})", COLOR_DANGER)
+            self.breakpoints = {bp - 1 if bp > index else bp
+                                for bp in self.breakpoints if bp != index}
+            if self.current_action_idx > index:
+                self.current_action_idx -= 1
+            elif self.current_action_idx == index:
+                self.current_action_idx = min(index, len(self.recorded_actions) - 1)
+            self.current_action_idx = max(0, self.current_action_idx)
+            act_type = act.get('type', 'action')
+            self._finish_queue_deletion(before, f"Deleted {act_type} (Action #{index + 1})")
 
     def delete_action_range(self, start_idx, end_idx):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
         start_idx = max(0, start_idx)
         end_idx = min(len(self.recorded_actions) - 1, end_idx)
         if start_idx <= end_idx:
+            before = self._begin_queue_deletion()
             count = end_idx - start_idx + 1
             del self.recorded_actions[start_idx:end_idx + 1]
-            if self.current_action_idx >= len(self.recorded_actions):
-                self.current_action_idx = max(0, len(self.recorded_actions) - 1)
-            self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-            self.update_status(f"Deleted {count} action(s)", COLOR_DANGER)
+            self.breakpoints = {bp if bp < start_idx else bp - count
+                                for bp in self.breakpoints
+                                if bp < start_idx or bp > end_idx}
+            if self.current_action_idx > end_idx:
+                self.current_action_idx -= count
+            elif self.current_action_idx >= start_idx:
+                self.current_action_idx = start_idx
+            self.current_action_idx = max(0, min(self.current_action_idx,
+                                                  len(self.recorded_actions) - 1))
+            self._finish_queue_deletion(before, f"Deleted {count} action(s)")
 
     def remove_all_mouse_moves(self):
         if (self.recording and not self.recording_paused) or (self.playing and not self.is_paused): return
-        initial_len = len(self.recorded_actions)
-        self.recorded_actions = [a for a in self.recorded_actions if a.get("type") != "move"]
-        removed = initial_len - len(self.recorded_actions)
-        self.current_action_idx = 0
-        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-        self.update_status(f"Removed {removed} mouse move(s)", COLOR_SUCCESS)
+        kept = [i for i, action in enumerate(self.recorded_actions)
+                if action.get('type') != 'move']
+        removed = len(self.recorded_actions) - len(kept)
+        if not removed:
+            self.update_status('No mouse moves to remove', TEXT_MUTED)
+            return
+        before = self._begin_queue_deletion()
+        idx_map = {old: new for new, old in enumerate(kept)}
+        self.recorded_actions = [self.recorded_actions[i] for i in kept]
+        self.breakpoints = {idx_map[i] for i in self.breakpoints if i in idx_map}
+        new_selection = next((i for i in kept if i >= self.current_action_idx),
+                             kept[-1] if kept else None)
+        self.current_action_idx = idx_map[new_selection] if new_selection is not None else 0
+        self._finish_queue_deletion(before, f"Removed {removed} mouse move(s)")
 
     def start_pixel_inspection(self, callback):
         """Creates a crosshair canvas, hiding it before sampling so true desktop colors are captured."""
@@ -12990,6 +13292,7 @@ try {{
                         validated_actions.append(cleaned_act)
 
                 if validated_actions:
+                    self._clear_queue_undo()  # New macro replaces the editable queue.
                     self.recorded_actions = validated_actions
                     self.current_action_idx = 0
                     self.preset_var.set(stem)
@@ -13064,6 +13367,7 @@ try {{
                             validated_actions.append(cleaned_act)
 
                     if validated_actions:
+                        self._clear_queue_undo()  # New macro replaces the editable queue.
                         self.recorded_actions = validated_actions
                         self.current_action_idx = 0
                         self.preset_var.set("-- Select Preset --")
@@ -13837,7 +14141,9 @@ try {{
         self.play_btn.set_state("disabled")
         self.pause_btn.set_state("normal", text="Pause Rec (F9)", bg=BG_BORDER, hover=BG_HOVER)
 
+        self._clear_queue_undo()  # Recording starts a fresh editable sequence.
         self.recorded_actions.clear()
+        self.breakpoints.clear()
         self.current_action_idx = 0
         self.update_action_count_badge()
         self.queue_viewer.clear()
