@@ -9476,6 +9476,220 @@ class SequentWalkthrough:
             self.app.show_tab(self.original_tab, animate=False)
 
 # --- Main Application ---
+# --- Windows Explorer macro-file drag & drop (native OLE, no TkDND dependency) ---
+SEQUENT_IMPORT_TYPES = DYNAMIC_ACTION_TYPES | SCREEN_RECOGNITION_TYPES | frozenset({
+    'delay', 'wait_pixel', 'wait_text', 'move', 'click', 'drag', 'scroll',
+    'key', 'press', 'combo', 'enter', 'backspace', 'select_all', 'copy',
+    'paste', 'read_clipboard', 'prompt_input', 'type_variable', 'disclaimer',
+})
+
+
+def read_sequent_dropped_macro(path):
+    """Validate a dropped *macro* JSON file, without changing the current queue.
+
+    Never treat every .json as a macro. Chains, settings, globals and incomplete
+    action arrays have distinct formats. Do not silently discard invalid rows.
+    """
+    name = os.path.basename(os.fspath(path)).lower()
+    if not name.endswith('.json') or name.endswith('.chain.json'):
+        raise ValueError('Drop a Sequent .json macro, not a chain or another file type.')
+    if name in ('globals.json', 'settings.json'):
+        raise ValueError('This is a Sequent configuration/data file, not a macro.')
+    try:
+        if os.path.getsize(path) > 8 * 1024 * 1024:
+            raise ValueError('Macro exceeds the 8 MiB import safety limit.')
+        with open(path, 'r', encoding='utf-8-sig') as stream:
+            data = json.load(stream)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError('File is not readable Sequent macro JSON.') from exc
+    if not isinstance(data, list):
+        raise ValueError('A Sequent macro must contain a JSON list of actions.')
+    if len(data) > 20000:
+        raise ValueError('Macro contains too many actions to import safely.')
+    for index, action in enumerate(data, 1):
+        if (not isinstance(action, dict) or
+                not isinstance(action.get('type'), str) or
+                action['type'] not in SEQUENT_IMPORT_TYPES):
+            raise ValueError(f'Action #{index} is not a recognized Sequent action.')
+    return data
+
+
+class SequentExplorerDropTarget:
+    """OLE IDropTarget: accept CF_HDROP files from Explorer, never subclass Tk.
+
+    Register on the Tk UI thread. The COM callbacks only extract paths and
+    schedule a Tk idle callback, avoiding a Python WNDPROC / Tk re-entrancy.
+    """
+    def __init__(self, app):
+        self.app = app
+        self.hwnds = []
+        self.com_initialized = False
+        self._refcount = 1
+        self._build_interfaces()
+        self.ole32 = ctypes.WinDLL('ole32')
+        self.ole32.OleInitialize.argtypes = [ctypes.c_void_p]
+        self.ole32.OleInitialize.restype = ctypes.c_long
+        self.ole32.RegisterDragDrop.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.ole32.RegisterDragDrop.restype = ctypes.c_long
+        self.ole32.RevokeDragDrop.argtypes = [ctypes.c_void_p]
+        self.ole32.RevokeDragDrop.restype = ctypes.c_long
+        self.ole32.OleUninitialize.argtypes = []
+        self.ole32.OleUninitialize.restype = None
+        rc = self.ole32.OleInitialize(None)
+        if rc not in (0, 1):
+            raise OSError(f'OLE initialization failed: HRESULT 0x{rc & 0xffffffff:08X}')
+        self.com_initialized = True
+        try:
+            # Tk's winfo_id() is a child HWND on Windows; the ancestor is its
+            # outer window. Register both to support drops on native chrome.
+            children = (native_toplevel_hwnd(app.root), app.root.winfo_id())
+            for hwnd in dict.fromkeys(int(h) for h in children if h):
+                result = self.ole32.RegisterDragDrop(
+                    ctypes.c_void_p(hwnd), ctypes.cast(ctypes.pointer(self.object), ctypes.c_void_p))
+                if result == 0:
+                    self.hwnds.append(hwnd)
+            if not self.hwnds:
+                raise OSError('Explorer file drops could not be registered for the Sequent window')
+        except Exception:
+            self.close()
+            raise
+
+    def _build_interfaces(self):
+        CALLBACK = ctypes.WINFUNCTYPE
+        HRESULT = ctypes.c_long
+        ULONG = ctypes.c_ulong
+        DWORD = ctypes.c_uint32
+        LPVOID = ctypes.c_void_p
+        class POINTL(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+        class FORMATETC(ctypes.Structure):
+            _fields_ = [('cfFormat', ctypes.c_ushort), ('ptd', LPVOID),
+                        ('dwAspect', DWORD), ('lindex', ctypes.c_long), ('tymed', DWORD)]
+        class STGMEDIUM(ctypes.Structure):
+            _fields_ = [('tymed', DWORD), ('hGlobal', LPVOID), ('pUnkForRelease', LPVOID)]
+        QI = CALLBACK(HRESULT, LPVOID, LPVOID, ctypes.POINTER(LPVOID))
+        REF = CALLBACK(ULONG, LPVOID)
+        ENTER = CALLBACK(HRESULT, LPVOID, LPVOID, DWORD, POINTL, ctypes.POINTER(DWORD))
+        OVER = CALLBACK(HRESULT, LPVOID, DWORD, POINTL, ctypes.POINTER(DWORD))
+        LEAVE = CALLBACK(HRESULT, LPVOID)
+        DROP = CALLBACK(HRESULT, LPVOID, LPVOID, DWORD, POINTL, ctypes.POINTER(DWORD))
+        class VTBL(ctypes.Structure):
+            _fields_ = [('QueryInterface', QI), ('AddRef', REF), ('Release', REF),
+                        ('DragEnter', ENTER), ('DragOver', OVER),
+                        ('DragLeave', LEAVE), ('Drop', DROP)]
+        class OBJECT(ctypes.Structure):
+            _fields_ = [('lpVtbl', ctypes.POINTER(VTBL))]
+        self.FORMATETC = FORMATETC
+        self.STGMEDIUM = STGMEDIUM
+        self._accepted = False
+        self._iid_unknown = uuid.UUID('00000000-0000-0000-C000-000000000046').bytes_le
+        self._iid_drop_target = uuid.UUID('00000122-0000-0000-C000-000000000046').bytes_le
+
+        def query_interface(this, riid, result):
+            if not result:
+                return -2147467261  # E_POINTER
+            result[0] = None
+            if riid and ctypes.string_at(riid, 16) in (self._iid_unknown, self._iid_drop_target):
+                result[0] = ctypes.cast(ctypes.pointer(self.object), LPVOID).value
+                self._refcount += 1
+                return 0
+            return -2147467262  # E_NOINTERFACE
+
+        def add_ref(this):
+            self._refcount += 1
+            return self._refcount
+
+        def release(this):
+            self._refcount = max(1, self._refcount - 1)
+            return self._refcount
+
+        def query_file_format(data_object):
+            if not data_object:
+                return False
+            fmt = FORMATETC(15, None, 1, -1, 1)  # CF_HDROP, DVASPECT_CONTENT, TYMED_HGLOBAL
+            table = ctypes.cast(data_object, ctypes.POINTER(ctypes.POINTER(LPVOID))).contents
+            fn = CALLBACK(HRESULT, LPVOID, ctypes.POINTER(FORMATETC))(table[5])
+            return fn(data_object, ctypes.byref(fmt)) == 0
+
+        def drag_enter(this, data_object, keys, point, effect):
+            try:
+                self._accepted = query_file_format(data_object)
+                effect[0] = 1 if self._accepted else 0  # DROPEFFECT_COPY / NONE
+            except Exception:
+                self._accepted = False
+                effect[0] = 0
+            return 0
+
+        def drag_over(this, keys, point, effect):
+            effect[0] = 1 if self._accepted else 0
+            return 0
+
+        def drag_leave(this):
+            self._accepted = False
+            return 0
+
+        def extract_paths(data_object):
+            fmt = FORMATETC(15, None, 1, -1, 1)
+            medium = STGMEDIUM()
+            table = ctypes.cast(data_object, ctypes.POINTER(ctypes.POINTER(LPVOID))).contents
+            get_data = CALLBACK(HRESULT, LPVOID, ctypes.POINTER(FORMATETC),
+                                ctypes.POINTER(STGMEDIUM))(table[3])
+            if get_data(data_object, ctypes.byref(fmt), ctypes.byref(medium)) != 0:
+                return []
+            try:
+                if medium.tymed != 1 or not medium.hGlobal:
+                    return []
+                shell32 = ctypes.WinDLL('shell32')
+                shell32.DragQueryFileW.argtypes = [LPVOID, DWORD, ctypes.c_wchar_p, DWORD]
+                shell32.DragQueryFileW.restype = DWORD
+                count = shell32.DragQueryFileW(medium.hGlobal, 0xffffffff, None, 0)
+                if count != 1:
+                    return [] if count == 0 else [f'<{count} files>']
+                size = shell32.DragQueryFileW(medium.hGlobal, 0, None, 0)
+                if size > 32767:
+                    return []
+                buff = ctypes.create_unicode_buffer(size + 1)
+                shell32.DragQueryFileW(medium.hGlobal, 0, buff, size + 1)
+                return [buff.value]
+            finally:
+                release_medium = ctypes.WinDLL('ole32').ReleaseStgMedium
+                release_medium.argtypes = [ctypes.POINTER(STGMEDIUM)]
+                release_medium.restype = None
+                release_medium(ctypes.byref(medium))
+
+        def drop(this, data_object, keys, point, effect):
+            effect[0] = 0
+            try:
+                if self._accepted and data_object:
+                    paths = extract_paths(data_object)
+                    if paths:
+                        # Defer queue mutation and dialogs until Windows exits
+                        # its OLE drop callback and returns control to Tk.
+                        self.app.root.after_idle(lambda items=tuple(paths):
+                                                 self.app.handle_explorer_macro_drop(items))
+                        effect[0] = 1
+            except Exception as exc:
+                print(f'[Sequent] Explorer drop error: {exc}')
+            finally:
+                self._accepted = False
+            return 0
+
+        # Hold Python callback objects, VTBL, and COM object for the entire
+        # lifetime of registration. RevokeDragDrop before Tk destroys its HWND.
+        self.callbacks = (QI(query_interface), REF(add_ref), REF(release),
+                          ENTER(drag_enter), OVER(drag_over), LEAVE(drag_leave), DROP(drop))
+        self.vtable = VTBL(*self.callbacks)
+        self.object = OBJECT(ctypes.pointer(self.vtable))
+
+    def close(self):
+        for hwnd in self.hwnds:
+            self.ole32.RevokeDragDrop(ctypes.c_void_p(hwnd))
+        self.hwnds.clear()
+        if self.com_initialized:
+            self.ole32.OleUninitialize()
+            self.com_initialized = False
+
+
 class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
@@ -9656,6 +9870,10 @@ class BuiltInMacroApp:
         self._schedule_system_theme_poll()
         self.root.after(1200, self._watch_dynamic_trigger)
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self._explorer_drop_target = None
+        if os.name == 'nt':
+            # COM drop registration must happen on the Tk/STA UI thread.
+            self.root.after_idle(self._install_explorer_drop_target)
         self._autosave_job = self.root.after(600, self._autosave_tick)
 
     
@@ -13509,6 +13727,59 @@ try {{
         self.save_current_preset()
         return 'break'
 
+    def _install_explorer_drop_target(self):
+        if self._explorer_drop_target is not None:
+            return
+        try:
+            self.root.update_idletasks()
+            self._explorer_drop_target = SequentExplorerDropTarget(self)
+        except Exception as exc:
+            # A failed optional OLE registration must not prevent Sequent opening.
+            print(f'[Sequent] Explorer drag/drop unavailable: {exc}')
+            self.update_status('Explorer drag/drop unavailable; use Import Macro', TEXT_MUTED)
+
+    def handle_explorer_macro_drop(self, paths):
+        """Accept ONE Sequent macro. Never execute on drop or discard edits."""
+        if len(paths) != 1 or paths[0].startswith('<') and paths[0].endswith(' files>'):
+            messagebox.showwarning('One macro at a time',
+                'Drop one Sequent macro .json file at a time.', parent=self.root)
+            self.update_status('Drop one macro file at a time', COLOR_DANGER)
+            return False
+        path = os.path.abspath(os.fspath(paths[0]))
+        if self.recording or self.playing or self.chain_running:
+            messagebox.showwarning('Sequent is busy',
+                'Stop recording, playback or the macro chain before importing.',
+                parent=self.root)
+            return False
+        try:
+            actions = read_sequent_dropped_macro(path)
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            self.update_status('Unrecognized Sequent macro', COLOR_DANGER)
+            messagebox.showwarning('Unrecognized Sequent Macro',
+                f'{os.path.basename(path)} cannot be loaded as a Sequent macro.\n\n{exc}',
+                parent=self.root)
+            return False
+        # A macro already saved in our presets folder uses the regular loader:
+        # that retains its autosave identity and existing safeguards.
+        if os.path.normcase(os.path.dirname(path)) == os.path.normcase(self.presets_dir):
+            loaded = self.on_preset_file_selected(Path(path).stem, path)
+            if loaded:
+                self.show_tab('playback')
+            return bool(loaded)
+        if not self._safe_to_replace_queue():
+            return False
+        self._clear_queue_undo()
+        self.recorded_actions = copy.deepcopy(actions)
+        self.current_action_idx = 0
+        self.breakpoints.clear()
+        self.preset_var.set('-- Select Preset --')
+        self.current_source_label = f'File: {os.path.basename(path)}'
+        self._unbind_preset_autosave()  # External import is not a named preset.
+        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+        self.show_tab('playback')
+        self.update_status(f'Imported {os.path.basename(path)} (not executed)', COLOR_SUCCESS)
+        return True
+
     def request_close(self):
         """Use the same unsaved-change guard for X, Alt+F4 and the custom X."""
         if self.recording or self.playing or getattr(self, 'chain_running', False):
@@ -13521,6 +13792,12 @@ try {{
                 self.root.after_cancel(self._autosave_job)
             except tk.TclError:
                 pass
+        if self._explorer_drop_target is not None:
+            try:
+                self._explorer_drop_target.close()
+            except OSError as exc:
+                print(f'[Sequent] Explorer drop cleanup: {exc}')
+            self._explorer_drop_target = None
         self.root.destroy()
         return True
 
