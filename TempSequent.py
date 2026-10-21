@@ -7,9 +7,10 @@ import re
 import struct
 import base64
 import tempfile
+import hashlib
 import subprocess
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from threading import Thread, RLock
 from queue import Queue, Empty
 import math
@@ -4673,6 +4674,9 @@ class VSCodeQueueViewer(tk.Frame):
             return 'break'
         if ctrl and event.keysym.lower() == 'y':
             self.app.redo_deleted_actions()
+            return 'break'
+        if ctrl and event.keysym.lower() == 's':
+            self.app.save_current_preset()
             return 'break'
         if ctrl and event.keysym.lower() == 'c':
             self.app.copy_queue_actions()
@@ -9447,6 +9451,16 @@ class BuiltInMacroApp:
         self.is_binding = False
         self.active_hotkey_field = None
         self.recorded_actions = []
+        # Autosave is bound to the actual loaded preset path, never to the
+        # dropdown's display text (which may be changed by menu refreshes).
+        self.autosave_presets = True
+        self._active_preset_path = None
+        self._active_preset_disk_hash = None
+        self._active_saved_snapshot = None
+        self._unbound_saved_snapshot = "[]"
+        self._autosave_observed_snapshot = None
+        self._autosave_deadline = None
+        self._autosave_job = None
         # Queue deletions and pastes are journaled; typing in editors uses native
         # Tk undo and is deliberately not captured by queue Ctrl+Z.
         self._queue_undo_history = []
@@ -9555,6 +9569,8 @@ class BuiltInMacroApp:
         Thread(target=self.global_hotkey_listener, daemon=True).start()
         self._schedule_system_theme_poll()
         self.root.after(1200, self._watch_dynamic_trigger)
+        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self._autosave_job = self.root.after(600, self._autosave_tick)
 
     
     def set_app_window(self):
@@ -9854,6 +9870,8 @@ class BuiltInMacroApp:
         self.root.bind('<Control-Z>', self._on_queue_undo_shortcut, add='+')
         self.root.bind('<Control-y>', self._on_queue_redo_shortcut, add='+')
         self.root.bind('<Control-Y>', self._on_queue_redo_shortcut, add='+')
+        self.root.bind('<Control-s>', self._on_save_preset_shortcut, add='+')
+        self.root.bind('<Control-S>', self._on_save_preset_shortcut, add='+')
         # Only the queue itself handles Ctrl+C/V; normal Entry/Text widgets
         # (and other applications) retain their regular Windows clipboard.
         for seq, dx, dy in [
@@ -9901,7 +9919,7 @@ class BuiltInMacroApp:
         btn_close = SequentIcon(win_controls, 'close', bg=BG_HEADER,
                                 color=TEXT_MUTED, size=19)
         btn_close.pack(side=tk.RIGHT, padx=15, pady=15)
-        btn_close.bind("<Button-1>", lambda e: self.root.destroy())
+        btn_close.bind("<Button-1>", lambda e: self.request_close())
         btn_close.bind("<Enter>", lambda e: btn_close.paint(bg=COLOR_DANGER, color="#fff"))
         btn_close.bind("<Leave>", lambda e: btn_close.paint(bg=BG_HEADER, color=TEXT_MUTED))
         btn_min = SequentIcon(win_controls, 'minimize', bg=BG_HEADER,
@@ -10536,6 +10554,9 @@ class BuiltInMacroApp:
         self.import_macro_button = sequent_toolbar_button(filebar, "Import", self.load_macro_from_file)
         self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
         sequent_toolbar_button(filebar, "Export", self.save_macro_to_file).pack(side=tk.LEFT)
+        save_now = sequent_toolbar_button(filebar, "Save", self.save_current_preset)
+        save_now.pack(side=tk.LEFT, padx=(5, 0))
+        ModernTooltip(save_now, "Save the loaded preset now, or name a new preset", "Ctrl+S")
         self.queue_undo_btn = sequent_toolbar_button(
             filebar, "Undo", self.undo_deleted_actions, icon='undo')
         self.queue_undo_btn.pack(side=tk.LEFT, padx=(5, 0))
@@ -12509,7 +12530,9 @@ try {{
             self.finish_macro("failed", "Macro file not found")
             return
 
-        self.on_preset_file_selected(preset_name, preset_file)
+        if not self.on_preset_file_selected(preset_name, preset_file):
+            self.finish_macro('cancelled')
+            return
         self.update_status(f"Switching to '{preset_name}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
@@ -12521,7 +12544,9 @@ try {{
             return
 
         stem = os.path.splitext(os.path.basename(file_path))[0]
-        self.on_preset_file_selected(stem, file_path)
+        if not self.on_preset_file_selected(stem, file_path):
+            self.finish_macro('cancelled')
+            return
         self.update_status(f"Switching to '{stem}'...", COLOR_ACCENT)
         self.root.after(150, self.start_macro)
 
@@ -12555,6 +12580,7 @@ try {{
                 self.clicks_and_keys_only = config.get("clicks_and_keys_only", False)
                 self.window_relative = config.get("window_relative", False)
                 self.audio_cues = config.get("audio_cues", True)
+                self.autosave_presets = bool(config.get("autosave_presets", True))
                 self.delay_jitter = config.get("delay_jitter", False)
                 self.natural_timing = config.get("natural_timing", False)
                 ACTIVE_SOUND_THEME = config.get("sound_theme", "Classic")
@@ -12580,6 +12606,7 @@ try {{
             "clicks_and_keys_only": self.clicks_and_keys_only,
             "window_relative": self.window_relative,
             "audio_cues": self.audio_cues,
+            "autosave_presets": self.autosave_presets,
             "delay_jitter": self.delay_jitter,
             "natural_timing": self.natural_timing,
             "sound_theme": ACTIVE_SOUND_THEME,
@@ -12639,6 +12666,13 @@ try {{
 
         self.build_appearance_settings(f_app)
         self.build_entertain_me_toggle(f_app)
+        self.autosave_toggle = add_setting_toggle(
+            f_app, "Autosave loaded presets", self.autosave_presets,
+            self.set_autosave_presets)
+        tk.Label(f_app, text="Automatically saves edited presets after 1–2 seconds idle. "
+                 "New recordings require a filename.", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 8), wraplength=500, justify=tk.LEFT).pack(
+                     anchor="w", pady=(0, 5))
 
         # Guided help can be restarted without reopening Sequent.
         tk.Label(scroll_container, text="HELP & ONBOARDING", font=("Segoe UI", 8, "bold"),
@@ -13233,6 +13267,172 @@ try {{
         hk_field = SequentHotkeyField(row, action_key, self.hotkeys[action_key]["name"], self)
         hk_field.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+    # --- Reliable, identity-bound preset autosave ---
+    def set_autosave_presets(self, enabled):
+        self.autosave_presets = bool(enabled)
+        if self.autosave_presets:
+            self._autosave_observed_snapshot = None
+        self.update_status('Preset autosave enabled' if enabled else 'Preset autosave disabled',
+                           COLOR_SUCCESS if enabled else TEXT_MUTED)
+
+    def _queue_content_snapshot(self):
+        """Content-only fingerprint: debugger navigation doesn't dirty a preset."""
+        return json.dumps(self.recorded_actions, ensure_ascii=True,
+                          separators=(',', ':'), sort_keys=True)
+
+    def _bind_preset_autosave(self, path):
+        """Only an explicitly loaded/saved preset is eligible for autosave."""
+        path = os.path.abspath(path)
+        with open(path, 'rb') as source:
+            disk_hash = hashlib.sha256(source.read()).hexdigest()
+        self._active_preset_path = path
+        self._active_preset_disk_hash = disk_hash
+        self._active_saved_snapshot = self._queue_content_snapshot()
+        self._autosave_observed_snapshot = self._active_saved_snapshot
+        self._autosave_deadline = None
+
+    def _unbind_preset_autosave(self):
+        """Never autosave a fresh recording/import into a previously selected preset."""
+        self._active_preset_path = None
+        self._active_preset_disk_hash = None
+        self._active_saved_snapshot = None
+        self._unbound_saved_snapshot = self._queue_content_snapshot()
+        self._autosave_observed_snapshot = None
+        self._autosave_deadline = None
+
+    def _write_json_atomically(self, path, actions):
+        """Replace a complete, fsynced UTF-8 JSON file without partial writes."""
+        path = os.path.abspath(path)
+        folder = os.path.dirname(path)
+        os.makedirs(folder, exist_ok=True)
+        data = (json.dumps(actions, ensure_ascii=True, indent=2) + '\n').encode('utf-8')
+        fd, temporary = tempfile.mkstemp(prefix='.sequent-save-', suffix='.tmp', dir=folder)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return hashlib.sha256(data).hexdigest()
+
+    def _save_bound_preset(self):
+        """Save the current queue only to its actual loaded preset.
+
+        Detect external edits instead of silently clobbering them. Empty queues
+        are valid saved presets too, e.g. after deleting every queue action.
+        """
+        path = self._active_preset_path
+        if not path:
+            return False
+        current = self._queue_content_snapshot()
+        if current == self._active_saved_snapshot:
+            self._autosave_deadline = None
+            return True
+        try:
+            with open(path, 'rb') as stream:
+                actual_hash = hashlib.sha256(stream.read()).hexdigest()
+            if actual_hash != self._active_preset_disk_hash:
+                raise OSError('preset changed outside Sequent; export or reload it to avoid overwriting newer data')
+            # Validate serializability BEFORE touching the on-disk preset.
+            new_hash = self._write_json_atomically(path, self.recorded_actions)
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
+            self.update_status(f'Autosave failed: {exc}', COLOR_DANGER)
+            return False
+        self._active_saved_snapshot = current
+        self._active_preset_disk_hash = new_hash
+        self._autosave_observed_snapshot = current
+        self._autosave_deadline = None
+        self.update_status(f'Saved {os.path.basename(path)}', COLOR_SUCCESS)
+        return True
+
+    def _autosave_tick(self):
+        """Poll content on Tk's main thread, debounce disk writes until idle."""
+        self._autosave_job = None
+        try:
+            if (self.autosave_presets and self._active_preset_path and
+                    not self.recording and not self.playing and
+                    not getattr(self, 'chain_running', False)):
+                current = self._queue_content_snapshot()
+                if current == self._active_saved_snapshot:
+                    self._autosave_deadline = None
+                    self._autosave_observed_snapshot = current
+                elif current != self._autosave_observed_snapshot:
+                    self._autosave_observed_snapshot = current
+                    self._autosave_deadline = time.monotonic() + 1.2
+                elif (self._autosave_deadline is not None and
+                      time.monotonic() >= self._autosave_deadline):
+                    # On an I/O error, wait for another edit or manual retry;
+                    # avoid spamming the status bar with repeated failed writes.
+                    self._autosave_deadline = None
+                    self._save_bound_preset()
+        except (TypeError, ValueError) as exc:
+            self.update_status(f'Autosave validation failed: {exc}', COLOR_DANGER)
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self._autosave_job = self.root.after(600, self._autosave_tick)
+            except tk.TclError:
+                pass
+
+    def _safe_to_replace_queue(self):
+        """Save or ask before replacing the queue, including new recordings."""
+        if self._active_preset_path:
+            if self._queue_content_snapshot() == self._active_saved_snapshot:
+                return True
+            if self.autosave_presets:
+                return self._save_bound_preset()
+            answer = messagebox.askyesnocancel(
+                'Unsaved preset', 'Save changes to the current preset before switching?',
+                parent=self.root)
+            if answer is None:
+                return False
+            return self._save_bound_preset() if answer else True
+        if self._queue_content_snapshot() == self._unbound_saved_snapshot:
+            return True
+        answer = messagebox.askyesnocancel(
+            'Unsaved actions',
+            'This queue is not associated with a saved preset. Save it before replacing it?',
+            parent=self.root)
+        if answer is None:
+            return False
+        return self.save_macro_to_file() if answer else True
+
+    def save_current_preset(self):
+        """Save now: save in place if bound, otherwise open Save As."""
+        if self.recording or self.playing or getattr(self, 'chain_running', False):
+            self.update_status('Stop recording or playback before saving', COLOR_DANGER)
+            return False
+        if self._active_preset_path:
+            if self._queue_content_snapshot() == self._active_saved_snapshot:
+                self.update_status('Preset already saved', TEXT_MUTED)
+                return True
+            return self._save_bound_preset()
+        return self.save_macro_to_file()
+
+    def _on_save_preset_shortcut(self, event):
+        if not self._queue_shortcut_allowed(event):
+            return None
+        self.save_current_preset()
+        return 'break'
+
+    def request_close(self):
+        """Use the same unsaved-change guard for X, Alt+F4 and the custom X."""
+        if self.recording or self.playing or getattr(self, 'chain_running', False):
+            self.update_status('Stop recording or playback before closing', COLOR_DANGER)
+            return False
+        if not self._safe_to_replace_queue():
+            return False
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+        self.root.destroy()
+        return True
+
     def refresh_preset_menu(self, selected=None):
         menu = self.preset_menu["menu"]
         menu.delete(0, "end")
@@ -13251,19 +13451,27 @@ try {{
             self.preset_var.set("-- No Presets Found --")
             return
 
-        menu.add_command(label="-- Select Preset --", command=lambda: self.preset_var.set("-- Select Preset --"))
+        menu.add_command(label="-- Select Preset --", command=lambda: self.preset_var.set(
+            os.path.splitext(os.path.basename(self._active_preset_path))[0]
+            if self._active_preset_path else "-- Select Preset --"))
         for fname in json_files:
             stem = os.path.splitext(fname)[0]
             full_path = os.path.join(self.presets_dir, fname)
             menu.add_command(label=stem, command=lambda s=stem, p=full_path: self.on_preset_file_selected(s, p))
 
+        active_name = (os.path.splitext(os.path.basename(self._active_preset_path))[0]
+                       if self._active_preset_path else None)
+        selected = selected or active_name
         if selected and any(os.path.splitext(f)[0] == selected for f in json_files):
             self.preset_var.set(selected)
         else:
             self.preset_var.set("-- Select Preset --")
 
     def on_preset_file_selected(self, stem, file_path):
-        if self.recording or self.playing: return
+        if self.recording or self.playing: return False
+        file_path = os.path.abspath(file_path)
+        if self._active_preset_path and os.path.normcase(file_path) == os.path.normcase(self._active_preset_path):
+            return True  # Do not reload this preset over its in-memory edits.
         try:
             with open(file_path, "r", encoding="utf-8") as f: loaded_data = json.load(f)
             if isinstance(loaded_data, list):
@@ -13291,22 +13499,27 @@ try {{
                             cleaned_act["match_any"] = bool(act["match_any"])
                         validated_actions.append(cleaned_act)
 
-                if validated_actions:
-                    self._clear_queue_undo()  # New macro replaces the editable queue.
-                    self.recorded_actions = validated_actions
-                    self.current_action_idx = 0
-                    self.preset_var.set(stem)
-                    self.current_source_label = f"Preset: {stem}"
-                    self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                    self.update_status(f"Loaded '{stem}'", COLOR_SUCCESS)
-                else: self.update_status("Empty Preset File", COLOR_DANGER)
-            else: self.update_status("Invalid Format", COLOR_DANGER)
-        except Exception: self.update_status("Preset Load Error", COLOR_DANGER)
+                if not self._safe_to_replace_queue():
+                    return False
+                self._clear_queue_undo()  # New macro replaces the editable queue.
+                self.recorded_actions = validated_actions
+                self.current_action_idx = 0
+                self.breakpoints.clear()
+                self.preset_var.set(stem)
+                self.current_source_label = f"Preset: {stem}"
+                self._bind_preset_autosave(file_path)
+                self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+                self.update_status(f"Loaded '{stem}'", COLOR_SUCCESS)
+                return True
+            self.update_status("Invalid Format", COLOR_DANGER)
+        except Exception as exc:
+            self.update_status(f"Preset Load Error: {exc}", COLOR_DANGER)
+        return False
   
     def save_macro_to_file(self):
         if not self.recorded_actions:
             self.update_status("Queue Empty", COLOR_DANGER)
-            return
+            return False
 
         self.root.attributes('-topmost', False)
         try:
@@ -13317,14 +13530,26 @@ try {{
         finally:
             self.root.attributes('-topmost', False)
 
-        if file_path:
-            try:
-                with open(file_path, "w", encoding="utf-8") as f: json.dump(self.recorded_actions, f, indent=2)
-                self.update_status("Exported File", COLOR_SUCCESS)
-                if os.path.dirname(os.path.abspath(file_path)) == self.presets_dir:
-                    stem = os.path.splitext(os.path.basename(file_path))[0]
-                    self.refresh_preset_menu(selected=stem)
-            except Exception: self.update_status("Export Error", COLOR_DANGER)
+        if not file_path:
+            return False
+        try:
+            full = os.path.abspath(file_path)
+            if os.path.normcase(full) == os.path.normcase(os.path.join(self.presets_dir, 'globals.json')):
+                raise ValueError('globals.json stores Global variables and cannot be used as a macro preset')
+            self._write_json_atomically(full, self.recorded_actions)
+            if os.path.normcase(os.path.dirname(full)) == os.path.normcase(os.path.abspath(self.presets_dir)):
+                # An explicit Export into presets becomes the current saved preset.
+                stem = os.path.splitext(os.path.basename(full))[0]
+                self.current_source_label = f"Preset: {stem}"
+                self._bind_preset_autosave(full)
+                self.refresh_preset_menu(selected=stem)
+            elif self._active_preset_path is None:
+                self._unbound_saved_snapshot = self._queue_content_snapshot()
+            self.update_status("Exported File", COLOR_SUCCESS)
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            self.update_status(f"Export Error: {exc}", COLOR_DANGER)
+            return False
 
     def load_macro_from_file(self):
         if self.recording or self.playing: return
@@ -13366,17 +13591,19 @@ try {{
                                 cleaned_act["match_any"] = bool(act["match_any"])
                             validated_actions.append(cleaned_act)
 
-                    if validated_actions:
-                        self._clear_queue_undo()  # New macro replaces the editable queue.
-                        self.recorded_actions = validated_actions
-                        self.current_action_idx = 0
-                        self.preset_var.set("-- Select Preset --")
-                        file_name = file_path.replace("\\", "/").split("/")[-1]
-                        self.current_source_label = f"File: {file_name}"
-                        self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
-                        self.update_status("Loaded File", COLOR_SUCCESS)
-                    else: 
-                        self.update_status("Empty/Invalid File", COLOR_DANGER)
+                    if not self._safe_to_replace_queue():
+                        return False
+                    self._clear_queue_undo()  # New macro replaces the editable queue.
+                    self.recorded_actions = validated_actions
+                    self.current_action_idx = 0
+                    self.breakpoints.clear()
+                    self.preset_var.set("-- Select Preset --")
+                    file_name = os.path.basename(file_path)
+                    self.current_source_label = f"File: {file_name}"
+                    self._unbind_preset_autosave()
+                    self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
+                    self.update_status("Loaded File", COLOR_SUCCESS)
+                    return True
                 else: 
                     self.update_status("Invalid File", COLOR_DANGER)
             except Exception: 
@@ -14128,6 +14355,9 @@ try {{
         else: self.stop_macro()
 
     def start_recording(self):
+        if not self._safe_to_replace_queue():
+            return
+        self._unbind_preset_autosave()
         self.recording = True
         self.recording_paused = False
         self.last_event_time = time.perf_counter()
