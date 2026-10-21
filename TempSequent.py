@@ -4334,6 +4334,9 @@ class SequentDynamicEngine:
 
 # --- VS Code-Style Playback Queue Viewer ---
 class VSCodeQueueViewer(tk.Frame):
+    # The Action Queue never reorders on an ordinary click or a quick mouse drag.
+    QUEUE_DRAG_HOLD_MS = 2000
+    QUEUE_DRAG_SLOP_PX = 5
     # Categorized action catalog. Existing action type names are unchanged,
     # so recorded macros and all existing action editors remain compatible.
     ACTION_PICKER_GROUPS = (
@@ -4396,6 +4399,16 @@ class VSCodeQueueViewer(tk.Frame):
         self.hovered_line = None
         self.interactive_enabled = True
         self.sub_menu = None
+        # A queue drag requires an uninterrupted two-second stationary hold.
+        # These flags belong to this viewer, not the OS mouse/keyboard recorder.
+        self._dnd_hold_job = None
+        self._dnd_pressed = False
+        self._dnd_ready = False
+        self._dnd_active = False
+        self._dnd_start_idx = None
+        self._dnd_hover_idx = None
+        self._dnd_press_screen_xy = None
+        self._dnd_action_identity = None
 
         self._sub_drag_start_x = 0
         self._sub_drag_start_y = 0
@@ -4606,6 +4619,10 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def clear(self):
+        self._cancel_queue_drag_hold()
+        self._dnd_active = False
+        self._dnd_start_idx = None
+        self._dnd_hover_idx = None
         self.close_sub_menu()
         self.plus_btn.place_forget()
         self.code_text.tag_remove("sel", "1.0", "end")  # Forcibly clear selections
@@ -4660,6 +4677,11 @@ class VSCodeQueueViewer(tk.Frame):
     def set_interactive(self, enabled):
         self.interactive_enabled = enabled
         if not enabled:
+            self._cancel_queue_drag_hold()
+            self._dnd_active = False
+            self._dnd_start_idx = None
+            self._dnd_hover_idx = None
+            self.code_text.tag_remove("dnd_target", "1.0", "end")
             self.plus_btn.place_forget()
             self.close_sub_menu()
 
@@ -4813,7 +4835,7 @@ class VSCodeQueueViewer(tk.Frame):
         menu = tk.Menu(self, tearoff=0, bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, activeforeground=TEXT_PRIMARY, bd=1, relief="flat", font=("Segoe UI", 9))
 
         if self.app._queue_undo_history:
-            menu.add_command(label="Undo Delete (Ctrl+Z)", command=self.app.undo_deleted_actions)
+            menu.add_command(label="Undo Last Queue Edit (Ctrl+Z)", command=self.app.undo_deleted_actions)
             menu.add_separator()
         if line_num >= 2 and (line_num - 2) < len(self.app.recorded_actions):
             act_idx = line_num - 2
@@ -4927,100 +4949,164 @@ class VSCodeQueueViewer(tk.Frame):
                 self.open_action_submenu(line_num, event)
         except Exception: pass
 
+    def _cancel_queue_drag_hold(self):
+        """Cancel the pending drag without affecting normal text selection."""
+        job = self._dnd_hold_job
+        self._dnd_hold_job = None
+        if job is not None:
+            try:
+                self.code_text.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._dnd_pressed = False
+        self._dnd_ready = False
+        self._dnd_press_screen_xy = None
+        self._dnd_action_identity = None
+        try:
+            self.code_text.config(cursor="xterm")
+        except tk.TclError:
+            pass
+
+    def _queue_drag_button_down(self):
+        """Make sure a missed mouse-up event cannot arm drag on Windows."""
+        if os.name != "nt":
+            return True  # On other platforms Tk ButtonRelease handles the state.
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        except (AttributeError, OSError):
+            return False  # Fail closed if the button state cannot be verified.
+
+    def _arm_queue_drag(self):
+        """Allow dragging only after a full, stationary two-second press."""
+        self._dnd_hold_job = None
+        start = self._dnd_start_idx
+        if (not self._dnd_pressed or start is None or
+                not self.interactive_enabled or
+                self.app.recording or self.app.playing or self.app.chain_running or
+                not 0 <= start < len(self.app.recorded_actions) or
+                self.app.recorded_actions[start] is not self._dnd_action_identity or
+                not self._queue_drag_button_down()):
+            self._cancel_queue_drag_hold()
+            return
+        try:
+            px, py = self.code_text.winfo_pointerxy()
+            sx, sy = self._dnd_press_screen_xy
+            if (abs(px - sx) > self.QUEUE_DRAG_SLOP_PX or
+                    abs(py - sy) > self.QUEUE_DRAG_SLOP_PX):
+                self._cancel_queue_drag_hold()
+                return
+            self._dnd_ready = True
+            self.code_text.config(cursor="fleur")  # Visual confirmation; no queue changes.
+        except (tk.TclError, TypeError):
+            self._cancel_queue_drag_hold()
+
     def _on_code_click(self, event):
         if self.sub_menu and self.sub_menu.winfo_exists():
             self.close_sub_menu()
 
+        self._cancel_queue_drag_hold()
         self._dnd_start_idx = None
+        self._dnd_hover_idx = None
         self._dnd_active = False
 
-        # Shift-click is for range selection, not dragging a queue action.
-        if event.state & 0x0001:
+        # Shift-click keeps ordinary range selection; no queue drag is armed.
+        if not self.interactive_enabled or event.state & 0x0001:
             return
 
-        # Synchronize playhead & reticle to the clicked queue line
         try:
             clicked_pos = self.code_text.index(f"@{event.x},{event.y}")
             line_num = int(clicked_pos.split(".")[0])
-            if line_num >= 2:
-                act_idx = line_num - 2
-                if 0 <= act_idx < len(self.app.recorded_actions):
-                    self.app.set_active_action_index(act_idx)
-                    # Prime the drag-and-drop state
-                    self._dnd_start_idx = act_idx
-                    self._dnd_start_y = event.y
-        except Exception:
-            pass
+            act_idx = line_num - 2
+            if not 0 <= act_idx < len(self.app.recorded_actions):
+                return
+            # Selecting or editing remains immediate; only *reordering* is held.
+            self.app.set_active_action_index(act_idx)
+            if self.app.recording or self.app.playing or self.app.chain_running:
+                return
+            self._dnd_start_idx = act_idx
+            self._dnd_start_y = event.y
+            self._dnd_press_screen_xy = (event.x_root, event.y_root)
+            self._dnd_action_identity = self.app.recorded_actions[act_idx]
+            self._dnd_pressed = True
+            self._dnd_hold_job = self.code_text.after(
+                self.QUEUE_DRAG_HOLD_MS, self._arm_queue_drag)
+        except (tk.TclError, ValueError, IndexError):
+            self._cancel_queue_drag_hold()
 
     def _on_dnd_motion(self, event):
         if not self.interactive_enabled or not self.app.recorded_actions:
             return
-        start_idx = getattr(self, "_dnd_start_idx", None)
-        if start_idx is None:
+        start_idx = self._dnd_start_idx
+        if start_idx is None or not self._dnd_pressed:
             return
-        
-        # Only activate drag mode if the mouse moves vertically by a few pixels
-        if not getattr(self, "_dnd_active", False):
-            if abs(event.y - getattr(self, "_dnd_start_y", event.y)) > 5:
-                self._dnd_active = True
-                self.code_text.tag_remove("sel", "1.0", "end") # Clear text selection
-            else:
-                return
+
+        if not self._dnd_ready:
+            # Moving early means ordinary Text selection, never an action reorder.
+            sx, sy = self._dnd_press_screen_xy
+            if (abs(event.x_root - sx) > self.QUEUE_DRAG_SLOP_PX or
+                    abs(event.y_root - sy) > self.QUEUE_DRAG_SLOP_PX):
+                self._cancel_queue_drag_hold()
+                self._dnd_start_idx = None
+            return
+
+        if not self._dnd_active:
+            if abs(event.y_root - self._dnd_press_screen_xy[1]) <= self.QUEUE_DRAG_SLOP_PX:
+                return "break"
+            self._dnd_active = True
+            self.code_text.tag_remove("sel", "1.0", "end")
 
         try:
             hover_pos = self.code_text.index(f"@{event.x},{event.y}")
             line_num = int(hover_pos.split(".")[0])
-            hover_idx = line_num - 2
-            
-            # Cap the index to valid bounds so it can be dragged to the very bottom
-            max_idx = len(self.app.recorded_actions)
-            hover_idx = max(0, min(hover_idx, max_idx))
-            
+            hover_idx = max(0, min(line_num - 2, len(self.app.recorded_actions)))
             self._dnd_hover_idx = hover_idx
             self.code_text.tag_remove("dnd_target", "1.0", "end")
-            
             target_line = hover_idx + 2
             if target_line <= self.line_count + 1:
-                # Add a visual underline to the slot it will drop into
-                self.code_text.tag_add("dnd_target", f"{target_line}.0", f"{target_line}.end+1c")
-        except Exception:
+                self.code_text.tag_add(
+                    "dnd_target", f"{target_line}.0", f"{target_line}.end+1c")
+        except tk.TclError:
             pass
-
-        return "break" # Overrides standard text highlighting while dragging
+        return "break"
 
     def _on_code_release(self, event):
         self.code_text.tag_remove("dnd_target", "1.0", "end")
-        
-        if getattr(self, "_dnd_active", False):
-            start = getattr(self, "_dnd_start_idx", None)
-            end = getattr(self, "_dnd_hover_idx", None)
-            
-            if start is not None and end is not None and start != end:
-                # Perform the list reorder
-                act = self.app.recorded_actions.pop(start)
-                self.app.recorded_actions.insert(end, act)
-                
-                # Update the playhead index if it was affected by the shift
-                if self.app.current_action_idx == start:
-                    self.app.current_action_idx = end
-                elif start < self.app.current_action_idx <= end:
-                    self.app.current_action_idx -= 1
-                elif end <= self.app.current_action_idx < start:
-                    self.app.current_action_idx += 1
-                    
-                # Redraw the queue and re-sync the playhead
-                self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.set_active_action_index(self.app.current_action_idx)
-        
-        # Reset drag state
+        was_dragging = self._dnd_active and self._dnd_ready
+        start = self._dnd_start_idx
+        end = self._dnd_hover_idx
+        self._cancel_queue_drag_hold()
         self._dnd_active = False
         self._dnd_start_idx = None
         self._dnd_hover_idx = None
-        
-        # Call the selection handler to resume ghost-reticle multi-select trails
+
+        if (was_dragging and start is not None and end is not None and
+                start != end and not (self.app.playing or self.app.recording or
+                                      self.app.chain_running) and
+                0 <= start < len(self.app.recorded_actions) and
+                0 <= end <= len(self.app.recorded_actions)):
+            before = self.app._begin_queue_deletion()  # Reorders are undoable too.
+            action = self.app.recorded_actions.pop(start)
+            self.app.recorded_actions.insert(end, action)
+            # Keep each breakpoint attached to its original action.
+            def shifted(idx):
+                if idx == start:
+                    return end
+                if start < idx <= end:
+                    return idx - 1
+                if end <= idx < start:
+                    return idx + 1
+                return idx
+            self.app.breakpoints = {shifted(i) for i in self.app.breakpoints}
+            self.app.current_action_idx = shifted(self.app.current_action_idx)
+            self.app._finish_queue_deletion(before, "Reordered Action")
+            self.app.set_active_action_index(self.app.current_action_idx)
+
         self._on_text_selection_changed()
-    
+
     def _on_double_click(self, event):
+        # A double-click is always edit, never the start of a long-press drag.
+        self._cancel_queue_drag_hold()
+        self._dnd_start_idx = None
         if not self.interactive_enabled or not self.app.recorded_actions:
             return "break"
         try:
@@ -11583,7 +11669,7 @@ class BuiltInMacroApp:
         self.update_status(f"Added Area Search: {desc}", COLOR_SUCCESS)
 
     def _snapshot_queue_for_undo(self):
-        """Copy complete queue state for undo of deletion or paste."""
+        """Copy complete queue state for undo of deletion, paste, or reorder."""
         return {
             'actions': copy.deepcopy(self.recorded_actions),
             'breakpoints': set(self.breakpoints),
@@ -11631,7 +11717,7 @@ class BuiltInMacroApp:
         self.display_actions_in_queue(self.recorded_actions, self.current_source_label)
 
     def undo_deleted_actions(self):
-        """Ctrl+Z: undo the latest queue delete/paste without undoing text editing."""
+        """Ctrl+Z: undo a queue deletion, paste or reorder; leave text fields alone."""
         if self.recording or self.playing or self.chain_running:
             self.update_status('Stop recording/playback before undoing deletion', COLOR_DANGER)
             return False
