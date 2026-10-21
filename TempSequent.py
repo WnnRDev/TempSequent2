@@ -10,7 +10,7 @@ import tempfile
 import hashlib
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from threading import Thread, RLock
 from queue import Queue, Empty
 import math
@@ -20,7 +20,6 @@ import difflib
 import unicodedata
 from pathlib import Path
 import winsound
-import uuid
 
 ACTIVE_SOUND_THEME = "Classic"
 CUSTOM_SOUND_PATHS = {
@@ -2365,7 +2364,22 @@ DYNAMIC_ACTION_SPECS = {
    ('fallback_label','Fallback label if goto','text','')]),
  'Run Macro':('run_macro',[
    ('preset','Saved macro name','text',''),
-   ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro'])]),
+   ('mode','After running','choice','Run & Return',['Run & Return','Switch to Macro']),
+   ('inputs','Input parameters (JSON list of name/value objects)','json',[]),
+   ('return_var','Save returned value to variable (optional)','text',''),
+   ('return_scope','Return Variable Scope','choice','Local',['Local','Global'])]),
+ 'Text Processing':('text_process',[
+   ('source_var','Read variable','text','defect_description'),
+   ('source_scope','Source Variable Scope','choice','Global',['Local','Global']),
+   ('operation','Operation','choice','Regex Extract',
+      ['Regex Extract','Regex Replace','Replace Literal','Split','Strip Whitespace','Uppercase','Lowercase']),
+   ('pattern','Regex / literal pattern / split delimiter','text','Part[: ]+(\\S+)'),
+   ('replacement','Replacement (for replace operations)','text',''),
+   ('index','Capture group / split item index','int',0),
+   ('var_name','Store result as','text','processed_text'),
+   ('var_scope','Destination Variable Scope','choice','Local',['Local','Global'])]),
+ 'Return From Macro':('macro_return',[
+   ('value','Return text or ${variable}','text','${_last_value}')]),
  'Load Text File → Variable':('load_text_variable',[
    ('path','Text file to read (.txt; relative paths use presets/text_files)','path','defect_description.txt'),
    ('var_name','Destination variable name','text','defect_description'),
@@ -3128,7 +3142,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
-    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro',
+    'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
     'load_text_variable'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
@@ -3663,6 +3677,91 @@ def interpolate_variable(app, name):
         return app.variables[bare]
     return get_global_var(app, bare, '')
 
+# --- Sequent IDE tools: version history, text processing and run telemetry ---
+from collections import deque
+from datetime import datetime
+
+
+def sequent_history_directory(presets_dir, preset_path):
+    """Store bounded revisions outside the preset menu, named by path digest."""
+    digest = hashlib.sha256(os.path.normcase(os.path.abspath(preset_path)).encode('utf-8')).hexdigest()[:20]
+    return os.path.join(presets_dir, '.sequent_history', digest)
+
+
+def sequent_save_revision(presets_dir, preset_path, *, limit=30):
+    """Save the PREVIOUS valid JSON preset before replacing it."""
+    with open(preset_path, 'rb') as stream:
+        previous = stream.read()
+    if len(previous) > 16 * 1024 * 1024:
+        raise MacroExecutionError('Preset too large for version history')
+    actions = json.loads(previous.decode('utf-8-sig'))
+    if not isinstance(actions, list):
+        raise MacroExecutionError('Existing preset is not a macro; refusing overwrite')
+    folder = sequent_history_directory(presets_dir, preset_path)
+    os.makedirs(folder, exist_ok=True)
+    signature = hashlib.sha256(previous).hexdigest()[:12]
+    name = datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '_' + signature + '.json'
+    new_name = name
+    fd, temp = tempfile.mkstemp(prefix='.revision-', dir=folder)
+    try:
+        with os.fdopen(fd, 'wb') as destination:
+            destination.write(previous)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temp, os.path.join(folder, name))
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
+    revisions = sorted(x for x in os.listdir(folder) if re.fullmatch(r'\d{8}_\d{6}_\d{6}_[0-9a-f]{12}\.json', x))
+    for name in revisions[:-max(1, int(limit))]:
+        os.unlink(os.path.join(folder, name))
+    return os.path.join(folder, new_name)
+
+
+def sequent_text_transform(text, operation, pattern='', replacement='', index=0):
+    """No external regex engine or arbitrary code execution."""
+    text = str(text)
+    if len(text) > 2_000_000 or len(pattern) > 5000:
+        raise MacroExecutionError('Text processing limit exceeded')
+    if operation == 'Strip Whitespace': return text.strip()
+    if operation == 'Uppercase': return text.upper()
+    if operation == 'Lowercase': return text.lower()
+    if operation == 'Replace Literal':
+        if not pattern: raise MacroExecutionError('Literal replacement needs search text')
+        return text.replace(pattern, replacement)
+    if operation == 'Regex Replace':
+        try: return re.sub(pattern, replacement, text)
+        except re.error as exc: raise MacroExecutionError(f'Regex replace: {exc}') from exc
+    if operation == 'Regex Extract':
+        try:
+            match = re.search(pattern, text, flags=re.MULTILINE)
+            if match is None: raise MacroExecutionError('Text extraction pattern not found')
+            return match.group(int(index))
+        except (re.error, IndexError, ValueError) as exc:
+            raise MacroExecutionError(f'Regex extract: {exc}') from exc
+    if operation == 'Split':
+        if not pattern: raise MacroExecutionError('Split requires delimiter')
+        chunks = text.split(pattern)
+        i = int(index)
+        if not -len(chunks) <= i < len(chunks):
+            raise MacroExecutionError('Split index is outside the available fields')
+        return chunks[i]
+    raise MacroExecutionError(f'Unknown text operation: {operation}')
+
+
+def sequent_parameter_inputs(items, interpolate):
+    if not isinstance(items, list) or len(items) > 40:
+        raise MacroExecutionError('Macro inputs must be a JSON list (max 40)')
+    values = {}
+    for item in items:
+        if not isinstance(item, dict): raise MacroExecutionError('Macro input must be an object')
+        name = str(item.get('name', '')).strip()
+        if not re.fullmatch(r'[A-Za-z_][\w]{0,79}', name) or name.startswith('_'):
+            raise MacroExecutionError(f'Invalid macro parameter name {name!r}')
+        if name in values: raise MacroExecutionError('Duplicate macro parameter: ' + name)
+        values[name] = str(interpolate(str(item.get('value', ''))))
+    return values
+
+
 class SequentDynamicEngine:
     """Structured action execution and conditions; no independent Tk GUI state."""
     def __init__(self, app):
@@ -3977,8 +4076,18 @@ class SequentDynamicEngine:
             name = action.get('var_name','ocr_value')
             self._assign_variable(name, extracted, action.get('var_scope'))
             result = {'value':extracted,'variable':name}
-        elif typ == 'run_macro':
-            raise MacroExecutionError('Run Macro must be executed by the workflow interpreter')
+        elif typ in ('run_macro', 'macro_return'):
+            raise MacroExecutionError('Macro call/return actions require the workflow interpreter')
+        elif typ == 'text_process':
+            source = get_variable(self.app, action.get('source_var', ''), action.get('source_scope', 'local'))
+            transformed = sequent_text_transform(
+                source, action.get('operation', 'Strip Whitespace'),
+                self.interpolate(action.get('pattern', '')),
+                self.interpolate(action.get('replacement', '')),
+                action.get('index', 0))
+            destination = action.get('var_name', '')
+            self._assign_variable(destination, transformed, action.get('var_scope'))
+            result = {'variable':destination, 'value':transformed}
         elif typ == 'load_text_variable':
             result = sequent_text_file_to_variable(self.app, action)
         elif typ == 'set_variable':
@@ -4062,19 +4171,30 @@ class SequentDynamicEngine:
         return self.last_result
     
     def run_action_with_recovery(self, action, *, idle=False):
+        began = time.perf_counter()
         mode = action.get('on_error',self.policy['on_error'])
         retries = max(0,min(20,int(action.get('retry_count',self.policy['retry_count']))))
         retry_delay = float(action.get('retry_delay',self.policy['retry_delay']))
         for attempt in range(retries+1):
             try:
                 if action.get('type') in DYNAMIC_ACTION_TYPES:
-                    return self.execute(action,idle=idle)
-                self.app.execute_single_action(action, idle=idle)
-                return {'success':True}
+                    result = self.execute(action,idle=idle)
+                else:
+                    self.app.execute_single_action(action, idle=idle)
+                    result = {'success':True}
+                if hasattr(self.app, 'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'OK',
+                                          time.perf_counter() - began)
+                return result
             except MacroCancelled:
-                # User abort is not a retryable/recoverable failure.
+                if hasattr(self.app,'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'CANCEL',
+                                          time.perf_counter()-began)
                 raise
             except Exception as exc:
+                if hasattr(self.app,'trace_action'):
+                    self.app.trace_action(action.get('type','?'), 'ERROR',
+                                          time.perf_counter()-began, str(exc))
                 self.app.variables['_last_success'] = 'false'
                 self.app.variables['_last_error'] = str(exc)
                 if attempt < retries:
@@ -4129,7 +4249,9 @@ class SequentDynamicEngine:
             if on_step: on_step(index, action)
             if typ == 'if_dynamic':
                 branch,end = dynamic_matching_block(actions,index,'if_dynamic','end_if','else_dynamic')
-                if self.evaluate(action): index += 1
+                condition = self.evaluate(action)
+                if hasattr(self.app,'trace_action'): self.app.trace_action('if_dynamic','TRUE' if condition else 'FALSE')
+                if condition: index += 1
                 else: index = branch+1 if branch is not None else end+1
                 continue
             if typ == 'else_dynamic':
@@ -4166,6 +4288,7 @@ class SequentDynamicEngine:
                         for col,value in rows[pos].items():
                             self.app.variables['row.'+str(col)]=str(value)
                 else: raise MacroExecutionError(f'Unknown loop mode: {mode}')
+                if hasattr(self.app,'trace_action'): self.app.trace_action('loop_start','ENTER' if run else 'EXIT')
                 if not run:
                     frames.pop()
                     index=end+1
@@ -4192,23 +4315,47 @@ class SequentDynamicEngine:
                 # by the current macro rather than silently switching to nothing.
                 nested_actions = self._load_called_macro(preset)
                 if mode == 'Switch to Macro':
+                    if action.get('inputs') or action.get('return_var'):
+                        raise MacroExecutionError('Run Macro inputs/outputs require Run & Return')
                     return {'switch':'preset', 'target':preset}
                 if preset in macro_stack:
                     raise MacroExecutionError('Run Macro: recursive macro call: ' +
                                               ' -> '.join(macro_stack + (preset,)))
                 if len(macro_stack) >= 12:
                     raise MacroExecutionError('Run Macro: maximum nested call depth (12) reached')
-                # Execute inside the same engine: variables, recovery policy,
-                # loop timing and stop/pause state remain shared. The child does
-                # not replace the parent queue or alter its selected preset.
-                child = self.run_program(nested_actions, idle=idle,
-                                         macro_stack=macro_stack + (preset,))
+                # Inputs are child-local variables, temporarily shadowing matching
+                # caller variables. Restore them even when a nested macro errors.
+                if action.get('return_var'):
+                    variable_identity(action['return_var'],action.get('return_scope','local'))
+                parameters = sequent_parameter_inputs(action.get('inputs', []), self.interpolate)
+                missing = object()
+                prior = {name:self.app.variables.get(name, missing) for name in parameters}
+                try:
+                    self.app.variables.update(parameters)
+                    child = self.run_program(nested_actions, idle=idle,
+                                             macro_stack=macro_stack + (preset,))
+                finally:
+                    for name, old_value in prior.items():
+                        if old_value is missing: self.app.variables.pop(name, None)
+                        else: self.app.variables[name] = old_value
                 if child.get('cancelled') or child.get('switch'):
                     return child
                 if not child.get('completed'):
                     raise MacroExecutionError(f'Run Macro: {preset!r} did not finish')
+                if action.get('return_var') and 'return_value' not in child:
+                    raise MacroExecutionError(f'Run Macro: {preset!r} did not return a value')
+                if 'return_value' in child:
+                    value = child['return_value']
+                    self.app.variables['_last_macro_return'] = value
+                    dest = str(action.get('return_var', '')).strip()
+                    if dest:
+                        set_variable(self.app, dest, value, action.get('return_scope','local'))
                 index += 1
                 continue
+            if typ == 'macro_return':
+                value = self.interpolate(str(action.get('value','')))
+                return {'completed':True, 'return_value':value,
+                        'next_index':index + 1}
             if typ=='if_var':
                 actual=str(get_variable(self.app, action.get('var_name',''), action.get('var_scope')))
                 if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
@@ -4357,10 +4504,12 @@ class VSCodeQueueViewer(tk.Frame):
             ("Clipboard Branch / Fallback", "On a keyword miss, set a Local/Global variable and/or run a macro.", "CB"),
             ("Request Input", "Ask the user for a value at runtime.", "IN"),
             ("Type Variable", "Type the value of a saved variable.", "VR"),
+            ("Text Processing", "Regex extract, replace, split, or format text variables.", "TX"),
             ("Advanced Key", "Press, hold, or release a specific key.", "AK"),
         )),
         ("Logic & Flow", (
             ("Run Macro", "Run a saved macro and return, or switch to it.", "RM"),
+            ("Return From Macro", "Return a text value to the calling macro.", "RM"),
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
@@ -6720,6 +6869,26 @@ class VSCodeQueueViewer(tk.Frame):
                                    'The original macro will not resume automatically.')
         mode.trace_add('write', refresh_mode)
         refresh_mode()
+        tk.Label(body, text='INPUT PARAMETERS (JSON LIST)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI',8,'bold')).pack(anchor='w')
+        tk.Label(body, text='Example: [{"name":"part","value":"${part_number}"}]. '
+                 'Available as local variables while the child macro runs.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=445,
+                 justify='left').pack(anchor='w', pady=(2,4))
+        inputs_widget = tk.Text(body, height=4, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                font=('Consolas',9), insertbackground=TEXT_PRIMARY)
+        inputs_widget.insert('1.0', json.dumps(old.get('inputs', []), indent=2))
+        inputs_widget.pack(fill=tk.X, pady=(0,7))
+        tk.Label(body, text='STORE RETURN IN VARIABLE (OPTIONAL)', bg=BG_PANEL,
+                 fg=SYNTAX_BLUE, font=('Segoe UI',8,'bold')).pack(anchor='w')
+        return_name = tk.Entry(body, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                               insertbackground=TEXT_PRIMARY)
+        return_name.insert(0, old.get('return_var',''))
+        return_name.pack(fill=tk.X,pady=(3,5))
+        return_scope = tk.StringVar(value=old.get('return_scope','Local').title())
+        return_menu = tk.OptionMenu(body,return_scope,'Local','Global')
+        return_menu.configure(bg=BG_INPUT,fg=TEXT_PRIMARY,highlightthickness=0)
+        return_menu.pack(fill=tk.X,pady=(0,7))
         error = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
                          font=('Segoe UI', 8), wraplength=445, justify='left')
         error.pack(fill=tk.X, pady=(2, 5))
@@ -6741,7 +6910,19 @@ class VSCodeQueueViewer(tk.Frame):
             if mode.get() not in ('Run & Return', 'Switch to Macro'):
                 error.config(text='Select a valid run mode.')
                 return
-            action = {'type':'run_macro', 'preset':target, 'mode':mode.get()}
+            try:
+                input_values = json.loads(inputs_widget.get('1.0','end-1c'))
+                sequent_parameter_inputs(input_values, lambda value: value)
+                if mode.get() == 'Switch to Macro' and (input_values or return_name.get().strip()):
+                    raise ValueError('Inputs and return values require Run & Return')
+                if return_name.get().strip():
+                    variable_identity(return_name.get(),return_scope.get())
+            except (ValueError,TypeError,MacroExecutionError) as exc:
+                error.config(text=f'Invalid macro parameters: {exc}')
+                return
+            action = {'type':'run_macro', 'preset':target, 'mode':mode.get(),
+                      'inputs':input_values,'return_var':return_name.get().strip(),
+                      'return_scope':return_scope.get().lower()}
             if edit_idx is not None:
                 idx = edit_idx
                 self.app.recorded_actions[idx] = action
@@ -9476,6 +9657,7 @@ class SequentWalkthrough:
             self.app.show_tab(self.original_tab, animate=False)
 
 # --- Main Application ---
+# --- Windows Explorer macro file drops (DLL-owned child window, no Tk subclass) ---
 class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
@@ -9636,6 +9818,8 @@ class BuiltInMacroApp:
         }
 
         self.load_settings()
+        self._trace_lock = RLock()
+        self._trace_rows = deque(maxlen=1500)
         self.dynamic_engine = SequentDynamicEngine(self)
         self._auto_trigger_key = None
         self._auto_trigger_state = None
@@ -9937,10 +10121,300 @@ class BuiltInMacroApp:
         if len(path) <= max_len: return path
         return "..." + path[-(max_len - 3):]
 
+    def trace_action(self, action, state, elapsed=0, details=''):
+        # Only metadata/errors go to the journal, NEVER clipboard contents or
+        # variable values (which can contain private defect descriptions).
+        with self._trace_lock:
+            self._trace_rows.append((datetime.now().isoformat(timespec='seconds'),
+                                     str(action), str(state), round(elapsed, 4), str(details)[:300]))
+
+    def open_ide_tools(self):
+        menu = tk.Menu(self.root, tearoff=False, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                       activebackground=COLOR_ACCENT, activeforeground=TEXT_ON_ACCENT)
+        for name, callback in (('Variable Explorer', self.open_variable_explorer),
+                               ('Preset Version History', self.open_preset_history),
+                               ('Execution Timeline', self.open_execution_timeline),
+                               ('Preset Manager', self.open_preset_manager)):
+            menu.add_command(label=name, command=callback)
+        x = self.root.winfo_pointerx(); y = self.root.winfo_pointery()
+        try: menu.tk_popup(x, y)
+        finally: menu.grab_release()
+
+    def open_variable_explorer(self):
+        window = tk.Toplevel(self.root)
+        window.title('Sequent — Live Variables')
+        window.geometry('720x490')
+        window.configure(bg=BG_PANEL)
+        left = tk.Frame(window, bg=BG_PANEL)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=12, pady=12)
+        tk.Label(left, text='LOCAL / GLOBAL VARIABLES', bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        listing = tk.Listbox(left, bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=BG_SELECTED,
+                             font=('Consolas',10), exportselection=False)
+        listing.pack(fill=tk.BOTH, expand=True, pady=8)
+        right = tk.Frame(window, bg=BG_PANEL, width=350)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(0,12), pady=12)
+        tk.Label(right, text='SELECTED VALUE (EDITABLE)', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY).pack(anchor='w')
+        editor = tk.Text(right, bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Consolas',9),
+                         insertbackground=TEXT_PRIMARY, wrap='word', height=13)
+        editor.pack(fill=tk.BOTH, expand=True, pady=8)
+        entries=[]
+        dirty=[False]
+        def selected():
+            index=listing.curselection()
+            return entries[index[0]] if index and index[0]<len(entries) else None
+        def refresh():
+            if not window.winfo_exists(): return
+            old=selected()
+            try:
+                with _GLOBAL_VARIABLE_LOCK: globals_ = _read_global_values(self)
+                items = ([('Local',k) for k in sorted(self.variables)] +
+                         [('Global',k) for k in sorted(globals_)])
+                if items != entries:
+                    entries[:] = items
+                    listing.delete(0,tk.END)
+                    for scope,name in items: listing.insert(tk.END, f'{scope:6}  {name}')
+                    if old in items: listing.selection_set(items.index(old))
+                pair=selected()
+                if pair and not editor.edit_modified():
+                    scope,name=pair
+                    current=str(get_variable(self,name,scope))
+                    if editor.get('1.0','end-1c') != current:
+                        editor.delete('1.0',tk.END)
+                        editor.insert('1.0',current)
+                        editor.edit_modified(False)
+            except MacroExecutionError as exc:
+                self.update_status(str(exc),COLOR_DANGER)
+            window.after(1400,refresh)
+        def on_select(event=None):
+            pair=selected()
+            if not pair: return
+            scope,name=pair
+            try: value = get_variable(self,name,scope)
+            except MacroExecutionError as exc:
+                self.update_status(str(exc),COLOR_DANGER);return
+            editor.delete('1.0',tk.END)
+            editor.insert('1.0',str(value))
+            dirty[0]=False
+            editor.edit_modified(False)
+        def save():
+            pair=selected()
+            if not pair:return
+            scope,name=pair
+            try:
+                set_variable(self,name,editor.get('1.0','end-1c'),scope)
+                editor.edit_modified(False)
+                self.update_status(f'Updated {scope} variable {name}',COLOR_SUCCESS)
+            except MacroExecutionError as exc:
+                messagebox.showerror('Save variable',str(exc),parent=window)
+        def delete():
+            pair=selected()
+            if not pair:return
+            scope,name=pair
+            if not messagebox.askyesno('Delete variable',f'Delete {scope} variable {name}?',parent=window):return
+            if scope=='Local':self.variables.pop(name,None)
+            else:
+                try:
+                    with _GLOBAL_VARIABLE_LOCK:
+                        all_values=_read_global_values(self)
+                        all_values.pop(name,None)
+                        self._write_json_atomically(_global_variable_path(self),all_values)
+                except (MacroExecutionError,OSError) as exc:
+                    messagebox.showerror('Delete variable',str(exc),parent=window);return
+            refresh();editor.delete('1.0',tk.END)
+        listing.bind('<<ListboxSelect>>',on_select)
+        controls=tk.Frame(right,bg=BG_PANEL);controls.pack(fill=tk.X)
+        def create():
+            name=simpledialog.askstring('New variable','Variable name:',parent=window)
+            if not name:return
+            try: variable_identity(name,'local')
+            except MacroExecutionError as exc:
+                messagebox.showerror('Invalid name',str(exc),parent=window);return
+            global_scope=messagebox.askyesno('Variable scope',
+                'Save this variable globally across all macros?\nYes = Global, No = Local',parent=window)
+            scope='global' if global_scope else 'local'
+            try:
+                set_variable(self,name,'',scope)
+                refresh()
+                selected_key=(scope.title(),name)
+                if selected_key in entries:
+                    listing.selection_clear(0,tk.END)
+                    listing.selection_set(entries.index(selected_key))
+                    listing.see(entries.index(selected_key))
+                    on_select()
+            except MacroExecutionError as exc:
+                messagebox.showerror('New variable',str(exc),parent=window)
+        tk.Button(controls,text='New',command=create).pack(side=tk.LEFT,padx=3)
+        tk.Button(controls,text='Save Value',command=save).pack(side=tk.LEFT,padx=3)
+        tk.Button(controls,text='Delete',command=delete).pack(side=tk.LEFT,padx=3)
+        tk.Button(controls,text='Refresh',command=lambda:(refresh(),on_select())).pack(side=tk.LEFT,padx=3)
+        refresh()
+
+    def open_execution_timeline(self):
+        window=tk.Toplevel(self.root)
+        window.title('Sequent — Execution Timeline')
+        window.geometry('940x470');window.configure(bg=BG_PANEL)
+        text_box=tk.Text(window,bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',9),
+                         wrap='none',state=tk.DISABLED)
+        text_box.pack(fill=tk.BOTH,expand=True,padx=9,pady=9)
+        last=[-1]
+        def update():
+            if not window.winfo_exists():return
+            with self._trace_lock: records=list(self._trace_rows)
+            key = (len(records), records[-1] if records else None)
+            if key!=last[0]:
+                text_box.configure(state=tk.NORMAL);text_box.delete('1.0',tk.END)
+                for timestamp,action,status,seconds,detail in records:
+                    text_box.insert(tk.END,f'{timestamp}  {seconds:8.4f}s  {status:9}  {action:18}  {detail}\n')
+                text_box.see(tk.END);text_box.configure(state=tk.DISABLED)
+                last[0]=key
+            window.after(400,update)
+        def export():
+            filename=filedialog.asksaveasfilename(parent=window,defaultextension='.csv',
+                  filetypes=[('CSV files','*.csv')])
+            if filename:
+                with self._trace_lock: rows=list(self._trace_rows)
+                with open(filename,'w',newline='',encoding='utf-8-sig') as stream:
+                    writer=csv.writer(stream);writer.writerow(['timestamp','action','status','seconds','detail'])
+                    writer.writerows(rows)
+        tk.Button(window,text='Export Timeline CSV',command=export).pack(pady=(0,8))
+        update()
+
+    def open_preset_history(self):
+        path=getattr(self,'_active_preset_path',None)
+        if not path:
+            messagebox.showinfo('Preset history','Open a saved preset first.',parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('Sequent — Preset Version History')
+        window.geometry('670x425');window.configure(bg=BG_PANEL)
+        tk.Label(window,text='Previous versions (oldest to newest); up to 30 saved per preset',
+                 bg=BG_PANEL,fg=TEXT_PRIMARY).pack(anchor='w',padx=12,pady=8)
+        listing=tk.Listbox(window,bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',10))
+        listing.pack(fill=tk.BOTH,expand=True,padx=12,pady=8)
+        folder=sequent_history_directory(self.presets_dir,path)
+        names = sorted((n for n in os.listdir(folder) if n.endswith('.json'))) if os.path.isdir(folder) else []
+        for name in names: listing.insert(tk.END,name)
+        def restore():
+            selected=listing.curselection()
+            if not selected:return
+            name=names[selected[0]]
+            try:
+                with open(os.path.join(folder,name),'r',encoding='utf-8-sig') as stream:
+                    actions=json.load(stream)
+                if not isinstance(actions,list) or any(not isinstance(a,dict) or 'type' not in a for a in actions):
+                    raise ValueError('Revision does not contain a macro action list')
+                if not messagebox.askyesno('Restore preset',f'Restore {name}?\nCurrent version will be backed up first.',parent=window):return
+                # Verify current file has not been modified outside Sequent.
+                if not self._safe_to_replace_queue():return
+                with open(path,'rb') as stream: current_hash=hashlib.sha256(stream.read()).hexdigest()
+                if current_hash != self._active_preset_disk_hash:
+                    raise OSError('Preset changed externally; reload before restore')
+                sequent_save_revision(self.presets_dir,path)
+                new_hash=self._write_json_atomically(path,actions)
+                self.recorded_actions=copy.deepcopy(actions)
+                self.breakpoints.clear();self.current_action_idx=0
+                self._clear_queue_undo();self._bind_preset_autosave(path)
+                self.display_actions_in_queue(self.recorded_actions,self.current_source_label)
+                window.destroy()
+                self.update_status('Preset revision restored',COLOR_SUCCESS)
+            except (ValueError,OSError,MacroExecutionError) as exc:
+                messagebox.showerror('Restore failed',str(exc),parent=window)
+        def compare_revision():
+            selected=listing.curselection()
+            if not selected:return
+            try:
+                with open(os.path.join(folder,names[selected[0]]),'r',encoding='utf-8-sig') as stream:
+                    previous=json.load(stream)
+                before=json.dumps(previous,indent=2,ensure_ascii=True).splitlines(keepends=True)
+                after=json.dumps(self.recorded_actions,indent=2,ensure_ascii=True).splitlines(keepends=True)
+                change=''.join(difflib.unified_diff(before,after,fromfile='Revision',tofile='Current queue'))
+            except (OSError,ValueError) as exc:
+                messagebox.showerror('Compare failed',str(exc),parent=window);return
+            diff_window=tk.Toplevel(window)
+            diff_window.title('Compare Saved Revision vs Current Queue')
+            diff_window.geometry('850x530')
+            viewer=tk.Text(diff_window,wrap='none',font=('Consolas',9),bg=BG_INPUT,fg=TEXT_PRIMARY)
+            viewer.pack(fill=tk.BOTH,expand=True)
+            viewer.insert('1.0',change or 'No differences')
+            viewer.config(state=tk.DISABLED)
+        history_buttons=tk.Frame(window,bg=BG_PANEL);history_buttons.pack(pady=8)
+        tk.Button(history_buttons,text='Compare With Current',command=compare_revision).pack(side=tk.LEFT,padx=5)
+        tk.Button(history_buttons,text='Restore Selected Revision',command=restore).pack(side=tk.LEFT,padx=5)
+
+    def open_preset_manager(self):
+        """Non-destructive searchable preset manager with tags and favorites."""
+        window=tk.Toplevel(self.root);window.title('Sequent — Preset Manager')
+        window.geometry('680x520');window.configure(bg=BG_PANEL)
+        query=tk.StringVar();only_fav=tk.BooleanVar(value=False)
+        meta_path=os.path.join(self.presets_dir,'.sequent_preset_catalog.json')
+        def read_meta():
+            try:
+                with open(meta_path,encoding='utf-8') as stream: meta=json.load(stream)
+                return meta if isinstance(meta,dict) else {}
+            except FileNotFoundError:return {}
+        meta=read_meta()
+        tk.Entry(window,textvariable=query,bg=BG_INPUT,fg=TEXT_PRIMARY,
+                 insertbackground=TEXT_PRIMARY).pack(fill=tk.X,padx=12,pady=(12,4))
+        tk.Checkbutton(window,text='Favorites only',variable=only_fav,bg=BG_PANEL,
+                       fg=TEXT_PRIMARY,selectcolor=BG_INPUT).pack(anchor='w',padx=12)
+        listing=tk.Listbox(window,bg=BG_INPUT,fg=TEXT_PRIMARY,exportselection=False)
+        listing.pack(fill=tk.BOTH,expand=True,padx=12,pady=7)
+        tag=tk.StringVar();tk.Entry(window,textvariable=tag,bg=BG_INPUT,fg=TEXT_PRIMARY,
+                                    insertbackground=TEXT_PRIMARY).pack(fill=tk.X,padx=12,pady=(2,9))
+        names=[]
+        def refresh(*_):
+            old=listing.curselection();previous=names[old[0]] if old and old[0]<len(names) else None
+            names[:]=[n for n in self.get_preset_names() if
+                      (query.get().casefold() in n.casefold() or query.get().casefold() in str(meta.get(n,{}).get('tag','')).casefold())
+                      and (not only_fav.get() or meta.get(n,{}).get('favorite',False))]
+            listing.delete(0,tk.END)
+            for n in names: listing.insert(tk.END,('★ ' if meta.get(n,{}).get('favorite') else '   ')+n+
+                                           ('  #'+str(meta.get(n,{}).get('tag')) if meta.get(n,{}).get('tag') else ''))
+            if previous in names:listing.selection_set(names.index(previous))
+        def selected():
+            ids=listing.curselection();return names[ids[0]] if ids else None
+        def save_meta():
+            self._write_json_atomically(meta_path,meta)
+        def edit_favorite():
+            name=selected()
+            if not name:return
+            item=meta.setdefault(name,{})
+            item['favorite']=not item.get('favorite',False);item['tag']=tag.get().strip()[:60]
+            save_meta();refresh()
+        def duplicate():
+            name=selected()
+            if not name:return
+            dest=simpledialog.askstring('Duplicate preset','New preset name:',parent=window,
+                                        initialvalue=name+'_copy')
+            if not dest:return
+            try:
+                if not re.fullmatch(r'[A-Za-z0-9 _-]{1,90}',dest):raise ValueError('Use letters, numbers, spaces, _ or -')
+                old=os.path.join(self.presets_dir,name+'.json')
+                new=os.path.join(self.presets_dir,dest+'.json')
+                with open(old,'rb') as f: raw=f.read()
+                json.loads(raw.decode('utf-8'))
+                with open(new,'xb') as out:out.write(raw)
+                refresh();self.refresh_preset_menu()
+            except (OSError,ValueError) as exc:messagebox.showerror('Duplicate failed',str(exc),parent=window)
+        def on_select(_=None):
+            name=selected()
+            if name:tag.set(str(meta.get(name,{}).get('tag','')))
+        query.trace_add('write',refresh);only_fav.trace_add('write',refresh)
+        listing.bind('<<ListboxSelect>>',on_select)
+        controls=tk.Frame(window,bg=BG_PANEL);controls.pack(fill=tk.X,padx=12,pady=8)
+        tk.Button(controls,text='Save Tag / Toggle Favorite',command=edit_favorite).pack(side=tk.LEFT,padx=3)
+        tk.Button(controls,text='Duplicate',command=duplicate).pack(side=tk.LEFT,padx=3)
+        def open_selected():
+            name=selected()
+            if name and self.on_preset_file_selected(name,os.path.join(self.presets_dir,name+'.json')):
+                window.destroy()
+        tk.Button(controls,text='Open Preset',command=open_selected).pack(side=tk.LEFT,padx=3)
+        refresh()
+
     def get_preset_names(self):
         if not os.path.exists(self.presets_dir): return []
         try:
-            return sorted([os.path.splitext(f)[0] for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and f.lower() != "globals.json"])
+            return sorted([os.path.splitext(f)[0] for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and not f.lower().endswith(".chain.json") and not f.startswith(".") and f.lower() != "globals.json"])
         except Exception: return []
 
     def setup_ui(self, initial_tab="playback", animate=True):
@@ -10006,6 +10480,7 @@ class BuiltInMacroApp:
         self.mini_hud_button.place(x=self.sidebar_width + 12, rely=0.5, anchor=tk.W)
         top_bar.bind("<Configure>", self._position_mini_hud_button, add="+")
 
+        tools_button = sequent_toolbar_button(top_bar, 'IDE Tools', self.open_ide_tools)
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
         win_controls.pack(side=tk.RIGHT, fill=tk.Y)
         btn_close = SequentIcon(win_controls, 'close', bg=BG_HEADER,
@@ -10033,6 +10508,7 @@ class BuiltInMacroApp:
             # Windows handles double-click-to-maximize on the custom caption.
             top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
+        tools_button.pack(side=tk.RIGHT, padx=(4, 7), pady=8)
         # Notifications live exclusively in the bottom-left footer. Keep the
         # top-right area available for the preset selector and window controls.
 
@@ -10067,7 +10543,7 @@ class BuiltInMacroApp:
                                       fg=TEXT_MUTED, font=("Segoe UI", 8), anchor="w")
         self.footer_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(self.footer, text="SEQUENT  •  WORKSPACE", bg=BG_HEADER,
-                 fg=TEXT_MUTED, font=("Consolas", 8)).pack(side=tk.RIGHT, padx=12)
+                     fg=TEXT_MUTED, font=("Consolas", 8)).pack(side=tk.RIGHT, padx=12)
         tk.Frame(self.main_container, bg=BG_BORDER, height=1).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.workspace = tk.Frame(self.main_container, bg=BG_APP)
@@ -13427,7 +13903,8 @@ try {{
                 actual_hash = hashlib.sha256(stream.read()).hexdigest()
             if actual_hash != self._active_preset_disk_hash:
                 raise OSError('preset changed outside Sequent; export or reload it to avoid overwriting newer data')
-            # Validate serializability BEFORE touching the on-disk preset.
+            # Keep the old preset before replacing it; no edit loss on autosave.
+            sequent_save_revision(self.presets_dir, path)
             new_hash = self._write_json_atomically(path, self.recorded_actions)
         except (OSError, ValueError, TypeError, OverflowError) as exc:
             self.update_status(f'Autosave failed: {exc}', COLOR_DANGER)
@@ -13534,7 +14011,7 @@ try {{
 
         json_files = []
         if os.path.isdir(self.presets_dir):
-            try: json_files = sorted([f for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and f.lower() != "globals.json"])
+            try: json_files = sorted([f for f in os.listdir(self.presets_dir) if f.lower().endswith(".json") and not f.lower().endswith(".chain.json") and not f.startswith(".") and f.lower() != "globals.json"])
             except Exception: json_files = []
 
         if not json_files:
@@ -15166,6 +15643,7 @@ try {{
                         while self.is_paused and self.playing:time.sleep(.04)
                     if not self.playing:
                         raise MacroCancelled('Playback stopped at breakpoint')
+                    self.trace_action(action.get('type','?'), f'STEP {index+1}', 0)
                     if not self._playback_ui_pending or action.get('type') != 'move':
                         self._playback_ui_pending = True
                         self.root.after(0, lambda i=index, r=run_id:
@@ -15195,6 +15673,7 @@ try {{
             if self.audio_cues:play_cue('error')
         finally:
             if not self.switching_preset:
+                self.trace_action('macro', 'ERROR' if reason else 'END', 0, reason)
                 state = 'failed' if reason else 'cancelled' if not self.playing else 'completed'
                 self.root.after(0,self.finish_macro,state,reason)
 
