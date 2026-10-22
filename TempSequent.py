@@ -11,6 +11,7 @@ import hashlib
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 from threading import Thread, RLock
 from queue import Queue, Empty
 import math
@@ -18,6 +19,7 @@ import colorsys
 import random
 import difflib
 import unicodedata
+import uuid
 from pathlib import Path
 import winsound
 
@@ -1475,12 +1477,54 @@ def read_windows_app_theme():
         return "dark"
 
 
+class SequentRoundedAccentBar(tk.Canvas):
+    """Reusable, theme-aware vertical accent marker with rounded end caps.
+
+    Tk Frames always have square ends.  A lightweight Canvas line uses Tk's
+    own ROUND cap style, scales with the parent row, and needs no extra assets
+    or dependencies. The bar's background is the surface it sits upon.
+    """
+
+    def __init__(self, parent, *, thickness=4, background=None,
+                 accent=None, inset=5, **kwargs):
+        self.thickness = max(2, int(thickness))
+        self.inset = max(0, int(inset))
+        self.accent = COLOR_ACCENT if accent is None else accent
+        bg = background if background is not None else parent.cget('bg')
+        super().__init__(parent, width=self.thickness + 4, height=1,
+                         bg=bg, borderwidth=0, highlightthickness=0,
+                         takefocus=0, **kwargs)
+        self.bind('<Configure>', self._paint_accent, add='+')
+
+    def set_accent(self, accent, *, background=None):
+        """Recolor a live selection marker without rebuilding its widget."""
+        self.accent = accent
+        if background is not None:
+            self.configure(bg=background)
+        self._paint_accent()
+
+    def _paint_accent(self, event=None):
+        self.delete('rounded_accent_bar')
+        if not self.accent:
+            return
+        h = self.winfo_height()
+        if h <= 1:
+            return  # Configure paints after Tk has assigned the actual row height.
+        x = self.winfo_width() / 2
+        r = self.thickness / 2
+        y0 = min(h / 2, self.inset + r)
+        y1 = max(h / 2, h - self.inset - r)
+        self.create_line(x, y0, x, y1, fill=self.accent,
+                         width=self.thickness, capstyle=tk.ROUND,
+                         tags='rounded_accent_bar')
+
+
 def sequent_dock_header(parent, title, subtitle="", right_text=""):
     """Small consistent dock title bar. No changes to automation behavior."""
     shell = tk.Frame(parent, bg=BG_HEADER, height=39)
     shell.pack(fill=tk.X)
     shell.pack_propagate(False)
-    tk.Frame(shell, bg=COLOR_ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
+    SequentRoundedAccentBar(shell, thickness=3, background=BG_HEADER, inset=6).pack(side=tk.LEFT, fill=tk.Y)
     tk.Label(shell, text=title.upper(), bg=BG_HEADER, fg=TEXT_PRIMARY,
              font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(12, 8))
     if subtitle:
@@ -1501,10 +1545,18 @@ def sequent_icon_for_caption(caption):
     t = str(caption).strip().casefold()
     if not t: return None
     keys = (
+        ('copy action', 'copy'), ('paste action', 'paste'),
+        ('version history', 'history'), ('execution timeline', 'timeline'),
+        ('variable', 'variable'), ('clipboard', 'clipboard'),
+        ('load text file', 'file'), ('find image', 'image'), ('find text', 'text'),
+        ('compare', 'branch'), ('duplicate', 'copy'), ('favorite', 'star'),
+        ('restore', 'history'), ('preview', 'eye'), ('test ', 'eye'),
+        ('remove', 'trash'), ('move up', 'back'), ('move down', 'forward'),
+        ('exit', 'close'), ('reload icons', 'refresh'),
         ('stop recording', 'stop'), ('start recording', 'record'),
         ('stop macro', 'stop'), ('run macro', 'play'), ('run active', 'play'),
         ('run chain', 'play'), ('pause', 'pause'), ('resume', 'play'),
-        ('start guided', 'play'), ('step', 'step'), ('jump', 'first'),
+        ('start guided', 'play'), ('skip to end', 'last'), ('step', 'step'), ('jump', 'first'),
         ('prev', 'back'), ('next', 'forward'), ('import', 'upload'),
         ('export', 'download'), ('refresh', 'refresh'),
         ('clear', 'trash'), ('delete', 'trash'), ('snip', 'target'), ('cancel', 'close'),
@@ -1517,6 +1569,8 @@ def sequent_icon_for_caption(caption):
         ('mini hud', 'layout'), ('guided tour', 'help'),
         ('playback', 'play'), ('sequencer', 'layers'), ('settings', 'settings'),
         ('customize', 'settings'), ('reset', 'refresh'),
+        ('type ', 'keyboard'), ('tag', 'edit'), ('open', 'folder'),
+        ('no click', 'eye'), ('remove all', 'trash'), ('delete', 'trash'),
     )
     for prefix, icon in keys:
         if prefix in t: return icon
@@ -1537,29 +1591,873 @@ def sequent_clean_caption(text):
 
 
 def sequent_icon_for_action(name):
-    """Map action-picker categories to a stable pictogram, not textual sigils."""
+    """Choose distinct, meaningful vector fallback icons for each action."""
     name = str(name).casefold()
+    if 'image' in name or 'icon' in name: return 'image'
+    if 'clipboard' in name: return 'clipboard'
+    if 'text file' in name or 'write file' in name or 'load file' in name: return 'file'
+    if 'csv' in name or 'excel' in name: return 'file'
+    if 'type' in name or 'keyboard' in name or 'hotkey' in name: return 'keyboard'
+    if 'variable' in name or 'process text' in name or 'text transform' in name: return 'variable'
+    if 'loop' in name or 'repeat' in name: return 'loop'
+    if 'if ' in name or 'else' in name or 'gate' in name or 'branch' in name: return 'branch'
     if 'run macro' in name: return 'play'
-    if any(w in name for w in ('delay', 'wait', 'retry')): return 'clock'
-    if any(w in name for w in ('find', 'search', 'ocr', 'pixel', 'smart ui')): return 'target'
-    if any(w in name for w in ('clipboard','copy', 'paste')): return 'layers'
-    if any(w in name for w in ('file', 'csv', 'excel', 'export', 'load ')): return 'folder'
-    if any(w in name for w in ('input','variable', 'key')): return 'edit'
-    if any(w in name for w in ('if ', 'gate','else', 'loop', 'jump', 'label')): return 'layers'
+    if 'mouse' in name or 'drag' in name: return 'drag'
+    if 'label' in name or 'jump' in name: return 'branch'
+    if 'delay' in name or 'wait' in name or 'retry' in name: return 'clock'
+    if 'find text' in name or 'search selected' in name or 'ocr' in name: return 'text'
+    if any(w in name for w in ('find', 'search', 'pixel', 'smart ui', 'color')): return 'target'
+    if 'file' in name or 'export' in name or 'load ' in name: return 'folder'
+    if 'input' in name or 'key' in name: return 'edit'
     if 'warning' in name or 'disclaimer' in name: return 'alert'
     if 'recovery' in name or 'policy' in name: return 'settings'
     if 'trigger' in name: return 'play'
-    return 'layout'
+    return 'list'
+
+
+# --- Named icon slots: scoped per control, with built-in vector fallback ---
+# A custom icon file can override an individual button, sidebar entry, or
+# Action Library item without changing all other controls that use that glyph.
+_SEQUENT_ICON_SLOTS = {}
+
+_SEQUENT_KNOWN_BUTTON_CAPTIONS = ('+ Add Keyword Rule', '+ Add Stage', 'Abort Macro', 'Add Action', 'Apply Accent', 'Back', 'Browse / Choose File...', 'Browse File...', 'Browse...', 'Cancel', 'Capture Image / Icon from Desktop', 'Capture Selector from Recorded Click', 'Copy Action(s)', 'Customize...', 'Debug Tools', 'Delete Action', 'Exit tour', 'Export', 'Export Timeline CSV', 'Find Color & Click', 'Find Image & Click', 'Find Text & Click', 'Import', 'Inspect Desktop Pixel', 'Mini HUD', 'Next', 'Next  →', 'Open Preset', 'Paste Action(s)', 'Pause', 'Pause (F9)', 'Play', 'Preview Actual Search Area', 'Proceed', 'Record', 'Redo', 'Refresh', 'Remove', 'Remove All Mouse Movements', 'Resume', 'Run Macro', 'Run Macro Chain (F9)', 'Sample Color', 'Save', 'Save & Open Live Reticle Editor', 'Save Changes', 'Save Settings as Default', 'Select Search Box', 'Start Recording', 'Stop Recording', 'Submit', 'Test Match (Preview Only — No Click)', 'Test Selector (No Click)', 'Test Text Match (No Click)', 'Undo', '←  Back')
+
+
+def sequent_icon_slug(text):
+    """Stable filename-friendly button/action identifier."""
+    value = re.sub(r'[^a-z0-9]+', '-', str(text).casefold()).strip('-')
+    return value or 'unnamed'
+
+
+def sequent_icon_slot(group, title):
+    return str(group) + '.' + sequent_icon_slug(title)
+
+
+def sequent_register_icon_slot(slot, label, fallback):
+    if isinstance(slot, str) and slot and slot not in _SEQUENT_ICON_SLOTS:
+        _SEQUENT_ICON_SLOTS[slot] = (str(label), str(fallback))
+    return slot
+
+
+def sequent_icon_catalog():
+    """Known icon slots, including controls that are not currently visible."""
+    defaults = {
+        'play':'Run / Playback', 'record':'Record', 'pause':'Pause', 'stop':'Stop',
+        'save':'Save', 'undo':'Undo', 'redo':'Redo', 'search':'Search',
+        'folder':'Browse / Folder', 'download':'Export', 'upload':'Import',
+        'star':'Favorite (outline)', 'star-filled':'Favorite (filled)',
+        'close':'Close', 'refresh':'Refresh', 'settings':'Settings',
+        'alert':'Warning', 'variable':'Variable', 'clipboard':'Clipboard',
+        'image':'Image', 'text':'Text', 'loop':'Loop', 'branch':'Conditional',
+        'copy':'Copy', 'paste':'Paste', 'history':'Version History',
+        'timeline':'Timeline', 'file':'Text File', 'drag':'Drag / Reorder',
+    }
+    slots = {key: (label, key) for key, label in defaults.items()}
+    slots.update(_SEQUENT_ICON_SLOTS)
+    # Transport controls have icon-only captions, so they need persistent,
+    # independent slots even before the Playback workspace is first opened.
+    slots.update({
+        'transport.jump-to-start': ('Transport: Jump to Start', 'first'),
+        'transport.previous': ('Transport: Previous Action', 'back'),
+        'transport.next': ('Transport: Next Action', 'forward'),
+        'transport.skip-to-end': ('Transport: Skip to End', 'last'),
+    })
+    for label in _SEQUENT_KNOWN_BUTTON_CAPTIONS:
+        slot = sequent_icon_slot('button', label)
+        slots.setdefault(slot, (label, sequent_icon_for_caption(label) or 'list'))
+    # All Action Library entries get their own individual image slot.
+    for category, actions in getattr(globals().get('VSCodeQueueViewer'), 'ACTION_PICKER_GROUPS', ()):
+        for name, *_ in actions:
+            slot = sequent_icon_slot('action', name)
+            slots.setdefault(slot, (name, sequent_icon_for_action(name)))
+    return dict(sorted(slots.items()))
+
+
+# --- Sequent dependency-free SVG icon renderer ---
+# Sequent SVG icon decoder; Python standard library only.
+# Handles the SVG shapes/path commands typically used by outline icon packs.
+# Intentionally does not evaluate external files, scripts, CSS, filters or images.
+import base64
+import math
+import re
+import struct
+import zlib
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+_SVG_NUMBER = r'[-+]?(?:(?:\d*\.\d+)|(?:\d+\.?\d*))(?:[eE][-+]?\d+)?'
+_SVG_PATH_TOKENS = re.compile(r'[MmLlHhVvCcSsQqTtAaZz]|' + _SVG_NUMBER)
+_SVG_TRANSFORMS = re.compile(r'([a-zA-Z]+)\s*\(([^)]*)\)')
+_SVG_COLORS = {'black':(0,0,0),'white':(255,255,255),'red':(255,0,0),
+               'blue':(0,0,255),'green':(0,128,0),'gray':(128,128,128),
+               'grey':(128,128,128),'transparent':None}
+_SVG_SUPPORTED = {'svg','g','path','rect','circle','ellipse','line','polygon','polyline',
+                  'title','desc','metadata'}
+
+
+def _svg_num(text, default=0):
+    if text is None:
+        return float(default)
+    m = re.match(r'^\s*(' + _SVG_NUMBER + r')', str(text))
+    if m is None:
+        raise ValueError('Unsupported SVG numeric value: ' + str(text)[:30])
+    value = float(m.group(1))
+    if not math.isfinite(value):
+        raise ValueError('Invalid SVG coordinate')
+    return value
+
+
+def _svg_numbers(s):
+    result = [float(v) for v in re.findall(_SVG_NUMBER, s)]
+    if any(not math.isfinite(v) for v in result):
+        raise ValueError('Invalid SVG coordinate')
+    return result
+
+
+def _svg_matrix_mul(m, n):
+    a,b,c,d,e,f = m
+    A,B,C,D,E,F = n
+    return (a*A+c*B, b*A+d*B, a*C+c*D, b*C+d*D, a*E+c*F+e, b*E+d*F+f)
+
+
+def _svg_transform(s):
+    matrix = (1.,0.,0.,1.,0.,0.)
+    s = s or ''
+    for match in _SVG_TRANSFORMS.finditer(s):
+        kind = match.group(1).lower()
+        vals = _svg_numbers(match.group(2))
+        if kind == 'translate' and 1 <= len(vals) <= 2:
+            t = (1,0,0,1,vals[0],vals[1] if len(vals)>1 else 0)
+        elif kind == 'scale' and 1 <= len(vals) <= 2:
+            t = (vals[0],0,0,vals[1] if len(vals)>1 else vals[0],0,0)
+        elif kind == 'rotate' and len(vals) in (1,3):
+            angle = math.radians(vals[0]); cs=math.cos(angle); sn=math.sin(angle)
+            t = (cs,sn,-sn,cs,0,0)
+            if len(vals)==3:
+                t = _svg_matrix_mul((1,0,0,1,vals[1],vals[2]),
+                        _svg_matrix_mul(t,(1,0,0,1,-vals[1],-vals[2])))
+        elif kind == 'matrix' and len(vals)==6:
+            t = tuple(vals)
+        elif kind == 'skewx' and len(vals)==1:
+            t = (1,0,math.tan(math.radians(vals[0])),1,0,0)
+        elif kind == 'skewy' and len(vals)==1:
+            t = (1,math.tan(math.radians(vals[0])),0,1,0,0)
+        else:
+            raise ValueError('Unsupported SVG transform: '+kind)
+        matrix = _svg_matrix_mul(matrix,t)
+    if s.strip() and not _SVG_TRANSFORMS.sub('',s).strip(' \t\r\n,')=='':
+        raise ValueError('Unsupported SVG transform syntax')
+    return matrix
+
+
+def _svg_color(value, ink):
+    if value is None or str(value).strip().lower() == 'none':
+        return None
+    value = str(value).strip().lower()
+    if value == 'currentcolor':
+        value = ink
+    if value in _SVG_COLORS:
+        return _SVG_COLORS[value]
+    if value.startswith('#'):
+        digits = value[1:]
+        if len(digits) == 3 and all(c in '0123456789abcdef' for c in digits):
+            return tuple(int(c*2,16) for c in digits)
+        if len(digits) in (6,8) and all(c in '0123456789abcdef' for c in digits):
+            return tuple(int(digits[i:i+2],16) for i in (0,2,4))
+    m = re.fullmatch(r'rgba?\(([^)]*)\)', value)
+    if m:
+        nums = _svg_numbers(m.group(1))
+        if len(nums) in (3,4):
+            return tuple(max(0,min(255,round(c))) for c in nums[:3])
+    raise ValueError('Unsupported SVG color: '+value[:32])
+
+
+def _svg_flatten_path(d):
+    # Decode absolute and relative SVG path commands into linear outlines.
+    tokens = _SVG_PATH_TOKENS.findall(d)
+    if len(tokens) > 12000 or re.sub(r'[\s,]+','',_SVG_PATH_TOKENS.sub('',d)):
+        raise ValueError('SVG path is malformed or too complex')
+    outlines=[]; points=[]; pos=(0.,0.); origin=pos; cmd=None; i=0
+    last_cubic=None; last_quad=None; previous=''
+    def curve(p0,p1,p2,p3):
+        distance = math.dist(p0,p1)+math.dist(p1,p2)+math.dist(p2,p3)
+        count = max(6,min(36,int(distance/2.5)+1))
+        for j in range(1,count+1):
+            t=j/count; u=1-t
+            points.append((u*u*u*p0[0]+3*u*u*t*p1[0]+3*u*t*t*p2[0]+t*t*t*p3[0],
+                           u*u*u*p0[1]+3*u*u*t*p1[1]+3*u*t*t*p2[1]+t*t*t*p3[1]))
+    def quad(p0,p1,p2):
+        curve(p0,(p0[0]+2/3*(p1[0]-p0[0]),p0[1]+2/3*(p1[1]-p0[1])),
+              (p2[0]+2/3*(p1[0]-p2[0]),p2[1]+2/3*(p1[1]-p2[1])),p2)
+    def arc(start, rx,ry,angle,large,sweep,end):
+        rx,ry=abs(rx),abs(ry)
+        if rx < 1e-8 or ry < 1e-8 or start==end:
+            points.append(end); return
+        phi=math.radians(angle); co=math.cos(phi); si=math.sin(phi)
+        dx=(start[0]-end[0])/2; dy=(start[1]-end[1])/2
+        x=co*dx+si*dy; y=-si*dx+co*dy
+        val=x*x/(rx*rx)+y*y/(ry*ry)
+        if val > 1:
+            factor=math.sqrt(val);rx*=factor;ry*=factor
+        ratio=max(0,(1-x*x/(rx*rx)-y*y/(ry*ry))/(x*x/(rx*rx)+y*y/(ry*ry)+1e-100))
+        k=(-1 if bool(large)==bool(sweep) else 1)*math.sqrt(ratio)
+        cxp=k*(rx*y/ry); cyp=-k*(ry*x/rx)
+        cx=co*cxp-si*cyp+(start[0]+end[0])/2
+        cy=si*cxp+co*cyp+(start[1]+end[1])/2
+        def theta(u,v): return math.atan2(u[0]*v[1]-u[1]*v[0],u[0]*v[0]+u[1]*v[1])
+        u=((x-cxp)/rx,(y-cyp)/ry);v=((-x-cxp)/rx,(-y-cyp)/ry)
+        a1=math.atan2(u[1],u[0]); delta=theta(u,v)
+        if not sweep and delta>0:delta-=2*math.pi
+        if sweep and delta<0:delta+=2*math.pi
+        count=min(64,max(8,int(abs(delta)*max(rx,ry)/3)+1))
+        for j in range(1,count+1):
+            t=a1+delta*j/count
+            points.append((cx+rx*math.cos(t)*co-ry*math.sin(t)*si,
+                           cy+rx*math.cos(t)*si+ry*math.sin(t)*co))
+        points[-1]=end
+    args={'M':2,'L':2,'H':1,'V':1,'C':6,'S':4,'Q':4,'T':2,'A':7,'Z':0}
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd=tokens[i];i+=1
+        if cmd is None: raise ValueError('SVG path needs a command')
+        op=cmd.upper(); relative=cmd.islower()
+        if op=='Z':
+            if points:
+                outlines.append((points,True)); points=[]
+            pos=origin;last_cubic=last_quad=None;previous=op;cmd=None
+            continue
+        count=args[op]
+        if i+count>len(tokens) or any(t.isalpha() for t in tokens[i:i+count]):
+            raise ValueError('Incomplete SVG path command: '+cmd)
+        a=list(map(float,tokens[i:i+count]));i+=count
+        if any(not math.isfinite(v) for v in a): raise ValueError('Nonfinite SVG path coordinate')
+        def pt(ix=0):
+            return ((a[ix]+pos[0]) if relative else a[ix],
+                    (a[ix+1]+pos[1]) if relative else a[ix+1])
+        start=pos
+        if op=='M':
+            if points:outlines.append((points,False))
+            pos=pt();points=[pos];origin=pos
+            cmd='l' if relative else 'L'
+        elif op=='L': pos=pt();points.append(pos)
+        elif op=='H': pos=(a[0]+pos[0] if relative else a[0],pos[1]);points.append(pos)
+        elif op=='V': pos=(pos[0],a[0]+pos[1] if relative else a[0]);points.append(pos)
+        elif op=='C':
+            cp1=pt(0);cp2=pt(2);end=pt(4);curve(pos,cp1,cp2,end)
+            pos=end;last_cubic=cp2
+        elif op=='S':
+            cp1=(2*pos[0]-last_cubic[0],2*pos[1]-last_cubic[1]) if previous in ('C','S') and last_cubic else pos
+            cp2=pt(0);end=pt(2);curve(pos,cp1,cp2,end)
+            pos=end;last_cubic=cp2
+        elif op=='Q':
+            cp=pt(0);end=pt(2);quad(pos,cp,end);pos=end;last_quad=cp
+        elif op=='T':
+            cp=(2*pos[0]-last_quad[0],2*pos[1]-last_quad[1]) if previous in ('Q','T') and last_quad else pos
+            end=pt();quad(pos,cp,end);pos=end;last_quad=cp
+        elif op=='A':
+            end=pt(5);arc(pos,*a[:5],end);pos=end
+        if op not in ('C','S'):last_cubic=None
+        if op not in ('Q','T'):last_quad=None
+        previous=op
+        if len(points)>2500 or len(outlines)>400:
+            raise ValueError('SVG icon path is too complex')
+    if points:outlines.append((points,False))
+    return outlines
+
+
+def _svg_geometry(tag, attrib):
+    if tag=='path': return _svg_flatten_path(attrib.get('d',''))
+    if tag in ('polygon','polyline'):
+        a=_svg_numbers(attrib.get('points',''))
+        if len(a)%2:raise ValueError('Invalid polygon points')
+        return [([(a[i],a[i+1]) for i in range(0,len(a),2)],tag=='polygon')]
+    if tag=='line':
+        return [([(_svg_num(attrib.get('x1')),_svg_num(attrib.get('y1'))),
+                  (_svg_num(attrib.get('x2')),_svg_num(attrib.get('y2')))],False)]
+    if tag=='rect':
+        x=_svg_num(attrib.get('x'));y=_svg_num(attrib.get('y'))
+        w=_svg_num(attrib.get('width'));h=_svg_num(attrib.get('height'))
+        if w<=0 or h<=0:return []
+        rx=min(max(0,_svg_num(attrib.get('rx'))),w/2)
+        ry=min(max(0,_svg_num(attrib.get('ry'),rx)),h/2)
+        if rx<1e-6 or ry<1e-6:return [([(x,y),(x+w,y),(x+w,y+h),(x,y+h)],True)]
+        pts=[]
+        for cx,cy,start in ((x+w-rx,y+ry,-math.pi/2),(x+w-rx,y+h-ry,0),
+                            (x+rx,y+h-ry,math.pi/2),(x+rx,y+ry,math.pi)):
+            for j in range(9):
+                a=start+j*(math.pi/2)/8
+                pts.append((cx+rx*math.cos(a),cy+ry*math.sin(a)))
+        return [(pts,True)]
+    if tag in ('circle','ellipse'):
+        cx=_svg_num(attrib.get('cx'));cy=_svg_num(attrib.get('cy'))
+        rx=_svg_num(attrib.get('r') if tag=='circle' else attrib.get('rx'))
+        ry=rx if tag=='circle' else _svg_num(attrib.get('ry'))
+        if rx<=0 or ry<=0:return []
+        n=64
+        return [([(cx+rx*math.cos(math.tau*j/n),cy+ry*math.sin(math.tau*j/n))
+                  for j in range(n)],True)]
+    return []
+
+
+def _svg_styles(attrib, parent):
+    styles=parent.copy()
+    local={k:v for k,v in attrib.items() if k in ('fill','stroke','stroke-width',
+            'stroke-linecap','stroke-linejoin','opacity','fill-opacity','stroke-opacity',
+            'display','visibility','color')}
+    for item in attrib.get('style','').split(';'):
+        if ':' in item:
+            k,v=item.split(':',1);local[k.strip()]=v.strip()
+    styles.update(local)
+    return styles
+
+
+def _svg_read(path, ink):
+    path=Path(path)
+    if not path.is_file() or not 0<path.stat().st_size<=2*1024*1024:
+        raise ValueError('SVG must be smaller than 2 MiB')
+    data=path.read_bytes()
+    if any(word in data.lower() for word in (b'<!doctype',b'<!entity',b'<script',b'<foreignobject')):
+        raise ValueError('SVG contains unsupported embedded content')
+    try: root=ET.fromstring(data)
+    except ET.ParseError as e:raise ValueError('Invalid SVG XML: '+str(e)) from e
+    if root.tag.split('}')[-1] != 'svg': raise ValueError('Selected file is not an SVG image')
+    view=root.attrib.get('viewBox') or root.attrib.get('viewbox')
+    if view:
+        nums=_svg_numbers(view)
+        if len(nums)!=4:raise ValueError('Invalid SVG viewBox')
+        minx,miny,width,height=nums
+    else:
+        minx=miny=0.;width=_svg_num(root.attrib.get('width'),24)
+        height=_svg_num(root.attrib.get('height'),24)
+    if not 0 < width <= 100000 or not 0 < height <= 100000:
+        raise ValueError('Invalid SVG viewBox dimensions')
+    shapes=[]
+    ignored={'title','desc','metadata'}
+    def visit(node, matrix, style, depth):
+        if depth>30 or len(shapes)>400:raise ValueError('SVG is too complex')
+        tag=node.tag.split('}')[-1]
+        if tag in ignored:return
+        if tag not in _SVG_SUPPORTED:
+            raise ValueError('Unsupported SVG element <'+tag+'>')
+        newstyle=_svg_styles(node.attrib,style)
+        if newstyle.get('display')=='none' or newstyle.get('visibility')=='hidden':return
+        matrix=_svg_matrix_mul(matrix,_svg_transform(node.attrib.get('transform')))
+        if tag not in ('svg','g'):
+            geom=_svg_geometry(tag,node.attrib)
+            if geom:
+                ink_for_shape = newstyle.get('color',ink)
+                fill=_svg_color(newstyle.get('fill','black'),ink_for_shape)
+                stroke=_svg_color(newstyle.get('stroke','none'),ink_for_shape)
+                opacity=max(0,min(1,_svg_num(newstyle.get('opacity'),1)))
+                fa=opacity*max(0,min(1,_svg_num(newstyle.get('fill-opacity'),1)))
+                sa=opacity*max(0,min(1,_svg_num(newstyle.get('stroke-opacity'),1)))
+                sw=max(0,min(200,_svg_num(newstyle.get('stroke-width'),1)))
+                if fill is not None or stroke is not None:
+                    shapes.append((geom,matrix,fill,stroke,fa,sa,sw))
+        for child in node:visit(child,matrix,newstyle,depth+1)
+    visit(root,(1,0,0,1,0,0),{},0)
+    return (minx,miny,width,height),shapes
+
+
+def sequent_svg_png(path, size, ink='#edf1f6'):
+    """Render common SVG icon paths to transparent PNG bytes, without packages.
+
+    Supports paths (including cubic/quadratic curves and arcs), standard shapes,
+    currentColor, and affine transforms. Not a full browser SVG implementation.
+    Unsupported advanced SVG elements fail clearly instead of rendering incorrectly.
+    """
+    size=int(size)
+    if not 1 <= size <= 128:raise ValueError('Invalid SVG icon size')
+    (vx,vy,vw,vh),shapes=_svg_read(path,ink)
+    pixels=bytearray(size*size*4)
+    scale=min((size-2)/vw,(size-2)/vh) if size>2 else min(size/vw,size/vh)
+    left=(size-vw*scale)/2;top=(size-vh*scale)/2
+    root=(scale,0,0,scale,left-vx*scale,top-vy*scale)
+    def alpha_blend(offset,col,cover):
+        if col is None or cover<=0:return
+        a=max(0,min(255,int(cover*255+0.5)))
+        if not a:return
+        old=pixels[offset+3];old_weight=old*(255-a)//255;combined=a+old_weight
+        if not combined:return
+        for k in range(3):
+            pixels[offset+k]=(col[k]*a+pixels[offset+k]*old_weight)//combined
+        pixels[offset+3]=combined
+    for geom,matrix,fill,stroke,fa,sa,sw in shapes:
+        m=_svg_matrix_mul(root,matrix)
+        paths=[([(m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]) for x,y in points],closed)
+               for points,closed in geom if points]
+        if not paths:continue
+        stroke_width=sw*math.sqrt((m[0]*m[0]+m[1]*m[1]+m[2]*m[2]+m[3]*m[3])/2)
+        bounds=[p for pp,_ in paths for p in pp]
+        buffer=stroke_width/2+1
+        x0=max(0,int(math.floor(min(p[0] for p in bounds)-buffer)))
+        x1=min(size,int(math.ceil(max(p[0] for p in bounds)+buffer)))
+        y0=max(0,int(math.floor(min(p[1] for p in bounds)-buffer)))
+        y1=min(size,int(math.ceil(max(p[1] for p in bounds)+buffer)))
+        segments=[]
+        for pp,closed in paths:
+            segments.extend([(pp[j],pp[j+1]) for j in range(len(pp)-1)])
+            if closed and len(pp)>1:segments.append((pp[-1],pp[0]))
+        for yy in range(y0,y1):
+            for xx in range(x0,x1):
+                nfill=nstroke=0
+                for sy in (.25,.75):
+                    for sx in (.25,.75):
+                        px=xx+sx;py=yy+sy
+                        if fill is not None:
+                            inside=False
+                            for pp,_ in paths:
+                                for j in range(len(pp)):
+                                    ax,ay=pp[j-1];bx,by=pp[j]
+                                    if (ay>py)!=(by>py) and px < (bx-ax)*(py-ay)/(by-ay)+ax:
+                                        inside=not inside
+                            if inside:nfill+=1
+                        if stroke is not None and stroke_width>0:
+                            r2=(stroke_width/2)**2
+                            for (ax,ay),(bx,by) in segments:
+                                dx=bx-ax;dy=by-ay;dd=dx*dx+dy*dy
+                                if dd>0:
+                                    t=max(0,min(1,((px-ax)*dx+(py-ay)*dy)/dd))
+                                    qx=ax+t*dx;qy=ay+t*dy
+                                else:qx,qy=ax,ay
+                                if (px-qx)**2+(py-qy)**2 <=r2:
+                                    nstroke+=1;break
+                index=(yy*size+xx)*4
+                if nfill:alpha_blend(index,fill,fa*nfill/4)
+                if nstroke:alpha_blend(index,stroke,sa*nstroke/4)
+    rows=b''.join(b'\x00'+pixels[y*size*4:(y+1)*size*4] for y in range(size))
+    def chunk(tag,payload):
+        return struct.pack('>I',len(payload))+tag+payload+struct.pack('>I',zlib.crc32(tag+payload)&0xffffffff)
+    return (b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',size,size,8,6,0,0,0))+
+            chunk(b'IDAT',zlib.compress(rows,6))+chunk(b'IEND',b''))
+
+
+# --- Optional image-backed icon overrides (standard-library Tk PhotoImage) ---
+# Put transparent PNG icons in assets/icons, or set SEQUENT_ICON_DIR to test a
+# different folder. All buttons continue using SequentIcon, with the existing
+# vector drawings as fallbacks. Only Tk's UI thread creates PhotoImages.
+_SEQUENT_ICON_IMAGES = {}
+_SEQUENT_ICON_MAP_STATE = (None, None, {})
+
+
+def sequent_icon_directory():
+    override = os.environ.get('SEQUENT_ICON_DIR', '').strip().strip('"')
+    return Path(override).expanduser() if override else (
+        Path(__file__).resolve().parent / 'assets' / 'icons')
+
+
+def sequent_icon_map():
+    """Read filename aliases, refreshing when the JSON mapping changes."""
+    global _SEQUENT_ICON_MAP_STATE
+    folder = sequent_icon_directory()
+    manifest = folder / 'icon_map.json'
+    try:
+        stamp = manifest.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = (str(manifest), stamp)
+    if _SEQUENT_ICON_MAP_STATE[:2] != key:
+        mappings = {}
+        if stamp is not None:
+            try:
+                with manifest.open('r', encoding='utf-8') as stream:
+                    content = json.load(stream)
+                if isinstance(content, dict):
+                    mappings = content
+            except (OSError, ValueError, UnicodeError) as exc:
+                print(f'[Sequent] Invalid icon_map.json; using built-in icons: {exc}')
+        _SEQUENT_ICON_MAP_STATE = (*key, mappings)
+    return _SEQUENT_ICON_MAP_STATE[2]
+
+
+def sequent_icon_path(name):
+    """Resolve an icon by semantic name, confined to the configured folder."""
+    if not name or not isinstance(name, str):
+        return None
+    folder = sequent_icon_directory()
+    mapped = sequent_icon_map().get(name)
+    if isinstance(mapped, dict):
+        # Image files cannot be recolored by Tk as Canvas vectors can, so
+        # optionally select a theme-specific file at render time.
+        is_light = False
+        try:
+            rgb = [int(BG_APP[i:i+2], 16) for i in (1, 3, 5)]
+            is_light = sum(rgb) > 3 * 128
+        except (ValueError, TypeError):
+            pass
+        mapped = mapped.get('light' if is_light else 'dark', mapped.get('default'))
+    candidates = [mapped] if isinstance(mapped, str) and mapped else []
+    candidates.extend((name + '.svg', name + '.png', name + '.gif'))
+    for filename in candidates:
+        if not filename.lower().endswith(('.svg', '.png', '.gif')):
+            continue  # SVG uses Sequent's built-in icon renderer.
+        try:
+            path = (folder / filename).resolve()
+            if os.path.commonpath((str(folder.resolve()), str(path))) != str(folder.resolve()):
+                continue
+            if path.is_file():
+                return path
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def sequent_image_icon(master, name, size, override_key=None, ink=None):
+    """Look for an individual icon slot first, then its generic vector name."""
+    path = (sequent_icon_path(override_key) if override_key else None) or sequent_icon_path(name)
+    if path is None:
+        return None
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if path.suffix.casefold() == '.svg':
+        # Tk button foregrounds can be system color names, e.g. SystemButtonText.
+        # Convert them to standard RGB so SVG currentColor works in both themes.
+        try:
+            r, g, b = master.winfo_rgb(ink or TEXT_PRIMARY)
+            ink = '#{:02x}{:02x}{:02x}'.format(r >> 8, g >> 8, b >> 8)
+        except (tk.TclError, ValueError, TypeError):
+            ink = TEXT_PRIMARY
+    key = (id(master.tk), str(path), stamp, int(size),
+           (str(ink).lower() if path.suffix.casefold() == '.svg' else ''))
+    if key in _SEQUENT_ICON_IMAGES:
+        return _SEQUENT_ICON_IMAGES[key]
+    try:
+        if path.suffix.casefold() == '.svg':
+            png = sequent_svg_png(path, int(size), ink or TEXT_PRIMARY)
+            image = tk.PhotoImage(master=master, data=base64.b64encode(png).decode('ascii'))
+            for old in list(_SEQUENT_ICON_IMAGES):
+                if old[0] == key[0] and old[1] == key[1] and old[3:] == key[3:]:
+                    del _SEQUENT_ICON_IMAGES[old]
+            _SEQUENT_ICON_IMAGES[key] = image
+            return image
+        source = tk.PhotoImage(master=master, file=str(path))
+        original_w, original_h = source.width(), source.height()
+        if original_w <= 0 or original_h <= 0:
+            return None
+        # Reduce very large sources before the integer-only Tk zoom/subsample.
+        reduction = max(1, (max(original_w, original_h) + size * 2 - 1) // (size * 2))
+        if reduction > 1:
+            source = source.subsample(reduction)
+        w, h = source.width(), source.height()
+        ratio = float(size) / max(w, h)
+        target_w = max(1, min(size, round(w * ratio)))
+        target_h = max(1, min(size, round(h * ratio)))
+        if (w, h) != (target_w, target_h):
+            gx = math.gcd(w, target_w)
+            gy = math.gcd(h, target_h)
+            image = source.zoom(target_w // gx, target_h // gy).subsample(
+                w // gx, h // gy)
+        else:
+            image = source
+        # Evict superseded revisions of the same icon after a file edit.
+        for old in list(_SEQUENT_ICON_IMAGES):
+            if old[0] == key[0] and old[1] == key[1] and old[3:] == key[3:]:
+                del _SEQUENT_ICON_IMAGES[old]
+        _SEQUENT_ICON_IMAGES[key] = image
+        return image
+    except (tk.TclError, OSError, ValueError) as exc:
+        print(f'[Sequent] Could not read custom icon {path.name!r}: {exc}')
+        return None
+
+
+def sequent_assign_icon(slot, source):
+    """Copy a local PNG/GIF/SVG into the icon folder and bind the icon slot."""
+    import shutil
+    source = Path(source)
+    if source.suffix.casefold() not in ('.png', '.gif', '.svg'):
+        raise ValueError('Choose an SVG, PNG, or GIF image.')
+    if source.suffix.casefold() == '.svg':
+        _svg_read(source, TEXT_PRIMARY)
+    if not source.is_file() or source.stat().st_size > 10 * 1024 * 1024:
+        raise ValueError('Image missing or larger than 10 MiB.')
+    # Validate with Tk's decoder before persisting a mapping: prevents a broken icon.
+    # The caller is always on the UI thread. File contents are never executed.
+    folder = sequent_icon_directory()
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / (sequent_icon_slug(slot) + source.suffix.casefold())
+    if source.resolve() != dest.resolve():
+        shutil.copyfile(source, dest)
+    manifest = folder / 'icon_map.json'
+    mapping = sequent_icon_map().copy()
+    mapping[slot] = dest.name
+    temp = manifest.with_suffix('.tmp')
+    try:
+        temp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(temp, manifest)
+    finally:
+        try: temp.unlink(missing_ok=True)
+        except OSError: pass
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    return dest
+
+
+
+# --- Portable icon library and folder browser ---
+# Browse artwork from any directory, but keep all assigned images inside
+# assets/icons (or SEQUENT_ICON_DIR). Never store personal absolute paths.
+SEQUENT_ICON_EXTENSIONS = ('.png', '.gif', '.svg')
+SEQUENT_ICON_MAX_BYTES = 10 * 1024 * 1024
+
+
+def sequent_icon_library_files(directory):
+    """Return the supported, non-hidden icon files in a folder (and subfolders)."""
+    directory = Path(directory).expanduser()
+    if not directory.is_dir():
+        return []
+    result = []
+    for path in directory.rglob('*'):
+        if any(part.startswith('.') for part in path.relative_to(directory).parts):
+            continue
+        try:
+            if (path.suffix.casefold() in SEQUENT_ICON_EXTENSIONS and
+                    path.is_file() and not path.is_symlink() and
+                    0 < path.stat().st_size <= SEQUENT_ICON_MAX_BYTES):
+                result.append(path)
+        except OSError:
+            continue
+    return sorted(result, key=lambda p: str(p.relative_to(directory)).casefold())
+
+
+def sequent_import_icon_file(source):
+    """Copy external artwork into the project icon library with a stable name.
+
+    If the file is already inside assets/icons, keep its relative path. Imported
+    files use a content hash so identical icons do not create duplicate files,
+    while distinct images with the same original name cannot overwrite each other.
+    """
+    import shutil
+    source = Path(source).expanduser().resolve()
+    if (source.suffix.casefold() not in SEQUENT_ICON_EXTENSIONS or
+            not source.is_file() or source.stat().st_size <= 0 or
+            source.stat().st_size > SEQUENT_ICON_MAX_BYTES):
+        raise ValueError('Choose an SVG, PNG, or GIF smaller than 10 MiB.')
+    if source.suffix.casefold() == '.svg':
+        _svg_read(source, TEXT_PRIMARY)  # Validate XML/geometry before importing.
+    folder = sequent_icon_directory().resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        source.relative_to(folder)
+        return source
+    except ValueError:
+        pass
+    digest = hashlib.sha256()
+    with source.open('rb') as stream:
+        for block in iter(lambda: stream.read(65536), b''):
+            digest.update(block)
+    filename = (sequent_icon_slug(source.stem)[:50] + '-' +
+                digest.hexdigest()[:16] + source.suffix.casefold())
+    dest = folder / 'imported' / filename
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.is_file():
+        # Copy into a temporary name before publishing the file to the library.
+        temp = dest.with_name(dest.name + '.' + uuid.uuid4().hex + '.tmp')
+        try:
+            shutil.copyfile(source, temp)
+            os.replace(temp, dest)
+        finally:
+            try: temp.unlink(missing_ok=True)
+            except OSError: pass
+    return dest
+
+
+def sequent_assign_library_icon(slot, source):
+    """Bind a slot to portable project-relative artwork, not an absolute path."""
+    if slot not in sequent_icon_catalog():
+        raise ValueError('Unknown Sequent icon slot')
+    dest = sequent_import_icon_file(source)
+    folder = sequent_icon_directory().resolve()
+    relative = dest.relative_to(folder).as_posix()
+    manifest = folder / 'icon_map.json'
+    mapping = sequent_icon_map().copy()
+    mapping[slot] = relative
+    temp = manifest.with_name('icon_map.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + '\n',
+                        encoding='utf-8')
+        os.replace(temp, manifest)
+    finally:
+        try: temp.unlink(missing_ok=True)
+        except OSError: pass
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    return dest
+
+
+def sequent_import_icon_folder(source_directory):
+    """Stage all image assets from a folder inside assets/icons for GitHub shipping."""
+    paths = sequent_icon_library_files(source_directory)
+    imported = 0
+    folder = sequent_icon_directory().resolve()
+    for path in paths:
+        try:
+            path.resolve().relative_to(folder)
+            continue  # Already packaged in the repository.
+        except ValueError:
+            pass
+        dest = sequent_import_icon_file(path)
+        if dest.is_file():
+            imported += 1
+    return imported, len(paths)
+
+
+def sequent_icon_thumbnail(master, path, max_size=52):
+    """Render PNG/GIF or dependency-free SVG thumbnail for the Icon Manager."""
+    path = Path(path)
+    if path.suffix.casefold() == '.svg':
+        png = sequent_svg_png(path, min(128, int(max_size)), TEXT_PRIMARY)
+        return tk.PhotoImage(master=master, data=base64.b64encode(png).decode('ascii'))
+    image = tk.PhotoImage(master=master, file=str(path))
+    if image.width() < 1 or image.height() < 1:
+        raise ValueError('Icon has invalid dimensions')
+    reduce_by = max(1, math.ceil(max(image.width(), image.height()) / max_size))
+    return image.subsample(reduce_by) if reduce_by > 1 else image
+
+
+def sequent_reload_icons(root):
+    """Reload icon aliases and repaint every existing icon on the Tk UI thread."""
+    global _SEQUENT_ICON_MAP_STATE
+    _SEQUENT_ICON_MAP_STATE = (None, None, {})
+    _SEQUENT_ICON_IMAGES.clear()
+    updated = 0
+    pending = [root]
+    while pending:
+        widget = pending.pop()
+        try:
+            pending.extend(widget.winfo_children())
+        except tk.TclError:
+            continue
+        if isinstance(widget, SequentIcon):
+            widget.paint()
+            updated += 1
+        elif isinstance(widget, tk.Button) and hasattr(widget, '_sequent_icon_slot'):
+            sequent_style_native_button(widget, widget._sequent_icon_label,
+                                        widget._sequent_icon_fallback)
+    return updated
+
+
+# --- Compact header identity (original SEQUENT lettering + accent marker) ---
+# Keep the full SEQUENT / MACRO ENGINE asset for splash screens and documentation.
+# The toolbar uses only the large lettering, so it stays readable when compact.
+SEQUENT_COMPACT_WORDMARK_WIDTH = 200
+SEQUENT_COMPACT_WORDMARK_HEIGHT = 20
+
+
+def sequent_compact_brand_png(ink="#FFFFFF", asset_path=None):
+    """Recolor the original SEQUENT-only alpha mask to the current theme ink.
+
+    This is a plain PNG encoder using stdlib; no Pillow, SVG renderer or other
+    third-party package is needed by the running application.
+    """
+    mask_path = (asset_path if asset_path is not None else
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "assets", "branding", "sequent_compact.mask"))
+    with open(mask_path, "rb") as stream:
+        packed = stream.read(200000)
+    if not packed.startswith(b"SQCOMPACT1") or len(packed) < 14:
+        raise ValueError("Invalid compact Sequent brand mask")
+    width, height = struct.unpack(">HH", packed[10:14])
+    if not (0 < width <= 1024 and 0 < height <= 128):
+        raise ValueError("Invalid compact Sequent brand dimensions")
+    alpha = zlib.decompress(packed[14:])
+    if len(alpha) != width * height:
+        raise ValueError("Corrupted compact Sequent brand mask")
+    red, green, blue = bytes.fromhex(normalize_accent_color(ink)[1:])
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # PNG filter None
+        for opacity in alpha[y * width:(y + 1) * width]:
+            rows.extend((red, green, blue, opacity))
+
+    def chunk(kind, contents):
+        return (struct.pack(">I", len(contents)) + kind + contents +
+                struct.pack(">I", zlib.crc32(kind + contents) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
+                                        8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+            chunk(b"IEND", b""))
+
+
+def sequent_compact_brand_photoimage(master, ink="#FFFFFF"):
+    """Create compact wordmark using Tk's PNG support; retain ref in caller."""
+    data = sequent_compact_brand_png(ink)
+    return tk.PhotoImage(master=master,
+                         data=base64.b64encode(data).decode("ascii"), format="png")
+
+
+# --- Sequent wordmark: exact artwork, independently recolorable subtitle ---
+def sequent_brand_png(accent, title_ink="#FFFFFF", asset_path=None):
+    """Recolor the original two-layer logo without Pillow or SVG dependencies.
+
+    Artwork is packaged as a compressed pair of alpha masks. The wordmark is
+    recolored with the current theme text color; only its subtitle takes the
+    user's accent. Returned data is a standard transparent PNG for Tk 8.6+.
+    """
+    mask_path = (asset_path if asset_path is not None else
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "assets", "branding", "sequent_wordmark.mask"))
+    with open(mask_path, "rb") as handle:
+        packed = handle.read(200000)
+    if not packed.startswith(b"SQBRAND1") or len(packed) < 13:
+        raise ValueError("Invalid Sequent brand mask")
+    width, height = struct.unpack(">HH", packed[8:12])
+    if not 0 < width <= 1024 or not 0 < height <= 128:
+        raise ValueError("Invalid Sequent brand dimensions")
+    mask_pair = zlib.decompress(packed[12:])
+    count = width * height
+    if len(mask_pair) != 2 * count:
+        raise ValueError("Corrupted Sequent brand mask")
+    title = bytes.fromhex(normalize_accent_color(title_ink)[1:])
+    secondary = bytes.fromhex(normalize_accent_color(accent)[1:])
+    title_mask = memoryview(mask_pair)[:count]
+    subtitle_mask = memoryview(mask_pair)[count:]
+
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # PNG filter type None.
+        for x in range(width):
+            i = y * width + x
+            ta, sa = title_mask[i], subtitle_mask[i]
+            if sa > ta:
+                rows.extend((*secondary, sa))
+            else:
+                rows.extend((*title, ta))
+
+    def png_chunk(kind, data):
+        return (struct.pack('>I', len(data)) + kind + data +
+                struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            png_chunk(b"IHDR", struct.pack('>IIBBBBB', width, height,
+                                          8, 6, 0, 0, 0)) +
+            png_chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+            png_chunk(b"IEND", b""))
+
+
+def sequent_brand_photoimage(master, accent, title_ink="#FFFFFF"):
+    """Create theme-colored Tk artwork; caller retains the PhotoImage ref."""
+    data = sequent_brand_png(accent, title_ink)
+    return tk.PhotoImage(master=master, data=base64.b64encode(data).decode('ascii'),
+                         format='png')
 
 
 class SequentIcon(tk.Canvas):
     """An antialias-independent 20px vector icon, redrawn for hover/theme colors."""
-    def __init__(self, parent, name, color=TEXT_PRIMARY, bg=BG_INPUT, size=19):
+    def __init__(self, parent, name, color=TEXT_PRIMARY, bg=BG_INPUT, size=19,
+                 override_key=None, slot_label=None):
         self.size = size
+        self.override_key = override_key
+        if override_key:
+            sequent_register_icon_slot(override_key, slot_label or override_key, name)
         super().__init__(parent, width=size, height=size, bg=bg, bd=0,
                          highlightthickness=0, takefocus=0, cursor='hand2')
         self.name = name
         self.ink = color
+        self._external_image = None
         self.paint(bg=bg, color=color)
 
     def paint(self, bg=None, color=None, name=None):
@@ -1567,6 +2465,12 @@ class SequentIcon(tk.Canvas):
         if color is not None: self.ink = color
         if name is not None: self.name = name
         self.delete('all')
+        self._external_image = sequent_image_icon(
+            self, self.name, self.size, override_key=self.override_key, ink=self.ink)
+        if self._external_image is not None:
+            self.create_image(self.size // 2, self.size // 2,
+                              image=self._external_image, anchor=tk.CENTER)
+            return
         c = self.ink
         s = self.size / 20.0
         def xy(*v): return [q*s for q in v]
@@ -1587,10 +2491,11 @@ class SequentIcon(tk.Canvas):
         elif n == 'record': oval(5,5,15,15,fill=c)
         elif n == 'pause':
             box(5,4,8,16,fill=c); box(12,4,15,16,fill=c)
-        elif n in ('forward','back','first'):
+        elif n in ('forward','back','first','last'):
             if n == 'back': polygon(15,4,5,10,15,16)
             elif n == 'forward': polygon(5,4,15,10,5,16)
-            else: polygon(16,4,7,10,16,16); line(4,4,4,16)
+            elif n == 'first': polygon(16,4,7,10,16,16); line(4,4,4,16)
+            else: polygon(4,4,13,10,4,16); line(16,4,16,16)
         elif n == 'step':
             line(13,4,13,16); polygon(5,5,12,10,5,15)
         elif n == 'menu':
@@ -1637,6 +2542,18 @@ class SequentIcon(tk.Canvas):
             box(3,3,17,17); box(6,3,13,8); box(6,11,14,17)
         elif n == 'folder':
             polygon(3,5,8,5,10,7,17,7,17,16,3,16)
+        elif n in ('star', 'star-filled'):
+            # First-party Canvas geometry: same scalable vector style as the
+            # rest of Sequent, rather than an emoji or external icon font.
+            points = []
+            for i in range(10):
+                angle = -math.pi / 2 + i * math.pi / 5
+                radius = 8 if i % 2 == 0 else 3.7
+                points.extend((10 + radius * math.cos(angle),
+                               10 + radius * math.sin(angle)))
+            self.create_polygon(*xy(*points),
+                                fill=c if n == 'star-filled' else self.cget('bg'),
+                                outline=c, width=1.7*s, joinstyle=tk.ROUND)
         elif n == 'edit':
             line(4,16,7,16,16,7,13,4,4,13,4,16)
             line(11,6,14,9)
@@ -1667,6 +2584,48 @@ class SequentIcon(tk.Canvas):
                              font=('Segoe UI',round(12*s),'bold'))
         elif n == 'clock':
             oval(3,3,17,17); line(10,6,10,10,13,12)
+        elif n in ('variable', 'code'):
+            line(7,3,4,3,4,17,7,17); line(13,3,16,3,16,17,13,17)
+            line(8,8,12,8); line(8,12,12,12)
+        elif n == 'clipboard':
+            box(4,5,16,18); box(7,2,13,6); line(7,10,13,10); line(7,14,13,14)
+        elif n == 'image':
+            box(2,3,18,17); oval(12,5,15,8)
+            line(3,16,8,10,11,13,14,10,18,16)
+        elif n == 'text':
+            line(3,5,17,5); line(10,5,10,16); line(6,16,14,16)
+        elif n == 'file':
+            polygon(4,2,12,2,17,7,17,18,4,18)
+            line(12,2,12,7,17,7); line(7,11,14,11); line(7,14,14,14)
+        elif n == 'copy':
+            box(7,5,18,18); line(4,14,2,14,2,2,13,2,13,4)
+        elif n == 'paste':
+            box(4,5,16,18); box(7,2,13,6); line(9,11,12,11); line(9,14,13,14)
+        elif n == 'branch':
+            oval(2,3,6,7); oval(14,3,18,7); oval(8,14,12,18)
+            line(4,7,4,10,10,10,10,14); line(16,7,16,10,10,10)
+        elif n == 'loop':
+            self.create_arc(*xy(3,3,17,17), start=30, extent=290,
+                            style='arc', outline=c, width=2*s)
+            polygon(12,2,18,5,12,8)
+        elif n == 'history':
+            self.create_arc(*xy(3,3,17,17), start=30, extent=280,
+                            style='arc', outline=c, width=2*s)
+            line(10,5,10,10,14,12); polygon(2,4,5,9,8,4)
+        elif n == 'timeline':
+            line(4,2,4,18); line(4,5,16,5); line(4,10,13,10); line(4,15,18,15)
+            for px,py in ((4,5),(4,10),(4,15)): oval(px-1,py-1,px+1,py+1,fill=c)
+        elif n == 'drag':
+            line(10,2,10,18); line(2,10,18,10)
+            polygon(10,1,7,5,13,5); polygon(10,19,7,15,13,15)
+            polygon(1,10,5,7,5,13); polygon(19,10,15,7,15,13)
+        elif n in ('up', 'down'):
+            if n == 'up': line(4,13,10,7,16,13)
+            else: line(4,7,10,13,16,7)
+        elif n == 'keyboard':
+            box(2,5,18,15); line(4,8,16,8); line(4,11,16,11)
+        elif n == 'list':
+            for yy in (5,10,15): oval(3,yy-1,5,yy+1,fill=c); line(7,yy,17,yy)
         else: box(4,4,16,16)
 
 
@@ -1687,7 +2646,8 @@ class SequentCaptionLabel(tk.Label):
 
 class SequentToolbarButton(tk.Frame):
     """Compact icon/text toolbar button; keeps .config(text=...) compatibility."""
-    def __init__(self, parent, text, command, accent=False, icon=None):
+    def __init__(self, parent, text, command, accent=False, icon=None,
+                 icon_slot=None):
         base = COLOR_ACCENT if accent else BG_INPUT
         super().__init__(parent, bg=base, cursor='hand2',
                          highlightbackground=BG_BORDER, highlightthickness=0 if accent else 1)
@@ -1695,15 +2655,35 @@ class SequentToolbarButton(tk.Frame):
         self.base = base
         self.hover = COLOR_ACCENT_HOV if accent else BG_HOVER
         self.fg = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
-        self.name = icon or sequent_icon_for_caption(text)
-        self.icon = SequentIcon(self, self.name, color=self.fg, bg=base, size=17) if self.name else None
-        if self.icon is not None: self.icon.pack(side=tk.LEFT, padx=(7,3))
+        self.name = icon or sequent_icon_for_caption(text) or 'list'
+        # Explicit slots distinguish icon-only controls sharing a blank label.
+        self._explicit_icon_slot = icon_slot
+        self.icon_slot = icon_slot or sequent_icon_slot('button', text)
+        sequent_register_icon_slot(self.icon_slot, text or icon_slot or '', self.name)
+        self.icon = SequentIcon(self, self.name, color=self.fg, bg=base, size=17,
+                                override_key=self.icon_slot, slot_label=text)
         label_text = sequent_clean_caption(text)
         self.label = tk.Label(self, text=label_text, bg=base, fg=self.fg,
                               font=('Segoe UI',9,'bold'), cursor='hand2',
                               padx=5 if self.name else 11, pady=6)
-        self.label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Icon-only transport controls were previously offset by an empty,
+        # packed label. A fixed square with a centered Canvas ensures that
+        # custom SVG/PNG artwork is visually centered in its clickable box.
+        self._icon_only = not label_text.strip()
+        self._layout_contents()
         self._attach_events()
+
+    def _layout_contents(self):
+        self.icon.pack_forget()
+        self.label.pack_forget()
+        if self._icon_only:
+            self.pack_propagate(False)
+            tk.Frame.configure(self, width=36, height=34)
+            self.icon.pack(expand=True, anchor=tk.CENTER)
+        else:
+            self.pack_propagate(True)
+            self.icon.pack(side=tk.LEFT, padx=(7, 3))
+            self.label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     def _attach_events(self):
         for widget in (self, self.label, self.icon):
@@ -1736,20 +2716,362 @@ class SequentToolbarButton(tk.Frame):
         data.update(kw)
         if 'text' in data:
             caption = data.pop('text')
-            self.label.config(text=sequent_clean_caption(caption))
-            icon_name = sequent_icon_for_caption(caption)
-            if icon_name:
-                if self.icon is None:
-                    self.icon = SequentIcon(self, icon_name, color=self.fg, bg=self.base, size=17)
-                    self.icon.pack(side=tk.LEFT, before=self.label, padx=(7,3))
-                    self._attach_events()
-                else: self.icon.paint(name=icon_name)
+            clean_caption = sequent_clean_caption(caption)
+            self.label.config(text=clean_caption)
+            icon_only = not clean_caption.strip()
+            if icon_only != self._icon_only:
+                self._icon_only = icon_only
+                self._layout_contents()
+            icon_name = (self.name if self._explicit_icon_slot else
+                         (sequent_icon_for_caption(caption) or 'list'))
+            self.icon_slot = (self._explicit_icon_slot or
+                              sequent_icon_slot('button', caption))
+            sequent_register_icon_slot(self.icon_slot, caption or self.icon_slot,
+                                       icon_name)
+            self.icon.override_key = self.icon_slot
+            self.icon.paint(name=icon_name)
         return super().configure(cnf if not isinstance(cnf, dict) else None, **data)
     config = configure
 
 
-def sequent_toolbar_button(parent, text, command, accent=False, icon=None):
-    return SequentToolbarButton(parent, text, command, accent=accent, icon=icon)
+
+class SequentAnimatedPillBar(tk.Canvas):
+    """Animated grouped actions built from Tk Canvas and SequentIcon only.
+
+    items: (icon_slot, caption, callback, tooltip, fallback_icon). The existing
+    Icon Manager resolves each slot, including all four transport slots.  An
+    active highlight is *momentary*, not a selected tab: it slides from the
+    previous action, lingers, and fades. Fast subsequent clicks interrupt the
+    previous animation without losing commands. No Python dependencies.
+    """
+    HEIGHT = 42
+    INSET = 5
+    GAP = 3
+    FRAME_MS = 16
+    SLIDE_MS = 205
+    HOLD_MS = 380
+    FADE_MS = 260
+    HOVER_MS = 120
+
+    def __init__(self, parent, items, *, icon_only=False, accent_getter=None,
+                 min_width=None, background=None):
+        if not items:
+            raise ValueError('Pill bar needs at least one action')
+        self.items = list(items)
+        self.icon_only = bool(icon_only)
+        self.accent_getter = accent_getter or (lambda: COLOR_ACCENT)
+        self.surface = BG_INPUT
+        self.outer = background or BG_PANEL
+        self._segment_widths = []
+        caption_font = tkfont.Font(root=parent, family='Segoe UI', size=9, weight='bold')
+        for _slot, caption, _cb, _tip, _fallback in self.items:
+            if self.icon_only:
+                width = 42
+            else:
+                # Natural widths for short command captions; reserve space for
+                # the embedded user-customizable Icon Manager artwork.
+                width = max(78, 35 + caption_font.measure(caption) + 12)
+            self._segment_widths.append(width)
+        self.width = (2*self.INSET + sum(self._segment_widths)
+                      + self.GAP * (len(self.items)-1))
+        if min_width is not None:
+            self.width = max(self.width, int(min_width))
+        super().__init__(parent, width=self.width, height=self.HEIGHT,
+                         bg=self.outer, highlightthickness=0, bd=0,
+                         takefocus=1, cursor='hand2')
+        self._bounds = []
+        current = self.INSET
+        for width in self._segment_widths:
+            self._bounds.append((current, current + width))
+            current += width + self.GAP
+        self.icons = []
+        self._icon_images = []
+        for i,(slot,caption,callback,tooltip,fallback) in enumerate(self.items):
+            sequent_register_icon_slot(slot, caption or tooltip or slot, fallback)
+            glyph = SequentIcon(self, fallback, bg=self.surface,
+                                color=TEXT_PRIMARY, size=17,
+                                override_key=slot, slot_label=caption or tooltip)
+            self.icons.append(glyph)
+            x1,x2 = self._bounds[i]
+            icx = (x1+x2)//2 if icon_only else x1 + 16
+            glyph.place(x=icx, y=self.HEIGHT//2, anchor='center')
+            glyph.bind('<Button-1>', lambda event, idx=i: self.activate(idx), add='+')
+            glyph.bind('<Enter>', lambda event, idx=i: self._enter_segment(idx), add='+')
+            glyph.bind('<Leave>', lambda event: self._on_leave(), add='+')
+        self._anim_id = None
+        self._hover_anim_id = None
+        self._hover_strengths = [0.0] * len(self.items)
+        self._leave_job = None
+        self._start_visibility = 0.0
+        self._generation = 0
+        self._start_time = 0.0
+        self._origin_x = None
+        self._current_x = None
+        self._selected = None
+        self._last_selection_x = None
+        self._visibility = 0.0
+        self._hover = None
+        self._keyboard_index = 0
+        self._anim_trace = []
+        self.tooltip = None
+        # Construct after children so the existing tooltip system follows icon
+        # canvases. Text and shortcuts are changed by segment on hover.
+        self.tooltip = ModernTooltip(self, self.items[0][3], delay_ms=400)
+        self.bind('<Motion>', self._on_motion, add='+')
+        self.bind('<Leave>', self._on_leave, add='+')
+        self.bind('<Button-1>', self._on_press, add='+')
+        self.bind('<Left>', lambda e: self._keyboard_move(-1), add='+')
+        self.bind('<Right>', lambda e: self._keyboard_move(1), add='+')
+        self.bind('<Return>', self._keyboard_activate, add='+')
+        self.bind('<space>', self._keyboard_activate, add='+')
+        self.bind('<Destroy>', self._on_destroy, add='+')
+        self._render()
+
+    @staticmethod
+    def _capsule(canvas, x1, y1, x2, y2, fill, tag):
+        """Native antialias-friendly rounded capsule without image libraries."""
+        radius = min((y2-y1)/2, (x2-x1)/2)
+        if radius <= 0:
+            return
+        canvas.create_rectangle(x1+radius, y1, x2-radius, y2,
+                                fill=fill, outline='', tags=tag)
+        canvas.create_oval(x1, y1, x1+2*radius, y2,
+                           fill=fill, outline='', tags=tag)
+        canvas.create_oval(x2-2*radius, y1, x2, y2,
+                           fill=fill, outline='', tags=tag)
+
+    def _at(self, x):
+        for i,(a,b) in enumerate(self._bounds):
+            if a <= x <= b:
+                return i
+        return None
+
+    def _enter_segment(self, idx):
+        if idx != self._hover:
+            self._hover = idx
+            self.tooltip.text = self.items[idx][3] or self.items[idx][1]
+            self.tooltip._cancel()
+            self.tooltip.hide()
+            self.tooltip._on_enter()
+            self._schedule_hover()
+
+    def _on_motion(self, event):
+        idx = self._at(event.x)
+        if idx is None:
+            if self._hover is not None:
+                self._hover = None
+                self._schedule_hover()
+            self.tooltip._cancel()
+            self.tooltip.hide()
+        else:
+            self._enter_segment(idx)
+
+    def _on_leave(self, event=None):
+        # Moving from this Canvas to an overlaid icon is still inside the bar.
+        if self._leave_job is None:
+            self._leave_job = self.after_idle(self._check_leave)
+
+    def _check_leave(self):
+        self._leave_job = None
+        if not self.winfo_exists():
+            return
+        try:
+            target = self.winfo_containing(*self.winfo_pointerxy())
+            if target is not None and (target == self or
+                    str(target).startswith(str(self)+'.')):
+                return
+        except tk.TclError:
+            pass
+        if self._hover is not None:
+            self._hover = None
+            self._schedule_hover()
+        self.tooltip._cancel()
+        self.tooltip.hide()
+
+    def _on_press(self, event):
+        self.focus_set()
+        idx = self._at(event.x)
+        if idx is not None:
+            self.activate(idx)
+
+    def _keyboard_move(self, direction):
+        self._keyboard_index = (self._keyboard_index + direction) % len(self.items)
+        self._hover = self._keyboard_index
+        self._schedule_hover()
+        return 'break'
+
+    def _keyboard_activate(self, event=None):
+        self.activate(self._keyboard_index)
+        return 'break'
+
+    def activate(self, index):
+        """Start/restart highlight before invoking the original callback."""
+        if not 0 <= index < len(self.items):
+            return
+        self._keyboard_index = index
+        dest = self._bounds[index][0]
+        previous_live = self._selected is not None and self._visibility > 0.03
+        start = (self._current_x if previous_live else self._last_selection_x)
+        self._selected = index
+        self._origin_x = dest if start is None else start
+        self._current_x = self._origin_x
+        self._start_time = time.monotonic()
+        self._start_visibility = self._visibility if previous_live else 0.0
+        self._visibility = self._start_visibility
+        self._generation += 1
+        self._cancel_animation()
+        self._render()
+        self._anim_id = self.after(self.FRAME_MS,
+                                   lambda gen=self._generation: self._tick(gen))
+        # Preserve *all* execution semantics (including dialogs, Undo and
+        # transport selection); UI feedback never waits for callback completion.
+        cmd = self.items[index][2]
+        if cmd:
+            cmd()
+
+    def _tick(self, generation):
+        self._anim_id = None
+        if generation != self._generation or not self.winfo_exists():
+            return
+        elapsed = (time.monotonic() - self._start_time) * 1000.0
+        target = self._bounds[self._selected][0]
+        slide_t = min(1., elapsed / self.SLIDE_MS)
+        eased = 1. - (1. - slide_t) ** 3
+        self._current_x = self._origin_x + (target-self._origin_x)*eased
+        if elapsed <= self.HOLD_MS:
+            fade_in_t = min(1.0, elapsed / 95.0)
+            self._visibility = self._start_visibility + (1.-self._start_visibility)*fade_in_t
+        else:
+            fade_t = min(1., (elapsed-self.HOLD_MS)/self.FADE_MS)
+            self._visibility = (1. - fade_t)**2
+        self._render()
+        if elapsed < self.HOLD_MS + self.FADE_MS:
+            self._anim_id = self.after(self.FRAME_MS,
+                                       lambda gen=generation: self._tick(gen))
+        else:
+            self._last_selection_x = target
+            self._selected = None
+            self._visibility = 0.0
+            self._current_x = None
+            self._render()
+
+    def _cancel_animation(self):
+        if self._anim_id is not None:
+            try: self.after_cancel(self._anim_id)
+            except tk.TclError: pass
+        self._anim_id = None
+
+    def _on_destroy(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        self._generation += 1
+        self._cancel_animation()
+        for name in ('_hover_anim_id', '_leave_job'):
+            job = getattr(self, name, None)
+            if job is not None:
+                try: self.after_cancel(job)
+                except tk.TclError: pass
+                setattr(self, name, None)
+        if self.tooltip is not None:
+            self.tooltip._cancel()
+            self.tooltip.hide()
+
+    def _schedule_hover(self):
+        """Animate the subtle hover shading for each segment independently."""
+        if self._hover_anim_id is None and self.winfo_exists():
+            self._hover_anim_id = self.after(self.FRAME_MS, self._tick_hover)
+
+    def _tick_hover(self):
+        self._hover_anim_id = None
+        if not self.winfo_exists():
+            return
+        unfinished = False
+        step = self.FRAME_MS / self.HOVER_MS
+        for i,value in enumerate(self._hover_strengths):
+            dest = 1. if self._hover == i else 0.
+            if abs(dest-value) > .001:
+                value = min(dest, value+step) if dest > value else max(dest, value-step)
+                self._hover_strengths[i] = value
+            if abs(dest-value) > .001:
+                unfinished = True
+        self._render()
+        if unfinished:
+            self._hover_anim_id = self.after(self.FRAME_MS, self._tick_hover)
+
+    def refresh_accent(self):
+        """Update a live bar without reconstructing buttons or losing icons."""
+        self._render()
+
+    def _render(self):
+        if not self.winfo_exists():
+            return
+        self.delete('pill_art')
+        # Draw shell with a low-contrast rim, keeping all artwork inside it.
+        self._capsule(self, 0, 0, self.width, self.HEIGHT,
+                      BG_BORDER, 'pill_art')
+        self._capsule(self, 1, 1, self.width-1, self.HEIGHT-1,
+                      self.surface, 'pill_art')
+        highlight_color = None
+        sel_bounds = None
+        if self._selected is not None and self._visibility > 0.0:
+            active_width = self._segment_widths[self._selected]
+            sel_bounds = (self._current_x, self._current_x+active_width)
+        # Hover paints underneath active indicator, using the same capsule
+        # geometry. The highlight is a movable pill, never persistent tabs.
+        for idx,strength in enumerate(self._hover_strengths):
+            if strength > 0:
+                lo,hi = self._bounds[idx]
+                hover_ink = blend_hex(BG_HOVER, self.surface, strength)
+                self._capsule(self, lo, 5, hi, self.HEIGHT-5, hover_ink, 'pill_art')
+        if sel_bounds is not None:
+            highlight_color = blend_hex(self.accent_getter(), self.surface,
+                                        max(0.,min(1.,self._visibility)))
+            self._capsule(self, sel_bounds[0], 5, sel_bounds[1],
+                          self.HEIGHT-5, highlight_color, 'pill_art')
+        fg_normal = TEXT_PRIMARY
+        fg_selected = accent_text_color(self.accent_getter())
+        for idx,(slot,caption,cmd,tip,fallback) in enumerate(self.items):
+            lo,hi = self._bounds[idx]
+            icon_x = (lo+hi)/2 if self.icon_only else lo+16
+            inside = bool(sel_bounds and self._visibility > 0.0 and
+                          sel_bounds[0] <= icon_x-8 and sel_bounds[1] >= icon_x+8)
+            ink = fg_selected if inside and self._visibility > .58 else fg_normal
+            surface = (highlight_color if inside and highlight_color else
+                       blend_hex(BG_HOVER,self.surface,self._hover_strengths[idx]))
+            # SVG and image overrides still live in SequentIcon, with stable
+            # keys assigned by the Icon Manager; no extra renderer introduced.
+            ico = self.icons[idx]
+            if ico.ink != ink or ico.cget('bg') != surface:
+                ico.paint(color=ink, bg=surface)
+            if not self.icon_only:
+                self.create_text(lo+35, self.HEIGHT/2,
+                                 text=caption, anchor='w', font=('Segoe UI', 9, 'bold'),
+                                 fill=ink, tags='pill_art')
+        # Canvas children are separate Tk windows and always draw on top.
+
+
+def sequent_style_native_button(button, caption, glyph=None):
+    """Attach configured artwork to a legacy tk.Button without changing behavior."""
+    fallback = glyph or sequent_icon_for_caption(caption) or 'list'
+    slot = sequent_icon_slot('button', caption)
+    sequent_register_icon_slot(slot, caption, fallback)
+    button._sequent_icon_slot = slot
+    button._sequent_icon_label = caption
+    button._sequent_icon_fallback = fallback
+    icon = sequent_image_icon(button, fallback, 16, override_key=slot, ink=button.cget('fg'))
+    if icon is not None:
+        button.configure(image=icon, compound=tk.LEFT)
+        button._sequent_icon_image = icon
+    else:
+        button.configure(image='', compound=tk.NONE)
+        button._sequent_icon_image = None
+    return button
+
+
+def sequent_toolbar_button(parent, text, command, accent=False, icon=None,
+                           icon_slot=None):
+    return SequentToolbarButton(parent, text, command, accent=accent, icon=icon,
+                                icon_slot=icon_slot)
 
 
 # --- Sequent native-looking, dependency-free custom accent color dialog ---
@@ -1840,7 +3162,7 @@ class SequentAccentColorDialog:
         head.pack_propagate(False)
         if os.name == 'nt':
             head.bind('<Button-1>', lambda e: begin_native_window_motion(self.window))
-        tk.Frame(head, bg=COLOR_ACCENT, width=4).pack(side=tk.LEFT, fill=tk.Y)
+        SequentRoundedAccentBar(head, thickness=4, background=BG_HEADER, inset=8).pack(side=tk.LEFT, fill=tk.Y)
         title_box = tk.Frame(head, bg=BG_HEADER)
         title_box.pack(side=tk.LEFT, padx=18, pady=10)
         self._label(title_box, "CUSTOM ACCENT COLOR", size=12, bold=True, bg=BG_HEADER).pack(anchor="w")
@@ -1945,16 +3267,19 @@ class SequentAccentColorDialog:
 
         buttons = tk.Frame(footer, bg=BG_HEADER)
         buttons.pack(side=tk.RIGHT, padx=20, pady=13)
-        tk.Button(buttons, text="Cancel", command=self.cancel, bg=BG_INPUT, fg=TEXT_PRIMARY,
+        cancel_button = tk.Button(buttons, text="Cancel", command=self.cancel, bg=BG_INPUT, fg=TEXT_PRIMARY,
                   activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
                   font=("Segoe UI", 9, "bold"), relief="flat", bd=0, cursor="hand2",
-                  padx=20, pady=8).pack(side=tk.LEFT, padx=(0, 9))
+                  padx=20, pady=8)
+        sequent_style_native_button(cancel_button, 'Cancel', 'close')
+        cancel_button.pack(side=tk.LEFT, padx=(0, 9))
         self.apply_button = tk.Button(buttons, text="Apply Accent", command=self.apply,
                                       bg=self.selected, fg=accent_text_color(self.selected),
                                       activebackground=self.selected,
                                       activeforeground=accent_text_color(self.selected),
                                       font=("Segoe UI", 9, "bold"), relief="flat", bd=0,
                                       cursor="hand2", padx=19, pady=8)
+        sequent_style_native_button(self.apply_button, 'Apply Accent', 'check')
         self.apply_button.pack(side=tk.LEFT)
 
     def _render_sv_image(self):
@@ -5602,12 +6927,14 @@ class VSCodeQueueViewer(tk.Frame):
                 tile = tk.Frame(self._action_picker_inner, bg=row_color,
                                 cursor="hand2", padx=9, pady=8)
                 tile.pack(fill=tk.X, padx=(4, 8), pady=2)
-                accent = tk.Frame(tile, width=3,
-                                  bg=COLOR_ACCENT if selected else row_color)
+                accent = SequentRoundedAccentBar(
+                    tile, thickness=3, background=row_color,
+                    accent=COLOR_ACCENT if selected else '', inset=4)
                 accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 9))
-                accent.pack_propagate(False)
                 tag = SequentIcon(tile, sequent_icon_for_action(name),
-                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24)
+                                  color=SYNTAX_BLUE, bg=BG_INPUT, size=24,
+                                  override_key=sequent_icon_slot('action', name),
+                                  slot_label=name)
                 tag.pack(side=tk.LEFT, padx=(0, 8))
                 names = tk.Frame(tile, bg=row_color)
                 names.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -6124,9 +7451,11 @@ class VSCodeQueueViewer(tk.Frame):
                 card.destroy()
                 for idx, item in enumerate(rule_rows, 1):
                     item['title'].config(text=f'Rule {idx}')
-            tk.Button(heading, text='Remove', command=remove, bg=BG_PANEL,
+            remove_button = tk.Button(heading, text='Remove', command=remove, bg=BG_PANEL,
                       fg=COLOR_DANGER, bd=0, font=('Segoe UI', 8),
-                      cursor='hand2').pack(side=tk.RIGHT)
+                      cursor='hand2')
+            sequent_style_native_button(remove_button, 'Remove', 'trash')
+            remove_button.pack(side=tk.RIGHT)
 
             def field(label, initial, color):
                 tk.Label(card, text=label, font=('Segoe UI', 8), bg=BG_INPUT,
@@ -8402,8 +9731,10 @@ class ModernButton(tk.Frame):
         self._fade_job = None
 
         fg_color = self._get_contrast_fg(bg_color)
-        self.icon = SequentIcon(self, sequent_icon_for_caption(text) or 'check',
-                                color=fg_color, bg=bg_color, size=19)
+        self.icon = SequentIcon(self, sequent_icon_for_caption(text) or 'list',
+                                color=fg_color, bg=bg_color, size=19,
+                                override_key=sequent_icon_slot('button', text),
+                                slot_label=text)
         self.icon.pack(side=tk.LEFT, padx=(15, 6))
         self.label = SequentCaptionLabel(
             self, text=sequent_clean_caption(text), bg=bg_color, fg=fg_color,
@@ -8418,7 +9749,10 @@ class ModernButton(tk.Frame):
 
 
     def _on_caption_change(self, caption):
-        self.icon.paint(name=sequent_icon_for_caption(caption) or 'check')
+        self.icon.override_key = sequent_icon_slot('button', caption)
+        sequent_register_icon_slot(self.icon.override_key, caption,
+                                   sequent_icon_for_caption(caption) or 'list')
+        self.icon.paint(name=sequent_icon_for_caption(caption) or 'list')
         # Strip decorative glyphs when a legacy setter updates a caption.
         clean = sequent_clean_caption(caption)
         if clean != caption:
@@ -8857,11 +10191,14 @@ class SidebarButton(tk.Frame):
         self.command = command
         self.active = False
         
-        self.indicator = tk.Frame(self, bg=BG_SIDEBAR, width=4)
+        self.indicator = SequentRoundedAccentBar(
+            self, thickness=4, background=BG_SIDEBAR, accent='', inset=5)
         self.indicator.pack(side=tk.LEFT, fill=tk.Y)
         
         name = sequent_icon_for_caption(text) or 'layout'
-        self.icon = SequentIcon(self, name, color=TEXT_MUTED, bg=BG_SIDEBAR, size=19)
+        self.icon = SequentIcon(self, name, color=TEXT_MUTED, bg=BG_SIDEBAR, size=19,
+                                override_key=sequent_icon_slot('sidebar', text),
+                                slot_label=text)
         self.icon.pack(side=tk.LEFT, padx=(11, 2))
         nav_text = sequent_clean_caption(text).title()
         self.label = tk.Label(self, text=nav_text, bg=BG_SIDEBAR, fg=TEXT_MUTED,
@@ -8896,7 +10233,8 @@ class SidebarButton(tk.Frame):
         self.configure(bg=color)
         self.label.configure(bg=color, fg=fg_color)
         self.icon.paint(bg=color, color=fg_color)
-        self.indicator.configure(bg=ind_color)
+        self.indicator.set_accent(COLOR_ACCENT if is_active else '',
+                                  background=color)
 
 class GhostReticle:
     def __init__(self, root):
@@ -9508,16 +10846,19 @@ class SequentWalkthrough:
                                    bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
                                    activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
                                    padx=10, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_exit, 'Exit tour', 'close')
         self.btn_exit.pack(side=tk.LEFT)
         self.btn_next = tk.Button(btn_row, text="Next  →", command=self.next,
                                    bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, activebackground=COLOR_ACCENT_HOV,
                                    activeforeground="#ffffff", relief="flat", bd=0,
                                    padx=12, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_next, 'Next', 'forward')
         self.btn_next.pack(side=tk.RIGHT)
         self.btn_back = tk.Button(btn_row, text="←  Back", command=self.back,
                                    bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
                                    activeforeground=TEXT_PRIMARY, relief="flat", bd=0,
                                    padx=10, pady=7, cursor="hand2")
+        sequent_style_native_button(self.btn_back, 'Back', 'back')
         self.btn_back.pack(side=tk.RIGHT, padx=(0, 7))
         self.card.bind("<Escape>", lambda e: self.close())
         self.card.bind("<Right>", lambda e: self.next())
@@ -9658,6 +10999,226 @@ class SequentWalkthrough:
 
 # --- Main Application ---
 # --- Windows Explorer macro file drops (DLL-owned child window, no Tk subclass) ---
+# --- Shared Sequent visual language for auxiliary IDE tools ---
+# Auxiliary windows reuse Sequent's palette, native Canvas icons, toolbar buttons,
+# Segoe UI/Consolas typography, and dock/header spacing. Avoid OS-default ttk
+# widget styling and additional drag/Win32 message hooks.
+class SequentIDEWindow:
+    """Sequent-themed, resize-friendly Toplevel with live palette refresh."""
+
+    def __init__(self, app, title, subtitle, icon='layout', size=(760, 520), parent=None, embedded=False):
+        self.app = app
+        self.widgets = []
+        self._scheduled_jobs = set()
+        self.embedded = embedded
+        if embedded:
+            if parent is None:
+                raise ValueError('Embedded IDE tools require a parent frame')
+            self.window = tk.Frame(parent, bg=BG_APP)
+            self.window.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.window = tk.Toplevel(parent or app.root)
+            self.window.title('Sequent — ' + title)
+            self.window.configure(bg=BG_APP)
+            w, h = size
+            self.window.geometry(f'{w}x{h}')
+            self.window.minsize(min(520, w), min(335, h))
+        self._add(self.window, 'app')
+        self.window.bind('<Destroy>', self._on_window_destroy, add='+')
+        # Keep the normal, OS-managed Toplevel window frame. Replacing or
+        # subclassing Tk's native WNDPROC reintroduced crash risks previously.
+        head = self.frame(self.window, 'header', height=66)
+        head.pack(fill=tk.X)
+        head.pack_propagate(False)
+        rail = self.frame(head, 'accent', width=4)
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        icon_canvas = self.icon(head, icon, size=22, bg_role='header')
+        icon_canvas.pack(side=tk.LEFT, padx=(15, 10))
+        titles = self.frame(head, 'header')
+        titles.pack(side=tk.LEFT, fill=tk.Y, expand=True)
+        self.label(titles, title.upper(), role='heading', font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(12, 1))
+        self.label(titles, subtitle, role='header_muted', font=('Segoe UI', 9)).pack(anchor='w')
+        # Embedded tools have a shared navigation strip; they are not dialogs.
+        if not embedded:
+            close = self.icon(head, 'close', size=19, bg_role='header')
+            close.pack(side=tk.RIGHT, padx=18)
+            close.bind('<Button-1>', lambda e: self.close())
+            close.bind('<Enter>', lambda e: close.paint(bg=BG_HOVER))
+            close.bind('<Leave>', lambda e: close.paint(bg=BG_HEADER))
+        self.frame(self.window, 'border', height=1).pack(fill=tk.X)
+        self.body = self.frame(self.window, 'app')
+        self.body.pack(fill=tk.BOTH, expand=True, padx=14, pady=(12, 8))
+        self.frame(self.window, 'border', height=1).pack(fill=tk.X)
+        self.footer = self.frame(self.window, 'panel')
+        self.footer.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0)
+        self.footer_buttons = self.frame(self.footer, 'panel')
+        self.footer_buttons.pack(side=tk.RIGHT, padx=12, pady=9)
+        self.status = self.label(self.footer, 'READY', 'muted', font=('Segoe UI', 8))
+        self.status.pack(side=tk.LEFT, padx=14)
+        if not embedded:
+            self.window.protocol('WM_DELETE_WINDOW', self.close)
+            self.window.bind('<Escape>', lambda e: self.close())
+            if not hasattr(app, '_ide_tool_windows'):
+                app._ide_tool_windows = set()
+            app._ide_tool_windows.add(self)
+
+    def _add(self, widget, role):
+        self.widgets.append((widget, role))
+        return widget
+
+    def frame(self, parent, role='panel', **kwargs):
+        palette = dict(app=BG_APP, panel=BG_PANEL, header=BG_HEADER,
+                       input=BG_INPUT, border=BG_BORDER, accent=COLOR_ACCENT)
+        return self._add(tk.Frame(parent, bg=palette[role], **kwargs), role)
+
+    def label(self, parent, text, role='label', font=('Segoe UI', 9), **kwargs):
+        bg = BG_HEADER if role in ('heading', 'header_muted') else BG_PANEL if role in ('label', 'muted') else BG_APP
+        fg = TEXT_MUTED if role in ('muted', 'header_muted') else TEXT_PRIMARY
+        return self._add(tk.Label(parent, text=text, font=font, bg=bg, fg=fg, anchor='w', **kwargs), role)
+
+    def icon(self, parent, icon, size=19, bg_role='panel'):
+        bg = BG_HEADER if bg_role == 'header' else BG_PANEL
+        return self._add(SequentIcon(parent, icon, bg=bg, color=TEXT_MUTED, size=size), 'icon_' + bg_role)
+
+    def button(self, parent, caption, command, icon=None, accent=False, **pack):
+        button = sequent_toolbar_button(parent, caption, command, accent=accent, icon=icon)
+        self._add(button, 'button_accent' if accent else 'button')
+        button.pack(**pack)
+        return button
+
+    def entry(self, parent, textvariable=None, **kwargs):
+        return self._add(tk.Entry(parent, textvariable=textvariable,
+            bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+            highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT,
+            highlightthickness=1, relief=tk.FLAT, bd=0,
+            font=('Segoe UI', 10), **kwargs), 'entry')
+
+    def listbox(self, parent, **kwargs):
+        return self._add(tk.Listbox(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+            highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT,
+            highlightthickness=1, relief=tk.FLAT, bd=0,
+            activestyle='none', exportselection=False,
+            font=('Consolas', 10), **kwargs), 'listbox')
+
+    def text(self, parent, **kwargs):
+        return self._add(tk.Text(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            insertbackground=TEXT_PRIMARY, selectbackground=BG_SELECTED,
+            selectforeground=TEXT_PRIMARY, highlightbackground=BG_BORDER,
+            highlightcolor=COLOR_ACCENT, highlightthickness=1,
+            relief=tk.FLAT, bd=0, font=('Consolas', 10), **kwargs), 'text')
+
+    def checkbox(self, parent, caption, variable, **kwargs):
+        return self._add(tk.Checkbutton(parent, text=caption, variable=variable,
+            bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+            activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+            highlightthickness=0, font=('Segoe UI', 9), **kwargs), 'check')
+
+    def scroll(self, parent, content, side=tk.RIGHT):
+        scroll = self._add(ModernScrollBar(parent, command=content.yview, width=13), 'scroll')
+        content.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=side, fill=tk.Y)
+        return scroll
+
+    def footer_note(self, text):
+        self.status.config(text=text)
+
+    def schedule(self, milliseconds, callback):
+        """Panel-owned polling: cancel pending Tk jobs when a tool is replaced."""
+        key = [None]
+        def execute():
+            self._scheduled_jobs.discard(key[0])
+            if self.window.winfo_exists():
+                callback()
+        key[0] = self.window.after(milliseconds, execute)
+        self._scheduled_jobs.add(key[0])
+        return key[0]
+
+    def _on_window_destroy(self, event):
+        if event.widget is self.window:
+            self.cancel_jobs()
+
+    def cancel_jobs(self):
+        for job in tuple(self._scheduled_jobs):
+            try: self.window.after_cancel(job)
+            except tk.TclError: pass
+        self._scheduled_jobs.clear()
+
+    def dispose(self):
+        self.cancel_jobs()
+        try:
+            if self.window.winfo_exists(): self.window.destroy()
+        except tk.TclError: pass
+
+    def close(self):
+        if self.embedded:
+            # A tool switching workspace should not close the application.
+            self.app._show_debug_overview()
+            return
+        if hasattr(self.app, '_ide_tool_windows'):
+            self.app._ide_tool_windows.discard(self)
+        self.dispose()
+
+    def retheme(self):
+        palette = {'app': BG_APP, 'panel': BG_PANEL, 'header': BG_HEADER,
+                   'border': BG_BORDER, 'input': BG_INPUT, 'accent': COLOR_ACCENT}
+        for widget, role in self.widgets:
+            try:
+                if not widget.winfo_exists(): continue
+                if role in palette:
+                    widget.config(bg=palette[role])
+                    if role == 'panel' and widget.cget('highlightthickness'):
+                        widget.config(highlightbackground=BG_BORDER)
+                elif role in ('heading', 'header_muted'):
+                    widget.config(bg=BG_HEADER, fg=TEXT_MUTED if role == 'header_muted' else TEXT_PRIMARY)
+                elif role in ('label', 'muted'):
+                    widget.config(bg=BG_PANEL, fg=TEXT_MUTED if role == 'muted' else TEXT_PRIMARY)
+                elif role == 'entry':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                  highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT)
+                elif role == 'listbox':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=BG_SELECTED,
+                                  selectforeground=TEXT_PRIMARY, highlightbackground=BG_BORDER,
+                                  highlightcolor=COLOR_ACCENT)
+                elif role == 'text':
+                    widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                  selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+                                  highlightbackground=BG_BORDER, highlightcolor=COLOR_ACCENT)
+                elif role == 'check':
+                    widget.config(bg=BG_PANEL, fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                                  activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY)
+                elif role.startswith('icon_'):
+                    widget.paint(bg=BG_HEADER if role == 'icon_header' else BG_PANEL, color=TEXT_MUTED)
+                elif role.startswith('button'):
+                    accent = role == 'button_accent'
+                    widget.base = COLOR_ACCENT if accent else BG_INPUT
+                    widget.hover = COLOR_ACCENT_HOV if accent else BG_HOVER
+                    widget.fg = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
+                    widget.config(highlightbackground=BG_BORDER)
+                    widget.label.config(fg=widget.fg)
+                    if widget.icon: widget.icon.paint(color=widget.fg)
+                    widget._paint(widget.base)
+                elif role == 'scroll':
+                    widget.bg_trough = BG_SCROLL_TRACK
+                    widget.thumb_color = TRACK_INACTIVE
+                    widget.hover_color = TRACK_HOVER
+                    widget.active_color = TRACK_ACTIVE
+                    widget.current_color = TRACK_INACTIVE
+                    widget.config(bg=BG_SCROLL_TRACK)
+                    widget.draw()
+            except tk.TclError:
+                pass
+
+
+def sequent_retheme_ide_windows(app):
+    """Repaint open IDE tools in place, retaining selection and unsaved edits."""
+    for panel in tuple(getattr(app, '_ide_tool_windows', ())):
+        if panel.window.winfo_exists():
+            panel.retheme()
+        else:
+            app._ide_tool_windows.discard(panel)
+
+
 class BuiltInMacroApp:
     def __init__(self, root):
         self.root = root
@@ -9773,8 +11334,9 @@ class BuiltInMacroApp:
         self.window_relative = False
 
         # Loop & Pause State
-        self.loop_mode = "1x"
-        self.loop_options = ["1x", "2x", "5x", "10x", "25x", "∞ Loop"]
+        # Standalone Playback runs once. Repeat a workflow using an explicit
+        # LOOP action or Sequencer stage instead of the former Repeat control.
+        self.loop_mode = "1x"  # Preserve compatibility with older integrations.
         self.is_paused = False
 
         # Mini HUD State
@@ -10128,42 +11690,175 @@ class BuiltInMacroApp:
             self._trace_rows.append((datetime.now().isoformat(timespec='seconds'),
                                      str(action), str(state), round(elapsed, 4), str(details)[:300]))
 
+    # All IDE tools are docked within the DEBUG TOOLS sidebar workspace.
+    # No second app window or native window procedure is required.
     def open_ide_tools(self):
-        menu = tk.Menu(self.root, tearoff=False, bg=BG_PANEL, fg=TEXT_PRIMARY,
-                       activebackground=COLOR_ACCENT, activeforeground=TEXT_ON_ACCENT)
-        for name, callback in (('Variable Explorer', self.open_variable_explorer),
-                               ('Preset Version History', self.open_preset_history),
-                               ('Execution Timeline', self.open_execution_timeline),
-                               ('Preset Manager', self.open_preset_manager)):
-            menu.add_command(label=name, command=callback)
-        x = self.root.winfo_pointerx(); y = self.root.winfo_pointery()
-        try: menu.tk_popup(x, y)
-        finally: menu.grab_release()
+        self.show_tab('debug_tools', animate=False)
+
+    def _new_debug_panel(self, title, subtitle, icon='layout', size=(760, 520)):
+        if not self._discard_debug_panel():
+            return None
+        ui = SequentIDEWindow(self, title, subtitle, icon, size,
+                              parent=self.debug_tool_host, embedded=True)
+        self._debug_panel = ui
+        return ui
+
+    def _discard_debug_panel(self):
+        ui = getattr(self, '_debug_panel', None)
+        if ui is not None:
+            confirm = getattr(ui, 'confirm_discard', None)
+            if confirm is not None and ui.window.winfo_exists() and not confirm():
+                return False
+            ui.dispose()
+        self._debug_panel = None
+        return True
+
+    def _show_debug_overview(self):
+        if not self._discard_debug_panel():
+            return
+        self._debug_active_tool = None
+        self._update_debug_nav()
+        home = tk.Frame(self.debug_tool_host, bg=BG_APP)
+        home.pack(fill=tk.BOTH, expand=True)
+        self._debug_home = home
+        tk.Label(home, text='DEBUG TOOLS', bg=BG_APP, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 15, 'bold')).pack(anchor='w', padx=23, pady=(24, 4))
+        tk.Label(home, text='Inspect live state, review execution, recover changes and manage presets.',
+                 bg=BG_APP, fg=TEXT_MUTED, font=('Segoe UI', 10)).pack(anchor='w', padx=23)
+        choices = (('Live Variable Explorer', 'Inspect and edit Local / Global values', 'variable', 'variables'),
+                   ('Execution Timeline', 'Review macro actions, timing and failures', 'timeline', 'timeline'),
+                   ('Preset Version History', 'Compare and restore autosaved revisions', 'history', 'history'),
+                   ('Preset Manager', 'Find, tag, favorite and duplicate presets', 'folder', 'presets'))
+        for title, caption, glyph, tool in choices:
+            card = tk.Frame(home, bg=BG_PANEL, highlightthickness=1, highlightbackground=BG_BORDER)
+            card.pack(fill=tk.X, padx=23, pady=(12, 0))
+            icon = SequentIcon(card, glyph, bg=BG_PANEL, color=TEXT_MUTED, size=22)
+            icon.pack(side=tk.LEFT, padx=(14, 10), pady=14)
+            labels = tk.Frame(card, bg=BG_PANEL)
+            labels.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Label(labels, text=title, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                     font=('Segoe UI', 10, 'bold'), anchor='w').pack(fill=tk.X)
+            tk.Label(labels, text=caption, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 9), anchor='w').pack(fill=tk.X)
+            go = sequent_toolbar_button(card, 'Open', lambda key=tool: self._open_debug_tool(key), icon='layers')
+            go.pack(side=tk.RIGHT, padx=12)
+
+    def _open_debug_tool(self, key):
+        # Destroy the overview only after unsaved edits have been handled.
+        if self._debug_active_tool == key and self._debug_panel is not None:
+            return
+        previous = getattr(self, '_debug_panel', None)
+        if previous is not None and not self._discard_debug_panel():
+            return
+        if getattr(self, '_debug_home', None) is not None:
+            try:
+                if self._debug_home.winfo_exists(): self._debug_home.destroy()
+            except tk.TclError: pass
+            self._debug_home = None
+        actions = {'variables': self.open_variable_explorer,
+                   'timeline': self.open_execution_timeline,
+                   'history': self.open_preset_history,
+                   'presets': self.open_preset_manager}
+        self._debug_active_tool = key
+        self._update_debug_nav()
+        actions[key]()
+        # For a history view without an active preset, show an explanation.
+        if self._debug_panel is None:
+            self._show_debug_overview()
+
+    def _update_debug_nav(self):
+        for key, button in getattr(self, '_debug_nav_buttons', {}).items():
+            active = key == getattr(self, '_debug_active_tool', None)
+            button.base = COLOR_ACCENT if active else BG_INPUT
+            button.hover = COLOR_ACCENT_HOV if active else BG_HOVER
+            button.fg = TEXT_ON_ACCENT if active else TEXT_PRIMARY
+            button.label.config(fg=button.fg)
+            if button.icon: button.icon.paint(color=button.fg)
+            button._paint(button.base)
+
+    def build_debug_view(self):
+        for child in self.frame_debug.winfo_children(): child.destroy()
+        self._debug_panel = None
+        self._debug_home = None
+        nav = tk.Frame(self.frame_debug, bg=BG_HEADER, height=49)
+        nav.pack(fill=tk.X, padx=13, pady=(12, 0))
+        nav.pack_propagate(False)
+        self._debug_nav_buttons = {}
+        choices = (('variables', 'Variables', 'variable'),
+                   ('timeline', 'Timeline', 'timeline'),
+                   ('history', 'Version History', 'history'),
+                   ('presets', 'Presets', 'folder'))
+        for key, text, glyph in choices:
+            button = sequent_toolbar_button(nav, text,
+                          lambda choice=key: self._open_debug_tool(choice), icon=glyph)
+            button.icon.override_key = sequent_icon_slot('debug', key)
+            sequent_register_icon_slot(button.icon.override_key, 'Debug: ' + text, glyph)
+            button.icon.paint()
+            button.pack(side=tk.LEFT, padx=(5, 0), pady=7)
+            self._debug_nav_buttons[key] = button
+        tk.Frame(self.frame_debug, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=13)
+        self.debug_tool_host = tk.Frame(self.frame_debug, bg=BG_APP)
+        self.debug_tool_host.pack(fill=tk.BOTH, expand=True, padx=13, pady=(0, 13))
+        selected = getattr(self, '_debug_active_tool', None)
+        self._debug_active_tool = None
+        if selected in dict((key, True) for key, _, _ in choices):
+            self._open_debug_tool(selected)
+        else:
+            self._show_debug_overview()
 
     def open_variable_explorer(self):
-        window = tk.Toplevel(self.root)
-        window.title('Sequent — Live Variables')
-        window.geometry('720x490')
-        window.configure(bg=BG_PANEL)
-        left = tk.Frame(window, bg=BG_PANEL)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=12, pady=12)
-        tk.Label(left, text='LOCAL / GLOBAL VARIABLES', bg=BG_PANEL, fg=TEXT_PRIMARY,
-                 font=('Segoe UI', 10, 'bold')).pack(anchor='w')
-        listing = tk.Listbox(left, bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=BG_SELECTED,
-                             font=('Consolas',10), exportselection=False)
-        listing.pack(fill=tk.BOTH, expand=True, pady=8)
-        right = tk.Frame(window, bg=BG_PANEL, width=350)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(0,12), pady=12)
-        tk.Label(right, text='SELECTED VALUE (EDITABLE)', bg=BG_PANEL,
-                 fg=TEXT_PRIMARY).pack(anchor='w')
-        editor = tk.Text(right, bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Consolas',9),
-                         insertbackground=TEXT_PRIMARY, wrap='word', height=13)
-        editor.pack(fill=tk.BOTH, expand=True, pady=8)
-        entries=[]
-        dirty=[False]
+        ui = self._new_debug_panel( 'Live Variable Explorer',
+                             'Inspect and manage session / saved values', 'layers', (800, 525))
+        if ui is None: return None
+        window = ui.window
+        left = ui.frame(ui.body, 'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        head = ui.frame(left, 'panel'); head.pack(fill=tk.X, padx=12, pady=(11, 5))
+        ui.label(head, 'LOCAL / GLOBAL VARIABLES', font=('Segoe UI', 9, 'bold')).pack(anchor='w')
+        list_container = ui.frame(left, 'panel'); list_container.pack(fill=tk.BOTH, expand=True, padx=11, pady=(0, 10))
+        listing = ui.listbox(list_container)
+        ui.scroll(list_container, listing)
+        listing.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right = ui.frame(ui.body, 'panel', width=365,
+                         highlightthickness=1, highlightbackground=BG_BORDER)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH)
+        right.pack_propagate(False)
+        ui.label(right, 'SELECTED VALUE', font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(11, 3))
+        ui.label(right, 'Edit the exact text, including multiple lines.', role='muted',
+                 font=('Segoe UI', 8)).pack(anchor='w', padx=12, pady=(0, 8))
+        text_container = ui.frame(right, 'panel')
+        text_container.pack(fill=tk.BOTH, expand=True, padx=11)
+        editor = ui.text(text_container, wrap='word', undo=True)
+        ui.scroll(text_container, editor)
+        editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        entries = []
+        editing_pair = [None]
+
         def selected():
             index=listing.curselection()
             return entries[index[0]] if index and index[0]<len(entries) else None
+
+        def on_select(event=None):
+            pair=selected()
+            if not pair: return
+            if editing_pair[0] != pair and editor.edit_modified():
+                if not messagebox.askyesno('Unsaved variable edit',
+                           'Discard the edited variable text without saving?', parent=window):
+                    listing.selection_clear(0,tk.END)
+                    if editing_pair[0] in entries:
+                        listing.selection_set(entries.index(editing_pair[0]))
+                    return
+            scope,name=pair
+            try: value = get_variable(self,name,scope)
+            except MacroExecutionError as exc:
+                self.update_status(str(exc),COLOR_DANGER);return
+            editor.delete('1.0',tk.END)
+            editor.insert('1.0',str(value))
+            editor.edit_modified(False)
+            editing_pair[0] = pair
+            ui.footer_note(f'{scope.upper()}  /  {name}')
+
         def refresh():
             if not window.winfo_exists(): return
             old=selected()
@@ -10174,10 +11869,10 @@ class BuiltInMacroApp:
                 if items != entries:
                     entries[:] = items
                     listing.delete(0,tk.END)
-                    for scope,name in items: listing.insert(tk.END, f'{scope:6}  {name}')
+                    for scope,name in items: listing.insert(tk.END, f'{scope.upper():7}  {name}')
                     if old in items: listing.selection_set(items.index(old))
                 pair=selected()
-                if pair and not editor.edit_modified():
+                if pair and not editor.edit_modified() and editing_pair[0] == pair:
                     scope,name=pair
                     current=str(get_variable(self,name,scope))
                     if editor.get('1.0','end-1c') != current:
@@ -10186,18 +11881,8 @@ class BuiltInMacroApp:
                         editor.edit_modified(False)
             except MacroExecutionError as exc:
                 self.update_status(str(exc),COLOR_DANGER)
-            window.after(1400,refresh)
-        def on_select(event=None):
-            pair=selected()
-            if not pair: return
-            scope,name=pair
-            try: value = get_variable(self,name,scope)
-            except MacroExecutionError as exc:
-                self.update_status(str(exc),COLOR_DANGER);return
-            editor.delete('1.0',tk.END)
-            editor.insert('1.0',str(value))
-            dirty[0]=False
-            editor.edit_modified(False)
+            ui.schedule(1400,refresh)
+
         def save():
             pair=selected()
             if not pair:return
@@ -10205,9 +11890,11 @@ class BuiltInMacroApp:
             try:
                 set_variable(self,name,editor.get('1.0','end-1c'),scope)
                 editor.edit_modified(False)
+                ui.footer_note(f'SAVED  /  {scope.upper()}  /  {name}')
                 self.update_status(f'Updated {scope} variable {name}',COLOR_SUCCESS)
             except MacroExecutionError as exc:
                 messagebox.showerror('Save variable',str(exc),parent=window)
+
         def delete():
             pair=selected()
             if not pair:return
@@ -10222,13 +11909,15 @@ class BuiltInMacroApp:
                         self._write_json_atomically(_global_variable_path(self),all_values)
                 except (MacroExecutionError,OSError) as exc:
                     messagebox.showerror('Delete variable',str(exc),parent=window);return
-            refresh();editor.delete('1.0',tk.END)
-        listing.bind('<<ListboxSelect>>',on_select)
-        controls=tk.Frame(right,bg=BG_PANEL);controls.pack(fill=tk.X)
+            listing.selection_clear(0,tk.END)
+            editor.delete('1.0',tk.END)
+            editor.edit_modified(False)
+            refresh()
+
         def create():
             name=simpledialog.askstring('New variable','Variable name:',parent=window)
             if not name:return
-            try: variable_identity(name,'local')
+            try:variable_identity(name,'local')
             except MacroExecutionError as exc:
                 messagebox.showerror('Invalid name',str(exc),parent=window);return
             global_scope=messagebox.askyesno('Variable scope',
@@ -10237,63 +11926,102 @@ class BuiltInMacroApp:
             try:
                 set_variable(self,name,'',scope)
                 refresh()
-                selected_key=(scope.title(),name)
-                if selected_key in entries:
+                key=(scope.title(),name)
+                if key in entries:
                     listing.selection_clear(0,tk.END)
-                    listing.selection_set(entries.index(selected_key))
-                    listing.see(entries.index(selected_key))
+                    listing.selection_set(entries.index(key))
+                    listing.see(entries.index(key))
                     on_select()
             except MacroExecutionError as exc:
                 messagebox.showerror('New variable',str(exc),parent=window)
-        tk.Button(controls,text='New',command=create).pack(side=tk.LEFT,padx=3)
-        tk.Button(controls,text='Save Value',command=save).pack(side=tk.LEFT,padx=3)
-        tk.Button(controls,text='Delete',command=delete).pack(side=tk.LEFT,padx=3)
-        tk.Button(controls,text='Refresh',command=lambda:(refresh(),on_select())).pack(side=tk.LEFT,padx=3)
+
+        def confirm_discard():
+            if not editor.edit_modified():
+                return True
+            return messagebox.askyesno('Unsaved variable edit',
+                       'Discard the edited variable text without saving?', parent=window)
+        ui.confirm_discard = confirm_discard
+        ui.variable_editor = editor
+        ui.variable_listing = listing
+        ui.variable_entries = entries
+        listing.bind('<<ListboxSelect>>',on_select)
+        buttons=ui.frame(right, 'panel')
+        buttons.pack(fill=tk.X, padx=10, pady=(9, 10))
+        ui.button(buttons, 'New', create, icon='plus', side=tk.LEFT, padx=(0, 5))
+        ui.button(buttons, 'Save Value', save, icon='save', accent=True, side=tk.LEFT, padx=(0, 5))
+        ui.button(buttons, 'Delete', delete, icon='trash', side=tk.LEFT)
+        ui.button(ui.footer_buttons, 'Refresh', lambda:(refresh(),on_select()), icon='refresh', side=tk.RIGHT)
         refresh()
+        return window
 
     def open_execution_timeline(self):
-        window=tk.Toplevel(self.root)
-        window.title('Sequent — Execution Timeline')
-        window.geometry('940x470');window.configure(bg=BG_PANEL)
-        text_box=tk.Text(window,bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',9),
-                         wrap='none',state=tk.DISABLED)
-        text_box.pack(fill=tk.BOTH,expand=True,padx=9,pady=9)
-        last=[-1]
+        ui = self._new_debug_panel( 'Execution Timeline',
+                             'Action timings, branch results and failures', 'clock', (950, 520))
+        if ui is None: return None
+        window=ui.window
+        panel=ui.frame(ui.body, 'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH, expand=True)
+        header=ui.frame(panel, 'panel');header.pack(fill=tk.X, padx=12, pady=(11, 7))
+        ui.label(header, 'EXECUTION EVENTS', font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT)
+        ui.label(header, 'TIMESTAMP  /  DURATION  /  STATUS  /  ACTION', 'muted',
+                 font=('Consolas', 8)).pack(side=tk.RIGHT)
+        holder=ui.frame(panel, 'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11,pady=(0,11))
+        text_box=ui.text(holder, wrap='none', state=tk.DISABLED)
+        ui.scroll(holder,text_box)
+        text_box.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        last=[None]
         def update():
             if not window.winfo_exists():return
             with self._trace_lock: records=list(self._trace_rows)
-            key = (len(records), records[-1] if records else None)
+            key=(len(records), records[-1] if records else None)
             if key!=last[0]:
                 text_box.configure(state=tk.NORMAL);text_box.delete('1.0',tk.END)
                 for timestamp,action,status,seconds,detail in records:
                     text_box.insert(tk.END,f'{timestamp}  {seconds:8.4f}s  {status:9}  {action:18}  {detail}\n')
                 text_box.see(tk.END);text_box.configure(state=tk.DISABLED)
                 last[0]=key
-            window.after(400,update)
+                ui.footer_note(f'{len(records)} EVENTS  /  LIVE')
+            ui.schedule(400,update)
         def export():
             filename=filedialog.asksaveasfilename(parent=window,defaultextension='.csv',
                   filetypes=[('CSV files','*.csv')])
             if filename:
-                with self._trace_lock: rows=list(self._trace_rows)
-                with open(filename,'w',newline='',encoding='utf-8-sig') as stream:
-                    writer=csv.writer(stream);writer.writerow(['timestamp','action','status','seconds','detail'])
-                    writer.writerows(rows)
-        tk.Button(window,text='Export Timeline CSV',command=export).pack(pady=(0,8))
+                try:
+                    with self._trace_lock: rows=list(self._trace_rows)
+                    with open(filename,'w',newline='',encoding='utf-8-sig') as stream:
+                        writer=csv.writer(stream)
+                        writer.writerow(['timestamp','action','status','seconds','detail'])
+                        writer.writerows(rows)
+                    ui.footer_note(f'EXPORTED  /  {len(rows)} EVENTS')
+                except OSError as exc:
+                    messagebox.showerror('Export Timeline', str(exc), parent=window)
+        ui.button(ui.footer_buttons, 'Export Timeline CSV', export, icon='download', accent=True, side=tk.RIGHT)
         update()
+        return window
 
     def open_preset_history(self):
         path=getattr(self,'_active_preset_path',None)
         if not path:
             messagebox.showinfo('Preset history','Open a saved preset first.',parent=self.root);return
-        window=tk.Toplevel(self.root);window.title('Sequent — Preset Version History')
-        window.geometry('670x425');window.configure(bg=BG_PANEL)
-        tk.Label(window,text='Previous versions (oldest to newest); up to 30 saved per preset',
-                 bg=BG_PANEL,fg=TEXT_PRIMARY).pack(anchor='w',padx=12,pady=8)
-        listing=tk.Listbox(window,bg=BG_INPUT,fg=TEXT_PRIMARY,font=('Consolas',10))
-        listing.pack(fill=tk.BOTH,expand=True,padx=12,pady=8)
+        ui=self._new_debug_panel( 'Preset Version History',
+                            'Recover previous autosaves / compare revisions', 'undo', (770, 490))
+        if ui is None: return None
+        window=ui.window
+        panel=ui.frame(ui.body,'panel', highlightthickness=1, highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH,expand=True)
+        heading=ui.frame(panel,'panel');heading.pack(fill=tk.X,padx=12,pady=(10,6))
+        ui.label(heading,'SAVED REVISIONS',font=('Segoe UI',9,'bold')).pack(side=tk.LEFT)
+        ui.label(heading,'Up to 30 per preset',role='muted',
+                 font=('Segoe UI',8)).pack(side=tk.RIGHT)
+        holder=ui.frame(panel,'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11,pady=(0,11))
+        listing=ui.listbox(holder)
+        ui.scroll(holder,listing)
+        listing.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
         folder=sequent_history_directory(self.presets_dir,path)
-        names = sorted((n for n in os.listdir(folder) if n.endswith('.json'))) if os.path.isdir(folder) else []
+        names=sorted((n for n in os.listdir(folder) if n.endswith('.json'))) if os.path.isdir(folder) else []
         for name in names: listing.insert(tk.END,name)
+        ui.footer_note(f'{len(names)} REVISIONS  /  {os.path.basename(path)}')
+
         def restore():
             selected=listing.curselection()
             if not selected:return
@@ -10304,21 +12032,21 @@ class BuiltInMacroApp:
                 if not isinstance(actions,list) or any(not isinstance(a,dict) or 'type' not in a for a in actions):
                     raise ValueError('Revision does not contain a macro action list')
                 if not messagebox.askyesno('Restore preset',f'Restore {name}?\nCurrent version will be backed up first.',parent=window):return
-                # Verify current file has not been modified outside Sequent.
                 if not self._safe_to_replace_queue():return
                 with open(path,'rb') as stream: current_hash=hashlib.sha256(stream.read()).hexdigest()
                 if current_hash != self._active_preset_disk_hash:
                     raise OSError('Preset changed externally; reload before restore')
                 sequent_save_revision(self.presets_dir,path)
-                new_hash=self._write_json_atomically(path,actions)
+                self._write_json_atomically(path,actions)
                 self.recorded_actions=copy.deepcopy(actions)
                 self.breakpoints.clear();self.current_action_idx=0
                 self._clear_queue_undo();self._bind_preset_autosave(path)
                 self.display_actions_in_queue(self.recorded_actions,self.current_source_label)
-                window.destroy()
+                ui.close()
                 self.update_status('Preset revision restored',COLOR_SUCCESS)
             except (ValueError,OSError,MacroExecutionError) as exc:
                 messagebox.showerror('Restore failed',str(exc),parent=window)
+
         def compare_revision():
             selected=listing.curselection()
             if not selected:return
@@ -10330,21 +12058,37 @@ class BuiltInMacroApp:
                 change=''.join(difflib.unified_diff(before,after,fromfile='Revision',tofile='Current queue'))
             except (OSError,ValueError) as exc:
                 messagebox.showerror('Compare failed',str(exc),parent=window);return
-            diff_window=tk.Toplevel(window)
-            diff_window.title('Compare Saved Revision vs Current Queue')
-            diff_window.geometry('850x530')
-            viewer=tk.Text(diff_window,wrap='none',font=('Consolas',9),bg=BG_INPUT,fg=TEXT_PRIMARY)
-            viewer.pack(fill=tk.BOTH,expand=True)
+            diff=self._new_debug_panel('Compare Revisions',
+                                  'Read-only unified diff / current Action Queue',
+                                  'layers', (920, 570))
+            if diff is None: return
+            card=diff.frame(diff.body,'panel',highlightthickness=1, highlightbackground=BG_BORDER)
+            card.pack(fill=tk.BOTH,expand=True)
+            view=diff.frame(card,'panel');view.pack(fill=tk.BOTH,expand=True,padx=10,pady=10)
+            viewer=diff.text(view,wrap='none')
+            diff.scroll(view,viewer)
+            viewer.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
             viewer.insert('1.0',change or 'No differences')
-            viewer.config(state=tk.DISABLED)
-        history_buttons=tk.Frame(window,bg=BG_PANEL);history_buttons.pack(pady=8)
-        tk.Button(history_buttons,text='Compare With Current',command=compare_revision).pack(side=tk.LEFT,padx=5)
-        tk.Button(history_buttons,text='Restore Selected Revision',command=restore).pack(side=tk.LEFT,padx=5)
+            viewer.configure(state=tk.DISABLED)
+            diff.footer_note('READ-ONLY  /  REVISION COMPARISON')
+            diff.button(diff.footer_buttons,'Back to History',
+                        lambda: self._return_to_debug_history(),icon='undo',side=tk.RIGHT)
+
+        ui.button(ui.footer_buttons,'Restore Selected Revision',restore,icon='undo',accent=True,side=tk.RIGHT)
+        ui.button(ui.footer_buttons,'Compare With Current',compare_revision,icon='layers',side=tk.RIGHT,padx=(0,8))
+        return window
+
+    def _return_to_debug_history(self):
+        self._debug_active_tool = None
+        self._open_debug_tool('history')
 
     def open_preset_manager(self):
-        """Non-destructive searchable preset manager with tags and favorites."""
-        window=tk.Toplevel(self.root);window.title('Sequent — Preset Manager')
-        window.geometry('680x520');window.configure(bg=BG_PANEL)
+        """Sequent-styled searchable manager; no file drop handlers or extra DLLs."""
+        ui=self._new_debug_panel('Preset Manager',
+                            'Find, tag, favorite, duplicate and open saved macros',
+                            'folder', (750, 555))
+        if ui is None: return None
+        window=ui.window
         query=tk.StringVar();only_fav=tk.BooleanVar(value=False)
         meta_path=os.path.join(self.presets_dir,'.sequent_preset_catalog.json')
         def read_meta():
@@ -10353,34 +12097,78 @@ class BuiltInMacroApp:
                 return meta if isinstance(meta,dict) else {}
             except FileNotFoundError:return {}
         meta=read_meta()
-        tk.Entry(window,textvariable=query,bg=BG_INPUT,fg=TEXT_PRIMARY,
-                 insertbackground=TEXT_PRIMARY).pack(fill=tk.X,padx=12,pady=(12,4))
-        tk.Checkbutton(window,text='Favorites only',variable=only_fav,bg=BG_PANEL,
-                       fg=TEXT_PRIMARY,selectcolor=BG_INPUT).pack(anchor='w',padx=12)
-        listing=tk.Listbox(window,bg=BG_INPUT,fg=TEXT_PRIMARY,exportselection=False)
-        listing.pack(fill=tk.BOTH,expand=True,padx=12,pady=7)
-        tag=tk.StringVar();tk.Entry(window,textvariable=tag,bg=BG_INPUT,fg=TEXT_PRIMARY,
-                                    insertbackground=TEXT_PRIMARY).pack(fill=tk.X,padx=12,pady=(2,9))
+        panel=ui.frame(ui.body,'panel',highlightthickness=1,highlightbackground=BG_BORDER)
+        panel.pack(fill=tk.BOTH,expand=True)
+        search=ui.frame(panel,'panel');search.pack(fill=tk.X,padx=12,pady=(11,7))
+        ui.icon(search,'search').pack(side=tk.LEFT,padx=(0,8))
+        field=ui.entry(search,textvariable=query)
+        field.pack(side=tk.LEFT,fill=tk.X,expand=True,ipady=7)
+        ui.checkbox(panel,'Favorites only',only_fav).pack(anchor='w',padx=12,pady=(0,7))
+        holder=ui.frame(panel,'panel');holder.pack(fill=tk.BOTH,expand=True,padx=11)
+        listing=ui.listbox(holder)
+        ui.scroll(holder,listing)
+        listing.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        tags=ui.frame(panel,'panel');tags.pack(fill=tk.X,padx=12,pady=11)
+        ui.label(tags,'PRESET TAG',font=('Segoe UI',9,'bold')).pack(side=tk.LEFT,padx=(0,12))
+        tag=tk.StringVar()
+        tag_field=ui.entry(tags,textvariable=tag)
+        tag_field.pack(side=tk.LEFT,fill=tk.X,expand=True,ipady=5)
         names=[]
+        locals_for_favorite = {}
         def refresh(*_):
             old=listing.curselection();previous=names[old[0]] if old and old[0]<len(names) else None
             names[:]=[n for n in self.get_preset_names() if
-                      (query.get().casefold() in n.casefold() or query.get().casefold() in str(meta.get(n,{}).get('tag','')).casefold())
+                      (query.get().casefold() in n.casefold() or
+                       query.get().casefold() in str(meta.get(n,{}).get('tag','')).casefold())
                       and (not only_fav.get() or meta.get(n,{}).get('favorite',False))]
             listing.delete(0,tk.END)
-            for n in names: listing.insert(tk.END,('★ ' if meta.get(n,{}).get('favorite') else '   ')+n+
-                                           ('  #'+str(meta.get(n,{}).get('tag')) if meta.get(n,{}).get('tag') else ''))
+            for n in names:
+                # Unicode star is a list marker; the actual toggle uses the
+                # same custom-drawn Canvas star as the rest of Sequent.
+                flag='★  ' if meta.get(n,{}).get('favorite') else '☆  '
+                tag_string='  /  '+str(meta.get(n,{}).get('tag')) if meta.get(n,{}).get('tag') else ''
+                listing.insert(tk.END,flag+n+tag_string)
             if previous in names:listing.selection_set(names.index(previous))
+            if 'favorite_btn' in locals_for_favorite:
+                update_star_button()
+            ui.footer_note(f'{len(names)} PRESETS  /  {"FAVORITES" if only_fav.get() else "ALL"}')
         def selected():
             ids=listing.curselection();return names[ids[0]] if ids else None
         def save_meta():
             self._write_json_atomically(meta_path,meta)
-        def edit_favorite():
+        def update_star_button():
+            name=selected()
+            favorite=bool(name and meta.get(name,{}).get('favorite',False))
+            if favorite_btn.icon:
+                favorite_btn.icon.paint(name='star-filled' if favorite else 'star')
+            favorite_btn.label.config(text='Unfavorite' if favorite else 'Favorite')
+
+        def toggle_favorite():
             name=selected()
             if not name:return
             item=meta.setdefault(name,{})
-            item['favorite']=not item.get('favorite',False);item['tag']=tag.get().strip()[:60]
-            save_meta();refresh()
+            old=bool(item.get('favorite',False))
+            item['favorite']=not old
+            try:
+                save_meta()
+                refresh()
+            except (OSError,ValueError) as exc:
+                item['favorite']=old
+                messagebox.showerror('Save preset favorite',str(exc),parent=window)
+            update_star_button()
+
+        def save_tag():
+            name=selected()
+            if not name:return
+            item=meta.setdefault(name,{})
+            old=item.get('tag','')
+            item['tag']=tag.get().strip()[:60]
+            try:
+                save_meta()
+                refresh()
+            except (OSError,ValueError) as exc:
+                item['tag']=old
+                messagebox.showerror('Save preset tag',str(exc),parent=window)
         def duplicate():
             name=selected()
             if not name:return
@@ -10388,28 +12176,35 @@ class BuiltInMacroApp:
                                         initialvalue=name+'_copy')
             if not dest:return
             try:
-                if not re.fullmatch(r'[A-Za-z0-9 _-]{1,90}',dest):raise ValueError('Use letters, numbers, spaces, _ or -')
+                if not re.fullmatch(r'[A-Za-z0-9 _-]{1,90}',dest):
+                    raise ValueError('Use letters, numbers, spaces, _ or -')
                 old=os.path.join(self.presets_dir,name+'.json')
                 new=os.path.join(self.presets_dir,dest+'.json')
                 with open(old,'rb') as f: raw=f.read()
                 json.loads(raw.decode('utf-8'))
                 with open(new,'xb') as out:out.write(raw)
                 refresh();self.refresh_preset_menu()
-            except (OSError,ValueError) as exc:messagebox.showerror('Duplicate failed',str(exc),parent=window)
+            except (OSError,ValueError) as exc:
+                messagebox.showerror('Duplicate failed',str(exc),parent=window)
         def on_select(_=None):
             name=selected()
             if name:tag.set(str(meta.get(name,{}).get('tag','')))
+            update_star_button()
         query.trace_add('write',refresh);only_fav.trace_add('write',refresh)
         listing.bind('<<ListboxSelect>>',on_select)
-        controls=tk.Frame(window,bg=BG_PANEL);controls.pack(fill=tk.X,padx=12,pady=8)
-        tk.Button(controls,text='Save Tag / Toggle Favorite',command=edit_favorite).pack(side=tk.LEFT,padx=3)
-        tk.Button(controls,text='Duplicate',command=duplicate).pack(side=tk.LEFT,padx=3)
         def open_selected():
             name=selected()
             if name and self.on_preset_file_selected(name,os.path.join(self.presets_dir,name+'.json')):
-                window.destroy()
-        tk.Button(controls,text='Open Preset',command=open_selected).pack(side=tk.LEFT,padx=3)
+                ui.close()
+        ui.button(ui.footer_buttons,'Open Preset',open_selected,icon='folder',accent=True,side=tk.RIGHT)
+        ui.button(ui.footer_buttons,'Duplicate',duplicate,icon='layers',side=tk.RIGHT,padx=(0,7))
+        ui.button(ui.footer_buttons,'Save Tag',save_tag,icon='save',side=tk.RIGHT,padx=(0,7))
+        favorite_btn = ui.button(ui.footer_buttons,'Favorite',toggle_favorite,
+                                 icon='star',side=tk.RIGHT,padx=(0,7))
+        locals_for_favorite['favorite_btn']=favorite_btn
         refresh()
+        update_star_button()
+        return window
 
     def get_preset_names(self):
         if not os.path.exists(self.presets_dir): return []
@@ -10462,25 +12257,43 @@ class BuiltInMacroApp:
         self.hamburger.bind("<Leave>", lambda e: self.hamburger.paint(bg=BG_HEADER))
         ModernTooltip(self.hamburger, "Toggle Workspace Navigation")
 
+        # Compact top-bar identity: a colored marker beside the *original*
+        # SEQUENT artwork.  The full two-line logo remains a separate asset,
+        # but would make MACRO ENGINE illegible at toolbar sizes.
         brand = tk.Frame(top_bar, bg=BG_HEADER)
         brand.pack(side=tk.LEFT, padx=(6, 20))
-        title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_PRIMARY,
-                         font=("Segoe UI", 12, "bold"))
-        title.pack(anchor="w")
-        tk.Label(brand, text=" MACRO ENGINE", bg=BG_HEADER, fg=COLOR_ACCENT,
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        for widget in (brand, title):
+        self.brand_marker = tk.Canvas(brand, width=8, height=26, bg=BG_HEADER,
+                                      borderwidth=0, highlightthickness=0,
+                                      takefocus=0)
+        # Rounded 5px bar, centered vertically next to the wordmark.
+        self.brand_marker.create_line(4, 6, 4, 20, width=5,
+                                      fill=COLOR_ACCENT, capstyle=tk.ROUND,
+                                      tags="brand_accent_marker")
+        self.brand_marker.pack(side=tk.LEFT, padx=(0, 10))
+        self.brand_label = None
+        try:
+            brand_photo = sequent_compact_brand_photoimage(brand, TEXT_HEADER)
+        except (OSError, ValueError, tk.TclError, zlib.error) as exc:
+            print(f"[Sequent] Compact brand artwork unavailable: {exc}")
+            brand_photo = None
+        if brand_photo is not None:
+            title = tk.Label(brand, image=brand_photo, bg=BG_HEADER,
+                             borderwidth=0, highlightthickness=0, padx=0, pady=0)
+            title.image = brand_photo  # Keep the PhotoImage alive.
+            self.brand_label = title
+        else:
+            # Safe startup even if the brand asset is deleted or corrupt.
+            title = tk.Label(brand, text="SEQUENT", bg=BG_HEADER, fg=TEXT_HEADER,
+                             font=("Segoe UI", 12, "bold"), borderwidth=0)
+            self.brand_label = title
+        title.pack(side=tk.LEFT)
+        for widget in (brand, self.brand_marker, title):
             widget.bind("<Button-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag_window)
 
-        # Align the Mini HUD once with the expanded sidebar boundary.
-        # Its position is independent of sidebar opening/closing animations.
-        self._topbar_brand = brand
-        self.mini_hud_button = sequent_toolbar_button(top_bar, "Mini HUD", self.toggle_mini_hud)
-        self.mini_hud_button.place(x=self.sidebar_width + 12, rely=0.5, anchor=tk.W)
-        top_bar.bind("<Configure>", self._position_mini_hud_button, add="+")
-
-        tools_button = sequent_toolbar_button(top_bar, 'IDE Tools', self.open_ide_tools)
+        # Debug Tools remains accessible from the workspace sidebar.
+        # Mini HUD is entered using the existing minimize icon below, so the
+        # top bar needs neither of the duplicate shortcut buttons.
         win_controls = tk.Frame(top_bar, bg=BG_HEADER)
         win_controls.pack(side=tk.RIGHT, fill=tk.Y)
         btn_close = SequentIcon(win_controls, 'close', bg=BG_HEADER,
@@ -10492,9 +12305,13 @@ class BuiltInMacroApp:
         btn_min = SequentIcon(win_controls, 'minimize', bg=BG_HEADER,
                               color=TEXT_MUTED, size=19)
         btn_min.pack(side=tk.RIGHT, padx=13, pady=15)
-        btn_min.bind("<Button-1>", lambda e: self.minimize_window())
+        # Keep the native-looking MINIMIZE glyph but collapse to Mini HUD.
+        # The HUD's Expand button restores the full Sequent workspace.
+        self.mini_hud_button = btn_min  # Guided Tour target (not another button).
+        btn_min.bind("<Button-1>", lambda e: self.toggle_mini_hud())
         btn_min.bind("<Enter>", lambda e: btn_min.paint(bg=BG_HOVER))
         btn_min.bind("<Leave>", lambda e: btn_min.paint(bg=BG_HEADER))
+        ModernTooltip(btn_min, "Minimize to Mini HUD")
         # The native title bar already supplies Windows minimize/close controls.
         if self.native_window_resize:
             win_controls.pack_forget()
@@ -10508,7 +12325,6 @@ class BuiltInMacroApp:
             # Windows handles double-click-to-maximize on the custom caption.
             top_bar.bind("<Double-Button-1>", lambda e: self.toggle_maximize_window())
 
-        tools_button.pack(side=tk.RIGHT, padx=(4, 7), pady=8)
         # Notifications live exclusively in the bottom-left footer. Keep the
         # top-right area available for the preset selector and window controls.
 
@@ -10605,6 +12421,7 @@ class BuiltInMacroApp:
         self._tab_anim_id = None
         self.frame_playback = tk.Frame(self.content_frame, bg=BG_APP)
         self.frame_sequencer = tk.Frame(self.content_frame, bg=BG_APP)
+        self.frame_debug = tk.Frame(self.content_frame, bg=BG_APP)
         # Settings is a peer of the independent Playback/Sequencer docks.
         # If it stays nested in content_frame, the dock windows always paint
         # above it during page transitions, obscuring the Settings controls.
@@ -10623,6 +12440,7 @@ class BuiltInMacroApp:
         self.build_playback_view()
         self.build_sequencer_view()
         self.build_settings_view()
+        self.build_debug_view()
         # Separate transition canvas (for page effects, not sidebar movement).
         self.overlay = tk.Canvas(self.root, bg=BG_APP, highlightthickness=0)
         self.show_tab(initial_tab, animate=animate)
@@ -10641,10 +12459,7 @@ class BuiltInMacroApp:
         if action == "prev": self.step_backward()
         elif action == "next": self.step_forward()
         elif action == "home": self.jump_to_start()
-        elif action == "end":
-            if self.recorded_actions:
-                self.current_action_idx = len(self.recorded_actions) - 1
-                self.update_scrubber_ui()
+        elif action == "end": self.jump_to_end()
         elif action == "run_step":
             self.run_single_step()
         return "break"
@@ -10778,6 +12593,10 @@ class BuiltInMacroApp:
             self.sidebar_frame, text="SEQUENCER",
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
+        self.btn_tab_debug = SidebarButton(
+            self.sidebar_frame, text='DEBUG TOOLS',
+            command=lambda: self.show_tab('debug_tools'))
+        self.btn_tab_debug.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_settings = SidebarButton(
             self.sidebar_frame, text="SETTINGS",
             command=lambda: self.show_tab("settings"))
@@ -11028,41 +12847,33 @@ class BuiltInMacroApp:
                  font=("Segoe UI", 8, "bold")).pack(fill=tk.X, anchor="w")
         self.scrub_card = tk.Frame(controls, bg=BG_PANEL)
         self.scrub_card.pack(fill=tk.X, pady=(9, 9))
-        step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        step_controls.pack(fill=tk.X, pady=(0, 12))
-        for title, callback, hint, icon_name in [
-            ("", self.jump_to_start, "Home", "first"),
-            ("", self.step_backward, "Previous", "back"),
-            ("", self.step_forward, "Next", "forward"),
-            ("Step", self.run_single_step, "Execute selected action", "step"),
-        ]:
-            btn = sequent_toolbar_button(step_controls, title, callback, icon=icon_name)
-            btn.pack(side=tk.LEFT, padx=(0, 5))
-            ModernTooltip(btn, hint)
-        tk.Label(self.scrub_card, text="PLAYHEAD", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        # Keep the scrubber and action count, but omit the redundant PLAYHEAD
+        # heading so the transport is cleaner and uses less vertical space.
         scrub_row = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        scrub_row.pack(fill=tk.X, pady=(5, 9))
+        scrub_row.pack(fill=tk.X, pady=(1, 12))
         self.scrub_badge = tk.Label(scrub_row, text="[ 0 / 0 ]",
                                     bg=BG_INPUT, fg=SYNTAX_BLUE,
                                     font=("Consolas", 8, "bold"), padx=7, pady=4)
         self.scrub_badge.pack(side=tk.RIGHT)
         self.scrubber = ModernScrubberTrack(scrub_row, command=self.on_scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 7))
-        options = tk.Frame(self.scrub_card, bg=BG_PANEL)
-        options.pack(fill=tk.X, pady=(2, 4))
-        tk.Label(options, text="Repeat", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
-        self.loop_var = tk.StringVar(value=self.loop_mode)
-        self.loop_menu = tk.OptionMenu(options, self.loop_var, *self.loop_options,
-                                       command=lambda val: setattr(self, 'loop_mode', val))
-        self.loop_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
-                              activeforeground=TEXT_PRIMARY, font=("Segoe UI", 9),
-                              highlightthickness=1, highlightbackground=BG_BORDER,
-                              bd=0, relief="flat", cursor="hand2")
-        self.loop_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                      activebackground=COLOR_ACCENT, bd=0)
-        self.loop_menu.pack(side=tk.RIGHT)
+
+        # A centered, animated capsule, with independently customizable icons.
+        step_controls = tk.Frame(self.scrub_card, bg=BG_PANEL)
+        step_controls.pack(fill=tk.X, pady=(0, 5))
+        transport_items = [
+            ("transport.jump-to-start", "", self.jump_to_start, "Home", "first"),
+            ("transport.previous", "", self.step_backward, "Previous", "back"),
+            ("transport.next", "", self.step_forward, "Next", "forward"),
+            ("transport.skip-to-end", "", self.jump_to_end,
+             "Skip to End (select last action, do not execute)", "last"),
+        ]
+        self.transport_pillbar = SequentAnimatedPillBar(
+            step_controls, transport_items, icon_only=True)
+        self.transport_pillbar.pack(anchor="center")
+        # Named segment icons are exposed for legacy integrations and tests.
+        self.transport_buttons = dict(zip(
+            (item[0] for item in transport_items), self.transport_pillbar.icons))
         tk.Frame(controls, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(12, 14))
         tk.Label(controls, text="CURRENT ACTION", bg=BG_PANEL, fg=TEXT_MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w")
@@ -11118,16 +12929,21 @@ class BuiltInMacroApp:
         self.action_badge.pack(side=tk.RIGHT, padx=(3, 9))
         filebar = tk.Frame(queue_dock, bg=BG_PANEL, padx=11, pady=9)
         filebar.pack(fill=tk.X)
-        self.import_macro_button = sequent_toolbar_button(filebar, "Import", self.load_macro_from_file)
-        self.import_macro_button.pack(side=tk.LEFT, padx=(0, 5))
-        sequent_toolbar_button(filebar, "Export", self.save_macro_to_file).pack(side=tk.LEFT)
-        save_now = sequent_toolbar_button(filebar, "Save", self.save_current_preset)
-        save_now.pack(side=tk.LEFT, padx=(5, 0))
-        ModernTooltip(save_now, "Save the loaded preset now, or name a new preset", "Ctrl+S")
-        self.queue_undo_btn = sequent_toolbar_button(
-            filebar, "Undo", self.undo_deleted_actions, icon='undo')
-        self.queue_undo_btn.pack(side=tk.LEFT, padx=(5, 0))
-        ModernTooltip(self.queue_undo_btn, "Restore deleted queue actions", "Ctrl+Z")
+        file_actions = [
+            ("button.import", "Import", self.load_macro_from_file,
+             "Import a macro from a file", "upload"),
+            ("button.export", "Export", self.save_macro_to_file,
+             "Export the macro to a file", "download"),
+            ("button.save", "Save", self.save_current_preset,
+             "Save the loaded preset (Ctrl+S)", "save"),
+            ("button.undo", "Undo", self.undo_deleted_actions,
+             "Restore deleted queue actions (Ctrl+Z)", "undo"),
+        ]
+        self.file_action_pillbar = SequentAnimatedPillBar(filebar, file_actions)
+        self.file_action_pillbar.pack(side=tk.LEFT)
+        # Retain references for workflows that inspect these controls.
+        self.import_macro_button = self.file_action_pillbar.icons[0]
+        self.queue_undo_btn = self.file_action_pillbar.icons[3]
         
         # The lengthy instruction consumed more width than the queue could
         # supply at its default size. Keep the help accessible via a tooltip.
@@ -11243,10 +13059,13 @@ class BuiltInMacroApp:
         self.chain_badge.pack(side=tk.RIGHT, padx=(3, 9))
         filebar = tk.Frame(left, bg=BG_PANEL, padx=11, pady=9)
         filebar.pack(fill=tk.X)
-        sequent_toolbar_button(filebar, "Import Chain", self.load_chain_from_file).pack(
-            side=tk.LEFT, padx=(0, 6))
-        sequent_toolbar_button(filebar, "Export Chain", self.save_chain_to_file).pack(
-            side=tk.LEFT)
+        self.chain_action_pillbar = SequentAnimatedPillBar(filebar, [
+            ("button.import-chain", "Import Chain", self.load_chain_from_file,
+             "Import a macro chain", "upload"),
+            ("button.export-chain", "Export Chain", self.save_chain_to_file,
+             "Export the macro chain", "download"),
+        ])
+        self.chain_action_pillbar.pack(side=tk.LEFT)
         self.chain_scroll = ModernScrollableFrame(left, bg=BG_PANEL)
         self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.refresh_chain_ui()
@@ -11361,21 +13180,27 @@ class BuiltInMacroApp:
             ).pack(side=tk.LEFT)
 
             # Delete Stage Button
-            btn_del = tk.Label(row, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=card_bg, fg=TEXT_MUTED, cursor="hand2")
+            btn_del = SequentIcon(row, 'trash', bg=card_bg, color=TEXT_MUTED,
+                                  size=16, override_key='button.remove-stage',
+                                  slot_label='Remove chain stage')
             btn_del.pack(side=tk.RIGHT, padx=(4, 0))
             btn_del.bind("<Button-1>", lambda e, i=idx: self.remove_chain_stage(i))
-            btn_del.bind("<Enter>", lambda e, w=btn_del: w.config(fg="white", bg=COLOR_DANGER))
-            btn_del.bind("<Leave>", lambda e, w=btn_del, bg=card_bg: w.config(fg=TEXT_MUTED, bg=bg))
+            btn_del.bind("<Enter>", lambda e, w=btn_del: w.paint(bg=COLOR_DANGER, color='white'))
+            btn_del.bind("<Leave>", lambda e, w=btn_del, bg=card_bg: w.paint(bg=bg, color=TEXT_MUTED))
 
             # Move Down Button
             if idx < count - 1:
-                btn_down = tk.Label(row, text=" ▼ ", font=("Segoe UI", 8), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2", padx=4, pady=2)
+                btn_down = SequentIcon(row, 'down', bg=BG_INPUT, color=TEXT_MUTED,
+                                       size=16, override_key='button.move-stage-down',
+                                       slot_label='Move chain stage down')
                 btn_down.pack(side=tk.RIGHT, padx=(2, 2))
                 btn_down.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, 1))
 
             # Move Up Button
             if idx > 0:
-                btn_up = tk.Label(row, text=" ▲ ", font=("Segoe UI", 8), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2", padx=4, pady=2)
+                btn_up = SequentIcon(row, 'up', bg=BG_INPUT, color=TEXT_MUTED,
+                                       size=16, override_key='button.move-stage-up',
+                                       slot_label='Move chain stage up')
                 btn_up.pack(side=tk.RIGHT, padx=(2, 2))
                 btn_up.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, -1))
 
@@ -11859,6 +13684,13 @@ class BuiltInMacroApp:
     def jump_to_start(self):
         if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions: return
         self.current_action_idx = 0
+        self.update_scrubber_ui()
+
+    def jump_to_end(self):
+        """Select the last queued action without executing it or changing the macro."""
+        if (self.recording and not self.recording_paused) or self.playing or not self.recorded_actions:
+            return
+        self.current_action_idx = len(self.recorded_actions) - 1
         self.update_scrubber_ui()
 
     def step_backward(self):
@@ -13232,6 +15064,17 @@ try {{
         f_app.pack(fill=tk.X)
 
         self.build_appearance_settings(f_app)
+        icons_row = tk.Frame(f_app, bg=BG_PANEL)
+        icons_row.pack(fill=tk.X, pady=(2, 11))
+        tk.Label(icons_row, text="Custom Button Icons", font=("Segoe UI", 9, "bold"),
+                 bg=BG_PANEL, fg=TEXT_PRIMARY, width=24, anchor="w").pack(side=tk.LEFT)
+        def reload_custom_icons():
+            count = sequent_reload_icons(self.root)
+            self.update_status(f"Icon assets reloaded ({count} icons refreshed)", COLOR_SUCCESS)
+        sequent_toolbar_button(icons_row, "Reload Icons", reload_custom_icons,
+                               icon='refresh').pack(side=tk.LEFT, padx=(0, 8))
+        sequent_toolbar_button(icons_row, "Manage Icons...", self.open_icon_manager,
+                               icon='settings').pack(side=tk.LEFT)
         self.build_entertain_me_toggle(f_app)
         self.autosave_toggle = add_setting_toggle(
             f_app, "Autosave loaded presets", self.autosave_presets,
@@ -13354,11 +15197,13 @@ try {{
                 CUSTOM_SOUND_PATHS[cue_key] = ""
                 lbl_path.config(text="Default Theme Sound", fg=TEXT_MUTED)
 
-            btn_clear = tk.Label(path_box, text=" ✕ ", font=("Segoe UI", 9, "bold"), bg=BG_INPUT, fg=TEXT_MUTED, cursor="hand2")
+            btn_clear = SequentIcon(path_box, 'close', color=TEXT_MUTED, bg=BG_INPUT,
+                                    size=16, override_key='button.clear-sound',
+                                    slot_label='Clear custom sound')
             btn_clear.pack(side=tk.RIGHT, padx=(2, 0))
             btn_clear.bind("<Button-1>", lambda e: _clear())
-            btn_clear.bind("<Enter>", lambda e: btn_clear.config(fg=COLOR_DANGER))
-            btn_clear.bind("<Leave>", lambda e: btn_clear.config(fg=TEXT_MUTED))
+            btn_clear.bind("<Enter>", lambda e: btn_clear.paint(color=COLOR_DANGER))
+            btn_clear.bind("<Leave>", lambda e: btn_clear.paint(color=TEXT_MUTED))
             
             btn_browse = tk.Label(controls, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=10, pady=4)
             btn_browse.pack(side=tk.RIGHT)
@@ -13424,6 +15269,306 @@ try {{
 
         return self.entertain_pill
 
+
+    def open_icon_manager(self):
+        """Browse a folder of image assets and assign them to Sequent controls."""
+        window = tk.Toplevel(self.root)
+        window.title('Sequent — Icon Manager')
+        window.configure(bg=BG_APP)
+        window.geometry('1160x715')
+        window.minsize(850, 540)
+        window.transient(self.root)
+        header = tk.Frame(window, bg=BG_HEADER)
+        header.pack(fill=tk.X)
+        tk.Label(header, text='ICON MANAGER', bg=BG_HEADER, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 12, 'bold')).pack(anchor='w', padx=18, pady=(13, 3))
+        tk.Label(header, text='Choose a control, then select artwork from your icon library.',
+                 bg=BG_HEADER, fg=TEXT_MUTED, font=('Segoe UI', 9)).pack(
+                     anchor='w', padx=18, pady=(0, 10))
+
+        library_folder = [sequent_icon_directory().resolve()]
+        chosen_icon = [None]
+        folder_bar = tk.Frame(window, bg=BG_PANEL)
+        folder_bar.pack(fill=tk.X, padx=16, pady=(12, 0))
+        tk.Label(folder_bar, text='ICON FOLDER', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=(10, 8), pady=8)
+        folder_label = tk.Label(folder_bar, bg=BG_PANEL, fg=TEXT_PRIMARY,
+                                font=('Segoe UI', 9), anchor='w')
+        folder_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        body = tk.Frame(window, bg=BG_APP)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        left = tk.Frame(body, bg=BG_PANEL, width=304)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left.pack_propagate(False)
+        right = tk.Frame(body, bg=BG_PANEL, width=275)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right.pack_propagate(False)
+        middle = tk.Frame(body, bg=BG_PANEL)
+        middle.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(left, text='SEQUENT CONTROL', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(12, 0))
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(left, textvariable=search_var, bg=BG_INPUT,
+                                fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                                relief=tk.FLAT, font=('Segoe UI', 10))
+        search_entry.pack(fill=tk.X, padx=10, pady=10, ipady=5)
+        listbox = tk.Listbox(left, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                             selectbackground=BG_SELECTED, selectforeground=TEXT_PRIMARY,
+                             font=('Consolas', 9), relief=tk.FLAT, exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        selection = [None]
+        shown = []
+
+        tk.Label(middle, text='AVAILABLE ICONS', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=12, pady=(12, 0))
+        library_search = tk.StringVar()
+        tk.Entry(middle, textvariable=library_search, bg=BG_INPUT,
+                 fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+                 relief=tk.FLAT, font=('Segoe UI', 10)).pack(
+                     fill=tk.X, padx=10, pady=10, ipady=5)
+        gallery = ModernScrollableFrame(middle, bg=BG_PANEL)
+        gallery.pack(fill=tk.BOTH, expand=True, padx=6)
+        gallery_body = gallery.scrollable_frame
+        page_index = [0]
+        page_size = 36
+        thumbnails = []  # PhotoImage references must survive Tk garbage collection.
+        filtered_files = []
+        gallery_tiles = {}
+        gallery_footer = tk.Frame(middle, bg=BG_PANEL)
+        gallery_footer.pack(fill=tk.X, padx=10, pady=(7, 10))
+        page_label = tk.Label(gallery_footer, text='', bg=BG_PANEL, fg=TEXT_MUTED,
+                              font=('Segoe UI', 8))
+        page_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        label = tk.Label(right, text='SELECT AN ICON SLOT', bg=BG_PANEL,
+                         fg=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'),
+                         wraplength=245, justify=tk.LEFT)
+        label.pack(anchor='w', padx=14, pady=(14, 9))
+        preview = SequentIcon(right, 'folder', bg=BG_PANEL, color=TEXT_PRIMARY,
+                              size=48)
+        preview.pack(pady=(10, 12))
+        state = tk.Label(right, text='Select a control to see its icon', bg=BG_PANEL,
+                         fg=TEXT_MUTED, font=('Consolas', 9), wraplength=245,
+                         justify=tk.LEFT)
+        state.pack(anchor='w', padx=14, pady=(0, 12))
+        tk.Frame(right, bg=BG_BORDER, height=1).pack(fill=tk.X, padx=12)
+        tk.Label(right, text='SELECTED ARTWORK', bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(anchor='w', padx=14, pady=(13, 3))
+        selected_preview = tk.Label(right, bg=BG_PANEL, fg=TEXT_PRIMARY)
+        selected_preview.pack(pady=4)
+        selected_name = tk.Label(right, text='No image selected', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 9),
+                                 wraplength=235, justify=tk.CENTER)
+        selected_name.pack(padx=12, pady=(2, 12))
+
+        def refresh_slots(*_):
+            needle = search_var.get().casefold()
+            old = selection[0]
+            catalog = sequent_icon_catalog()
+            shown[:] = [slot for slot, (title, _) in catalog.items()
+                        if needle in slot.casefold() or needle in title.casefold()]
+            listbox.delete(0, tk.END)
+            for slot in shown:
+                title, _ = catalog[slot]
+                custom = '  *' if sequent_icon_path(slot) else ''
+                listbox.insert(tk.END, f'{title[:23]:23s} {slot}{custom}')
+            if old in shown:
+                idx = shown.index(old)
+                listbox.selection_set(idx)
+                listbox.see(idx)
+                on_slot_selection()
+
+        def on_slot_selection(event=None):
+            if not listbox.curselection():
+                return
+            selected = shown[listbox.curselection()[0]]
+            selection[0] = selected
+            title, glyph = sequent_icon_catalog()[selected]
+            label.config(text=title)
+            preview.override_key = selected
+            preview.paint(name=glyph)
+            linked = sequent_icon_path(selected)
+            state.config(text=selected + '\n' +
+                         (str(linked.relative_to(sequent_icon_directory())) if linked
+                          else '(built-in vector fallback)'))
+
+        def choose_gallery_icon(path):
+            chosen_icon[0] = path
+            selected_name.config(text=path.name)
+            try:
+                image = sequent_icon_thumbnail(window, path, 70)
+                selected_preview.configure(image=image, text='')
+                selected_preview.image = image
+            except (tk.TclError, OSError, ValueError):
+                selected_preview.configure(image='', text='Preview unavailable')
+                selected_preview.image = None
+            for tile_path, tile in gallery_tiles.items():
+                tile.configure(highlightbackground=(COLOR_ACCENT if tile_path == path
+                                                     else BG_BORDER),
+                               highlightthickness=(2 if tile_path == path else 1))
+
+        def render_gallery():
+            for item in gallery_body.winfo_children():
+                item.destroy()
+            gallery_tiles.clear()
+            thumbnails.clear()
+            max_page = max(0, (len(filtered_files) - 1) // page_size)
+            page_index[0] = min(max(0, page_index[0]), max_page)
+            start = page_index[0] * page_size
+            files = filtered_files[start:start + page_size]
+            if not files:
+                tk.Label(gallery_body, text='No SVG, PNG, or GIF icons found in this folder.',
+                         bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 9),
+                         wraplength=300).pack(padx=12, pady=18)
+            for pos, path in enumerate(files):
+                tile = tk.Frame(gallery_body, bg=BG_INPUT,
+                                highlightbackground=(COLOR_ACCENT if path == chosen_icon[0]
+                                                     else BG_BORDER),
+                                highlightthickness=(2 if path == chosen_icon[0] else 1),
+                                cursor='hand2', width=90, height=99)
+                tile.grid(row=pos // 3, column=pos % 3, padx=4, pady=4, sticky='nsew')
+                tile.grid_propagate(False)
+                gallery_tiles[path] = tile
+                try:
+                    img = sequent_icon_thumbnail(window, path, 54)
+                    thumbnails.append(img)
+                    art = tk.Label(tile, image=img, bg=BG_INPUT, cursor='hand2')
+                except (tk.TclError, OSError, ValueError):
+                    art = tk.Label(tile, text='?', bg=BG_INPUT, fg=COLOR_DANGER,
+                                   font=('Segoe UI', 18), cursor='hand2')
+                art.pack(expand=True)
+                name = tk.Label(tile, text=path.stem[:15], bg=BG_INPUT,
+                                fg=TEXT_MUTED, font=('Segoe UI', 8), cursor='hand2')
+                name.pack(pady=(0, 5))
+                for control in (tile, art, name):
+                    control.bind('<Button-1>', lambda _e, p=path: choose_gallery_icon(p))
+            for col in range(3):
+                gallery_body.columnconfigure(col, weight=1)
+            page_label.config(text=f'{len(filtered_files)} icons  ·  '
+                              f'Page {page_index[0]+1} of {max_page+1}')
+            gallery.canvas.yview_moveto(0)
+
+        def filter_gallery(*_):
+            query = library_search.get().casefold().strip()
+            files = sequent_icon_library_files(library_folder[0])
+            filtered_files[:] = [path for path in files
+                                 if query in str(path.relative_to(library_folder[0])).casefold()]
+            page_index[0] = 0
+            render_gallery()
+
+        def page(direction):
+            page_index[0] += direction
+            render_gallery()
+
+        back_btn = sequent_toolbar_button(gallery_footer, 'Previous',
+                  lambda: page(-1) if page_index[0] > 0 else None, icon='back')
+        back_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        next_btn = sequent_toolbar_button(gallery_footer, 'Next',
+                  lambda: page(1) if (page_index[0] + 1) * page_size < len(filtered_files)
+                  else None, icon='forward')
+        next_btn.pack(side=tk.RIGHT)
+
+        def set_folder(folder):
+            library_folder[0] = Path(folder).expanduser().resolve()
+            folder_label.config(text=str(library_folder[0]))
+            chosen_icon[0] = None
+            selected_preview.configure(image='', text='')
+            selected_preview.image = None
+            selected_name.config(text='No image selected')
+            if library_search.get():
+                library_search.set('')  # The StringVar callback refreshes the gallery.
+            else:
+                filter_gallery()
+
+        def pick_folder():
+            folder = filedialog.askdirectory(parent=window, title='Select your icon folder',
+                                             initialdir=str(library_folder[0]))
+            if folder:
+                set_folder(folder)
+
+        def import_all():
+            if not filtered_files:
+                messagebox.showinfo('No icon files', 'Choose a folder containing SVG, PNG, or GIF icons.',
+                                    parent=window)
+                return
+            try:
+                count, total = sequent_import_icon_folder(library_folder[0])
+                set_folder(sequent_icon_directory())
+                self.update_status(f'{count} of {total} icons copied into project assets/icons',
+                                   COLOR_SUCCESS)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror('Icon folder import failed', str(exc), parent=window)
+
+        def assign_selected():
+            if not selection[0]:
+                messagebox.showinfo('Select a control', 'Select a Sequent control first.',
+                                    parent=window)
+                return
+            if not chosen_icon[0]:
+                messagebox.showinfo('Select artwork', 'Select an icon from the gallery first.',
+                                    parent=window)
+                return
+            try:
+                # Validate the actual decoder, not just the file extension.
+                sequent_icon_thumbnail(window, chosen_icon[0], 52)
+                sequent_assign_library_icon(selection[0], chosen_icon[0])
+                sequent_reload_icons(self.root)
+                refresh_slots()
+                self.update_status(f'Icon assigned: {selection[0]}', COLOR_SUCCESS)
+            except (OSError, tk.TclError, ValueError) as exc:
+                messagebox.showerror('Icon assignment failed', str(exc), parent=window)
+
+        def choose_icon():
+            # Keep the original file picker for those assigning just one asset.
+            path = filedialog.askopenfilename(parent=window, title='Choose button icon',
+                        filetypes=[('Supported icons', '*.svg *.png *.gif'),
+                                   ('SVG vector', '*.svg'),
+                                   ('PNG image', '*.png'), ('GIF image', '*.gif')])
+            if path:
+                choose_gallery_icon(Path(path))
+                assign_selected()
+
+        def clear_icon():
+            slot = selection[0]
+            if not slot: return
+            mappings = sequent_icon_map().copy()
+            if slot in mappings:
+                del mappings[slot]
+                manifest = sequent_icon_directory() / 'icon_map.json'
+                manifest.write_text(json.dumps(mappings, indent=2) + '\n', encoding='utf-8')
+            global _SEQUENT_ICON_MAP_STATE
+            _SEQUENT_ICON_MAP_STATE = (None, None, {})
+            sequent_reload_icons(self.root)
+            preview.paint()
+            refresh_slots()
+
+        listbox.bind('<<ListboxSelect>>', on_slot_selection)
+        search_var.trace_add('write', refresh_slots)
+        library_search.trace_add('write', filter_gallery)
+        sequent_toolbar_button(folder_bar, 'Choose Folder...', pick_folder, icon='folder').pack(
+            side=tk.RIGHT, padx=(6, 10), pady=5)
+        sequent_toolbar_button(folder_bar, 'Project Icons',
+                               lambda: set_folder(sequent_icon_directory()), icon='folder').pack(
+                                   side=tk.RIGHT, padx=(6, 0), pady=5)
+        sequent_toolbar_button(folder_bar, 'Import Folder for GitHub', import_all,
+                               icon='download').pack(side=tk.RIGHT, padx=(6, 0), pady=5)
+        buttons = tk.Frame(right, bg=BG_PANEL)
+        buttons.pack(fill=tk.X, padx=12, pady=(4, 0))
+        sequent_toolbar_button(buttons, 'Assign Selected Icon', assign_selected,
+                               accent=True, icon='check').pack(fill=tk.X, pady=(0, 6))
+        sequent_toolbar_button(buttons, 'Assign Image...', choose_icon,
+                               icon='image').pack(fill=tk.X, pady=(0, 6))
+        sequent_toolbar_button(buttons, 'Restore Default', clear_icon,
+                               icon='undo').pack(fill=tk.X, pady=(0, 6))
+        tk.Label(right, text='Assigned artwork is always stored in assets/icons\n'
+                 'using a portable relative path for GitHub releases.',
+                 bg=BG_PANEL, fg=TEXT_MUTED, wraplength=245, justify=tk.LEFT,
+                 font=('Segoe UI', 8)).pack(anchor='w', padx=13, pady=(14, 10))
+        refresh_slots()
+        set_folder(sequent_icon_directory())
+        return window
 
     def build_appearance_settings(self, parent):
         """Persistent, easy-to-read theme selector and shared accent picker."""
@@ -13678,10 +15823,21 @@ try {{
         self._theme_rebuilding = True
 
         self._update_theme_tokens(theme_name)
+        sequent_retheme_ide_windows(self)
         if getattr(self, 'native_chrome', None) is not None:
             self.native_chrome.refresh_dwm_frame()
 
         active_tab = getattr(self, 'current_tab_name', 'playback') or 'playback'
+        debug_edit_snapshot = None
+        ui = getattr(self, '_debug_panel', None)
+        if (active_tab == 'debug_tools' and ui is not None and
+                getattr(ui, 'variable_editor', None) is not None):
+            editor = ui.variable_editor
+            if editor.winfo_exists() and editor.edit_modified():
+                selection = ui.variable_listing.curselection()
+                pair = (ui.variable_entries[selection[0]]
+                        if selection and selection[0] < len(ui.variable_entries) else None)
+                debug_edit_snapshot = (pair, editor.get('1.0', 'end-1c'))
         self._cancel_old_ui_jobs()
         try:
             self.root.configure(bg=BG_APP)
@@ -13706,6 +15862,16 @@ try {{
                 old_overlay.destroy()
 
             self.setup_ui(initial_tab=active_tab, animate=False)
+            if debug_edit_snapshot and getattr(self, '_debug_panel', None) is not None:
+                ui = self._debug_panel
+                pair, unsaved_text = debug_edit_snapshot
+                if pair in getattr(ui, 'variable_entries', []):
+                    index = ui.variable_entries.index(pair)
+                    ui.variable_listing.selection_clear(0, tk.END)
+                    ui.variable_listing.selection_set(index)
+                    ui.variable_editor.delete('1.0', tk.END)
+                    ui.variable_editor.insert('1.0', unsaved_text)
+                    ui.variable_editor.edit_modified(True)
             for grip in getattr(self, '_native_grips', ()):
                 if grip.winfo_exists():
                     grip.lift()
@@ -14415,6 +16581,11 @@ try {{
                 self.seq_timeline_viewport.place_configure(x=left)
             if self.stage_builder_dock.winfo_manager() == "place":
                 self.stage_builder_dock.place_configure(x=-13 + offset)
+        elif tab_name == "debug_tools":
+            # The embedded workspace is a single page, so animate its native
+            # frame directly. Never capture, destroy, or rebuild tool widgets.
+            if self.frame_debug.winfo_manager() == "place":
+                self.frame_debug.place_configure(x=offset)
 
     def _settle_tab_transition(self):
         """Finish/interupt animation and leave exactly one page visible."""
@@ -14429,12 +16600,13 @@ try {{
         if hasattr(self, "_settings_motion_view"):
             self._clear_settings_motion()
         current = self.current_tab_name
-        if current in ("playback", "sequencer", "settings"):
+        if current in ("playback", "sequencer", "settings", "debug_tools"):
             self._set_tab_heading(current)
         for name, frame in (
             ("playback", self.frame_playback),
             ("sequencer", self.frame_sequencer),
             ("settings", self.frame_settings),
+            ("debug_tools", self.frame_debug),
         ):
             if name != current:
                 frame.place_forget()
@@ -14448,7 +16620,9 @@ try {{
             # Settings must appear above the dock siblings, not behind them.
             self.frame_settings.lift()
         else:
-            self.frame_playback.tkraise() if current == "playback" else self.frame_sequencer.tkraise()
+            if current == 'playback': self.frame_playback.tkraise()
+            elif current == 'sequencer': self.frame_sequencer.tkraise()
+            elif current == 'debug_tools': self.frame_debug.tkraise()
         if hasattr(self, "sidebar_host") and self.sidebar_host.winfo_exists():
             self.sidebar_host.lift()
 
@@ -14456,6 +16630,7 @@ try {{
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
             "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
         title, subtitle = headings[tab_name]
@@ -14474,6 +16649,7 @@ try {{
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
             "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
         if tab_name not in headings:
@@ -14502,6 +16678,7 @@ try {{
         # We update the heading when the new page actually begins entering.
         self.btn_tab_playback.set_active(tab_name == "playback")
         self.btn_tab_sequencer.set_active(tab_name == "sequencer")
+        self.btn_tab_debug.set_active(tab_name == 'debug_tools')
         self.btn_tab_settings.set_active(tab_name == "settings")
         if tab_name == "sequencer":
             self.refresh_sequencer_preset_dropdown()
@@ -14511,9 +16688,10 @@ try {{
             "playback": self.frame_playback,
             "sequencer": self.frame_sequencer,
             "settings": self.frame_settings,
+            "debug_tools": self.frame_debug,
         }
 
-        if not animate or not self.entertain_me or old_tab not in tab_frames:
+        if (not animate or not self.entertain_me or old_tab not in tab_frames):
             self._set_tab_heading(tab_name)
             self._settle_tab_transition()
             return
@@ -14524,7 +16702,7 @@ try {{
         for name, frame in tab_frames.items():
             if name not in (old_tab, tab_name):
                 frame.place_forget()
-        order = {"playback": 0, "sequencer": 1, "settings": 2}
+        order = {"playback": 0, "sequencer": 1, "debug_tools": 2, "settings": 3}
         direction = 1 if order[tab_name] > order[old_tab] else -1
         self._tab_transition_from = old_tab
         self._tab_transition_to = tab_name
@@ -14544,6 +16722,8 @@ try {{
         elif tab_name == "settings":
             self._clear_settings_motion()
             self.frame_settings.place_forget()
+        elif tab_name == "debug_tools":
+            self.frame_debug.place_forget()
 
     def _start_tab_animation_phase(self, phase):
         """Stage one real page at a time: exit first, then enter."""
@@ -14569,8 +16749,9 @@ try {{
                 return
         else:
             self._show_docks_for_tab(tab)
-            frame = (self.frame_playback if tab == "playback"
-                     else self.frame_sequencer)
+            frame = (self.frame_playback if tab == "playback" else
+                     self.frame_sequencer if tab == "sequencer" else
+                     self.frame_debug)
             frame.place(x=0, y=0, relwidth=1, relheight=1)
 
         self.animate_tab_transition(phase, step=0)
@@ -14629,18 +16810,6 @@ try {{
             self._start_tab_animation_phase("in")
         else:
             self._settle_tab_transition()
-
-    def _position_mini_hud_button(self, event=None):
-        """Keep Mini HUD fixed beside the expanded sidebar boundary."""
-        button = getattr(self, "mini_hud_button", None)
-        brand = getattr(self, "_topbar_brand", None)
-        if not button or not button.winfo_exists() or not brand or not brand.winfo_exists():
-            return
-        brand_right = brand.winfo_x() + brand.winfo_width()
-        # Use the sidebar's full width, not its animated visible width.
-        x = max(brand_right + 8, self.sidebar_width + 12)
-        if button.winfo_x() != x:
-            button.place_configure(x=x)
 
     def _cancel_sidebar_animation(self):
         """Cancel a pending frame before reversing or rebuilding navigation."""
@@ -15631,7 +17800,10 @@ try {{
         reason = ''
         if self.audio_cues:play_cue('start')
         try:
-            loops = 1000000 if self.loop_mode == '∞ Loop' else int(self.loop_mode.replace('x',''))
+            # The Playback view no longer exposes Repeat. A single Run command
+            # makes one pass; explicit LOOP actions and Sequencer stages retain
+            # their separate repetition semantics.
+            loops = 1
             for rep in range(loops):
                 if not self.playing:break
                 start = self.current_action_idx if rep==0 and 0 <= self.current_action_idx < total else 0
