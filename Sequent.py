@@ -11190,12 +11190,14 @@ class SequentWalkthrough:
         ("playback", "Inspect and debug",
          "Use the playhead, Back/Next, Step, and breakpoints in the queue "
          "to inspect or execute individual actions while troubleshooting.", "scrub_card"),
-        ("sequencer", "Build a macro chain",
-         "The Sequencer combines saved macro presets into a sequence of stages. "
-         "Import, export, and review the stage order in the Macro Chain panel.", "seq_timeline_viewport"),
-        ("sequencer", "Configure a stage",
-         "Choose a saved preset, set its loop count and delay, then select Add Stage. "
-         "The Stage Builder also controls running the entire chain.", "stage_builder_dock"),
+        ("sequencer", "Explore Automation Studio",
+         "The Studio represents saved macro chains as clips on a composition timeline. "
+         "Double-click clips to expand actions and select the time ruler to preview timing. "
+         "Scrubbing never executes a macro.", "seq_timeline_viewport"),
+        ("sequencer", "Inspect and configure clips",
+         "Add preset clips using the Inspector. Select a clip to change its loop count "
+         "and delay, reorder stages, or run the chain with the existing execution engine.",
+         "stage_builder_dock"),
         ("settings", "Personalize Sequent",
          "Preferences contains appearance, timing, recording, audio, and hotkeys. "
          "Entertain Me controls the interface animations. You can relaunch this tour from Help anytime.", "frame_settings"),
@@ -11616,6 +11618,320 @@ def sequent_retheme_ide_windows(app):
             panel.retheme()
         else:
             app._ide_tool_windows.discard(panel)
+
+
+"""Sequent Automation Studio M1: pure-Python timeline renderer and preview model.
+
+This is a non-executing view of existing chains and preset actions. It deliberately
+preserves the chain file format and delegates execution to Sequent's existing engine.
+No third-party packages or Windows drivers are required.
+"""
+
+
+
+ACTION_COLORS = {
+    'move': '#497CA7', 'click': '#497CA7', 'drag': '#497CA7',
+    'scroll': '#497CA7', 'key': '#8563B3', 'hotkey': '#8563B3',
+    'delay': '#6E7682', 'compare_text': '#B18A4B', 'if_var': '#B18A4B',
+    'goto': '#B18A4B', 'label': '#B18A4B', 'set_variable': '#39977F',
+    'read_clipboard': '#39977F', 'find_text': '#497CA7',
+    'find_image': '#497CA7', 'find_color': '#497CA7',
+}
+
+
+def preview_duration(action):
+    """Approximate *layout* seconds, never a promise of execution timing."""
+    if not isinstance(action, dict):
+        return 0.35
+    kind = action.get('type', '')
+    try:
+        if kind == 'delay':
+            value = float(action.get('seconds', 1.0))
+            return min(120.0, max(0.05, value)) if math.isfinite(value) else 0.35
+        if kind == 'drag':
+            value = float(action.get('duration', 0.3))
+            return min(120.0, max(0.2, value)) if math.isfinite(value) else 0.35
+    except (TypeError, ValueError, OverflowError):
+        pass
+    # Unknown waits, branches and manual prompts are not deterministic.
+    return 0.35
+
+
+def action_keyframes(action):
+    """Read-only event/keyframe hints based solely on fields actually recorded."""
+    if not isinstance(action, dict):
+        return [('Event', 0.0)]
+    kind = action.get('type')
+    if kind == 'drag':
+        return [('Press', 0.0), ('Release', 1.0)]
+    if kind == 'click':
+        return [('Click', 0.0)]
+    if kind == 'key':
+        return [('Key', 0.0)]
+    if kind == 'compare_text':
+        return [('Compare', 0.0), ('Branch', 1.0)]
+    if kind == 'delay':
+        return [('Start', 0.0), ('End', 1.0)]
+    return [('Event', 0.0)]
+
+
+def load_preset_actions(presets_dir, preset_name):
+    """Read known local .json presets, without allowing path traversal."""
+    if not isinstance(preset_name, str) or not preset_name or preset_name in ('.', '..'):
+        return [], 'Invalid preset name'
+    base = os.path.realpath(presets_dir)
+    path = os.path.realpath(os.path.join(base, preset_name + '.json'))
+    if os.path.dirname(path) != base:
+        return [], 'Preset must be inside the presets directory'
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            data = json.load(stream)
+        if not isinstance(data, list):
+            return [], 'Preset does not contain an action list'
+        return [action for action in data if isinstance(action, dict)], None
+    except (OSError, ValueError, UnicodeError) as error:
+        return [], str(error)
+
+
+def preview_sequence(steps, presets_dir):
+    """Compute a non-executable chain timeline; never rewrite any action data."""
+    result = []
+    cursor = 0.0
+    for i, stage in enumerate(steps):
+        name = str(stage.get('preset', ''))
+        actions, error = load_preset_actions(presets_dir, name)
+        try:
+            loops = max(1, min(100000, int(stage.get('loops', 1))))
+            delay = max(0.0, float(stage.get('delay_after', 0.0)))
+            if not math.isfinite(delay):
+                delay = 0.0
+        except (TypeError, ValueError, OverflowError):
+            loops, delay = 1, 0.0
+        action_time = sum(preview_duration(action) for action in actions)
+        # Give empty presets visible but visibly estimated clips.
+        per_pass = max(0.6, action_time)
+        total = min(1000000.0, per_pass * loops + delay)
+        result.append(dict(index=i, name=name, actions=actions, error=error,
+                           start=cursor, duration=total, per_pass=per_pass,
+                           loops=loops, delay=delay))
+        cursor += total
+    return result
+
+
+class StudioTimeline(tk.Frame):
+    """Canvas-based chain timeline, nested preset actions, markers and scrub preview."""
+
+    LABEL_W = 154
+    TOP = 35
+    ROW_H = 44
+    ACTION_H = 28
+    MAX_DETAIL_ACTIONS = 80
+
+    def __init__(self, parent, *, steps_getter, presets_dir_getter,
+                 colors_getter, on_select, on_scrub):
+        colors = colors_getter()
+        super().__init__(parent, bg=colors['panel'])
+        self.steps_getter = steps_getter
+        self.presets_dir_getter = presets_dir_getter
+        self.colors_getter = colors_getter
+        self.on_select = on_select
+        self.on_scrub = on_scrub
+        self.scale = 60.0  # pixels per estimated second
+        self.expanded = set()
+        self.selected_stage = None
+        self.selected_action = None
+        self.playhead = 0.0
+        self.running_stage = -1
+        self.plans = []
+        self._hit = []
+        self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
+                                highlightthickness=0, relief='flat', cursor='crosshair')
+        self.xbar = tk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
+        self.ybar = tk.Scrollbar(self, orient='vertical', command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.xbar.set, yscrollcommand=self.ybar.set)
+        self.canvas.grid(row=0, column=0, sticky='nsew')
+        self.ybar.grid(row=0, column=1, sticky='ns')
+        self.xbar.grid(row=1, column=0, sticky='ew')
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.canvas.bind('<Button-1>', self._click)
+        self.canvas.bind('<Double-Button-1>', self._double_click)
+        self.canvas.bind('<B1-Motion>', self._scrub_drag)
+        self.canvas.bind('<MouseWheel>', self._mouse_wheel)
+        self.canvas.bind('<Button-4>', lambda e: self.canvas.yview_scroll(-3, 'units'))
+        self.canvas.bind('<Button-5>', lambda e: self.canvas.yview_scroll(3, 'units'))
+        self.canvas.bind('<Configure>', lambda e: self.redraw(), add='+')
+
+    def _mouse_wheel(self, event):
+        if event.state & 0x0004:  # Ctrl + wheel: zoom about the left edge.
+            self.zoom(1 if event.delta > 0 else -1)
+        else:
+            self.canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
+        return 'break'
+
+    def zoom(self, step):
+        self.scale = min(240.0, max(12.0, self.scale * (1.24 if step > 0 else 1 / 1.24)))
+        self.redraw()
+
+    def fit(self):
+        total = sum(plan['duration'] for plan in self.plans) or 4.0
+        available = max(120, self.canvas.winfo_width() - self.LABEL_W - 70)
+        self.scale = max(12.0, min(180.0, available / total))
+        self.redraw()
+        self.canvas.xview_moveto(0)
+
+    def toggle_expand(self, index):
+        if index in self.expanded:
+            self.expanded.remove(index)
+        else:
+            self.expanded.add(index)
+        self.redraw()
+
+    def _paint_diamond(self, x, y, color, *, size=4):
+        self.canvas.create_polygon(x, y-size, x+size, y, x, y+size, x-size, y,
+                                   fill=color, outline='')
+
+    def redraw(self):
+        if not self.canvas.winfo_exists():
+            return
+        colors = self.colors_getter()
+        self.canvas.configure(bg=colors['background'])
+        c = self.canvas
+        c.delete('all')
+        self._hit = []
+        self.plans = preview_sequence(self.steps_getter(), self.presets_dir_getter())
+        total = sum(plan['duration'] for plan in self.plans)
+        content_w = max(c.winfo_width(), self.LABEL_W + 220 + total * self.scale)
+        y = self.TOP
+        rows = []
+        for plan in self.plans:
+            height = self.ROW_H
+            if plan['index'] in self.expanded:
+                height += self.ACTION_H * min(len(plan['actions']), self.MAX_DETAIL_ACTIONS)
+                if len(plan['actions']) > self.MAX_DETAIL_ACTIONS:
+                    height += self.ACTION_H
+            rows.append((plan, y, height))
+            y += height
+        content_h = max(c.winfo_height(), y + 34)
+        c.configure(scrollregion=(0, 0, content_w + 24, content_h))
+        # ruler and 0.5/1/2/5s graduated ticks
+        c.create_rectangle(0, 0, content_w + 24, self.TOP, fill=colors['panel'], outline='')
+        c.create_rectangle(0, self.TOP, self.LABEL_W, content_h, fill=colors['panel'], outline='')
+        c.create_text(13, 18, anchor='w', text='TRACK / COMPOSITION', fill=colors['muted'],
+                      font=('Segoe UI', 8, 'bold'))
+        tick = next((v for v in (0.5, 1, 2, 5, 10, 30, 60, 120, 300)
+                     if v * self.scale >= 48), 600)
+        for idx in range(min(400, int(total / tick) + 3)):
+            t = idx * tick
+            x = self.LABEL_W + t * self.scale
+            c.create_line(x, self.TOP, x, content_h, fill=colors['grid'], dash=(2, 5))
+            c.create_text(x + 4, 18, anchor='w', text=f'{t:g}s', fill=colors['muted'],
+                          font=('Consolas', 8))
+        c.create_line(self.LABEL_W, 0, self.LABEL_W, content_h, fill=colors['border'])
+        for plan, top, height in rows:
+            idx = plan['index']
+            bg = colors['row'] if idx % 2 else colors['background']
+            c.create_rectangle(0, top, content_w, top+height, fill=bg, outline='')
+            c.create_rectangle(0, top, self.LABEL_W, top + self.ROW_H,
+                               fill=colors['panel'], outline=colors['grid'])
+            selected = idx == self.selected_stage
+            glyph = '▾' if idx in self.expanded else '▸'
+            c.create_text(10, top+22, anchor='w', text=glyph, fill=colors['accent'],
+                          font=('Segoe UI', 13, 'bold'))
+            stage_label = (plan['name'][:16] + '…') if len(plan['name']) > 17 else plan['name']
+            c.create_text(29, top+17, anchor='w', text=stage_label, fill=colors['text'],
+                          font=('Segoe UI', 9, 'bold'))
+            c.create_text(29, top+32, anchor='w',
+                          text=f"{len(plan['actions'])} actions  ·  {plan['loops']}×",
+                          fill=colors['muted'], font=('Segoe UI', 8))
+            x0 = self.LABEL_W + plan['start'] * self.scale
+            x1 = x0 + plan['duration'] * self.scale
+            c.create_rectangle(x0+2, top+7, x1-2, top+37, width=2 if selected else 1,
+                               outline=colors['accent'] if selected else '#5A83AE',
+                               fill='#344B69' if selected else '#304157')
+            c.create_text(x0+11, top+21, anchor='w', text=stage_label,
+                          fill='#F0F3F8', font=('Segoe UI', 9, 'bold'),
+                          width=max(1, x1-x0-25))
+            if plan['error']:
+                c.create_text(x1-12, top+21, text='!', fill='#FFB3B3',
+                              font=('Segoe UI', 11, 'bold'))
+            if idx == self.running_stage:
+                c.create_rectangle(x0+2, top+7, x1-2, top+37,
+                                   outline=colors['success'], width=3)
+            self._hit.append((x0, top, x1, top+self.ROW_H, idx, None))
+            self._hit.append((0, top, self.LABEL_W, top+self.ROW_H, idx, None))
+            if idx not in self.expanded:
+                continue
+            pos = x0
+            for j, action in enumerate(plan['actions'][:self.MAX_DETAIL_ACTIONS]):
+                action_top = top + self.ROW_H + j * self.ACTION_H
+                kind = str(action.get('type', 'action'))
+                duration = preview_duration(action)
+                ax0, ax1 = pos, pos + duration*self.scale
+                c.create_rectangle(0, action_top, self.LABEL_W, action_top+self.ACTION_H,
+                                   fill=colors['panel'], outline=colors['grid'])
+                c.create_text(18, action_top+14, anchor='w',
+                              text=f'{j+1:02d}  {kind[:17]}', fill=colors['text'],
+                              font=('Consolas', 8))
+                # The first loop is expanded; repeated runs remain summarized in parent.
+                shown_right = max(ax0 + 5, min(ax1, x1-3))
+                if shown_right > ax0 + 4:
+                    color = ACTION_COLORS.get(kind, '#62758A')
+                    c.create_rectangle(ax0+2, action_top+5, shown_right-2, action_top+23,
+                                       fill=color, outline=(colors['accent'] if
+                                       (idx, j) == (self.selected_stage, self.selected_action)
+                                       else ''))
+                    for _, frac in action_keyframes(action):
+                        px = ax0 + 5 + max(0.0, shown_right - ax0 - 10) * frac
+                        self._paint_diamond(px, action_top+14, '#E6EDF7', size=3)
+                self._hit.append((0, action_top, self.LABEL_W, action_top+self.ACTION_H, idx, j))
+                self._hit.append((ax0, action_top, max(ax0+8, ax1), action_top+self.ACTION_H, idx, j))
+                pos += duration * self.scale
+            if len(plan['actions']) > self.MAX_DETAIL_ACTIONS:
+                c.create_text(20, top+height-14, anchor='w',
+                              text=f"… {len(plan['actions'])-self.MAX_DETAIL_ACTIONS} more actions",
+                              fill=colors['muted'], font=('Segoe UI', 8))
+        if not self.plans:
+            c.create_text(self.LABEL_W + 26, self.TOP + 40, anchor='w',
+                          text='No clips yet. Select a preset and add a stage.',
+                          fill=colors['muted'], font=('Segoe UI', 10))
+        marker_x = self.LABEL_W + self.playhead * self.scale
+        c.create_line(marker_x, 7, marker_x, content_h, fill='#F27A75', width=2,
+                      tags=('studio_playhead',))
+        c.create_polygon(marker_x-7, 7, marker_x+7, 7, marker_x, 18,
+                         fill='#F27A75', outline='', tags=('studio_playhead',))
+
+    def _scrub(self, event):
+        pos = self.canvas.canvasx(event.x)
+        self.playhead = max(0.0, (pos - self.LABEL_W) / self.scale)
+        self.redraw()
+        self.on_scrub(self.playhead)
+
+    def _click(self, event):
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        if y < self.TOP:
+            self._scrub(event)
+            return 'break'
+        for x0,y0,x1,y1,idx,j in reversed(self._hit):
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                self.selected_stage, self.selected_action = idx, j
+                self.redraw()
+                self.on_select(idx, j)
+                return 'break'
+        return 'break'
+
+    def _double_click(self, event):
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        for x0,y0,x1,y1,idx,j in reversed(self._hit):
+            if j is None and x0 <= x <= x1 and y0 <= y <= y1:
+                self.toggle_expand(idx)
+                return 'break'
+        return 'break'
+
+    def _scrub_drag(self, event):
+        if self.canvas.canvasy(event.y) < self.TOP:
+            self._scrub(event)
+            return 'break'
 
 
 class BuiltInMacroApp:
@@ -13026,7 +13342,7 @@ class BuiltInMacroApp:
             command=lambda: self.show_tab("playback"))
         self.btn_tab_playback.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_sequencer = SidebarButton(
-            self.sidebar_frame, text="SEQUENCER",
+            self.sidebar_frame, text="STUDIO",
             command=lambda: self.show_tab("sequencer"))
         self.btn_tab_sequencer.pack(fill=tk.X, padx=7, pady=2)
         self.btn_tab_debug = SidebarButton(
@@ -13419,92 +13735,238 @@ class BuiltInMacroApp:
                 seq, lambda e, x=dx, y=dy: self.nudge_active_coordinate(x, y))
 
     def build_sequencer_view(self):
-        """Independent sequencer docks: animated timeline and pinned Stage Builder."""
-        # Match Playback's dock geometry. Both docks belong to the stationary
-        # workspace, not workspace_main (which moves during sidebar animation).
+        """After Effects-inspired studio replacing the old stage-card Sequencer.
+
+        Keep chain_steps and the existing execution path intact. This is a
+        visual editor/inspector for legacy chain stages and a read-only view
+        of their nested preset actions; timeline scrubbing never executes.
+        """
+        self.studio_selected_stage = getattr(self, 'studio_selected_stage', None)
+        self.studio_selected_action = getattr(self, 'studio_selected_action', None)
+        self.studio_scrub_time = getattr(self, 'studio_scrub_time', 0.0)
         self.stage_builder_dock = ModernCard(self.workspace, bg_card=BG_PANEL)
         right = self.stage_builder_dock
         right.pack_propagate(False)
         self._place_stage_builder_dock()
-        sequent_dock_header(right, "Stage Builder", "CONFIGURE")
-        config = tk.Frame(right, bg=BG_PANEL, padx=14, pady=14)
+        sequent_dock_header(right, 'Clip Inspector', 'COMPOSITION / STAGES')
+        # The inspector is scrollable at 768p and when the window is resized.
+        inspector_scroll = ModernScrollableFrame(right, bg=BG_PANEL)
+        inspector_scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 8))
+        config = tk.Frame(inspector_scroll.scrollable_frame, bg=BG_PANEL, padx=8, pady=6)
         config.pack(fill=tk.BOTH, expand=True)
 
         def field_title(text):
             tk.Label(config, text=text.upper(), bg=BG_PANEL, fg=TEXT_MUTED,
-                     font=("Segoe UI", 8, "bold"), anchor="w").pack(
-                         fill=tk.X, pady=(10, 5))
-        field_title("Macro preset")
-        self.seq_preset_var = tk.StringVar(value="-- Select Preset --")
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(
+                         fill=tk.X, pady=(9, 4))
+
+        field_title('Add composition clip')
+        self.seq_preset_var = tk.StringVar(value='-- Select Preset --')
         self.seq_preset_menu = tk.OptionMenu(config, self.seq_preset_var,
-                                             "-- Select Preset --")
+                                             '-- Select Preset --')
         self.seq_preset_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY,
-                                    activebackground=BG_HOVER, font=("Segoe UI", 9),
+                                    activebackground=BG_HOVER, font=('Segoe UI', 9),
                                     highlightthickness=1, highlightbackground=BG_BORDER,
-                                    bd=0, relief="flat", cursor="hand2")
-        self.seq_preset_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    bd=0, relief='flat', cursor='hand2')
+        self.seq_preset_menu['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
                                             activebackground=COLOR_ACCENT, bd=0)
         self.seq_preset_menu.pack(fill=tk.X, ipady=3)
-        field_title("Loop count")
+        field_title('Loop count')
         self.seq_loops_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_PURPLE,
                                         insertbackground=TEXT_PRIMARY,
-                                        font=("Consolas", 10), bd=0,
+                                        font=('Consolas', 10), bd=0,
                                         highlightbackground=BG_BORDER,
                                         highlightthickness=1)
-        self.seq_loops_entry.insert(0, "1")
-        self.seq_loops_entry.pack(fill=tk.X, ipady=6)
-        field_title("Post-stage delay (seconds)")
+        self.seq_loops_entry.insert(0, '1')
+        self.seq_loops_entry.pack(fill=tk.X, ipady=5)
+        field_title('Post-stage delay (seconds)')
         self.seq_delay_entry = tk.Entry(config, bg=BG_INPUT, fg=SYNTAX_BLUE,
                                         insertbackground=TEXT_PRIMARY,
-                                        font=("Consolas", 10), bd=0,
+                                        font=('Consolas', 10), bd=0,
                                         highlightbackground=BG_BORDER,
                                         highlightthickness=1)
-        self.seq_delay_entry.insert(0, "1.0")
-        self.seq_delay_entry.pack(fill=tk.X, ipady=6)
-        btn_add_stage = ModernButton(config, text="+ Add Stage",
-                                     bg_color=COLOR_ACCENT,
-                                     hover_color=COLOR_ACCENT_HOV,
-                                     command=self.add_chain_stage)
-        btn_add_stage.pack(fill=tk.X, pady=(18, 0))
-        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=18)
-        tk.Label(config, text="CHAIN TRANSPORT", bg=BG_PANEL, fg=TEXT_MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.btn_run_chain = ModernButton(config, text="Run Macro Chain (F9)",
+        self.seq_delay_entry.insert(0, '1.0')
+        self.seq_delay_entry.pack(fill=tk.X, ipady=5)
+        ModernButton(config, text='+ Add Clip', bg_color=COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV,
+                     command=self.add_chain_stage).pack(fill=tk.X, pady=(12, 8))
+        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(8, 10))
+        field_title('Selected composition')
+        self.studio_selection_label = tk.Label(
+            config, text='Select a clip on the timeline', anchor='w',
+            bg=BG_PANEL, fg=TEXT_PRIMARY, font=('Segoe UI', 9, 'bold'),
+            wraplength=236, justify=tk.LEFT)
+        self.studio_selection_label.pack(fill=tk.X)
+        tk.Label(config, text='LOOPS    /    POST DELAY', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(9, 3))
+        edit_row = tk.Frame(config, bg=BG_PANEL)
+        edit_row.pack(fill=tk.X)
+        self.studio_loop_edit = tk.Entry(edit_row, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                         insertbackground=TEXT_PRIMARY, bd=0,
+                                         font=('Consolas', 10), width=7)
+        self.studio_loop_edit.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 7))
+        self.studio_delay_edit = tk.Entry(edit_row, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                          insertbackground=TEXT_PRIMARY, bd=0,
+                                          font=('Consolas', 10), width=8)
+        self.studio_delay_edit.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        ModernButton(config, text='Apply Clip Properties', bg_color=BG_BORDER,
+                     hover_color=BG_HOVER,
+                     command=self.studio_apply_stage_properties).pack(fill=tk.X, pady=(9, 5))
+        reorder_row = tk.Frame(config, bg=BG_PANEL)
+        reorder_row.pack(fill=tk.X)
+        for label, fn in [('Move Up', lambda: self.studio_reorder(-1)),
+                          ('Move Down', lambda: self.studio_reorder(1))]:
+            tk.Button(reorder_row, text=label, command=fn, cursor='hand2',
+                      font=('Segoe UI', 9), bg=BG_INPUT, fg=TEXT_PRIMARY,
+                      activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                      bd=0, relief='flat').pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                                padx=2, ipady=6)
+        tk.Button(config, text='Remove Selected Clip',
+                  command=self.studio_remove_selected, cursor='hand2',
+                  font=('Segoe UI', 9), bg=BG_INPUT, fg=COLOR_DANGER,
+                  activebackground=BG_HOVER, bd=0, relief='flat').pack(
+                      fill=tk.X, pady=(6, 8), ipady=5)
+        self.studio_action_detail = tk.Label(
+            config, text='Double-click a clip to inspect its actions.',
+            anchor='nw', justify=tk.LEFT, bg=BG_PANEL, fg=TEXT_MUTED,
+            wraplength=238, font=('Consolas', 8))
+        self.studio_action_detail.pack(fill=tk.X, pady=(5, 10))
+        tk.Frame(config, bg=BG_BORDER, height=1).pack(fill=tk.X, pady=(8, 10))
+        field_title('Execution')
+        self.btn_run_chain = ModernButton(config, text='Run Macro Chain (F9)',
                                           bg_color=COLOR_SUCCESS,
-                                          hover_color="#278761",
+                                          hover_color='#278761',
                                           command=self.toggle_chain_run)
-        self.btn_run_chain.pack(fill=tk.X, pady=(10, 7))
-        sequent_toolbar_button(config, "Clear All Stages", self.clear_chain).pack(fill=tk.X)
+        self.btn_run_chain.pack(fill=tk.X, pady=(7, 7))
+        sequent_toolbar_button(config, 'Clear All Clips', self.clear_chain).pack(fill=tk.X)
 
-        self.seq_timeline_dock = ModernCard(
-            self.seq_timeline_viewport, bg_card=BG_PANEL
-        )
+        self.seq_timeline_dock = ModernCard(self.seq_timeline_viewport,
+                                            bg_card=BG_PANEL)
         left = self.seq_timeline_dock
-        initial_timeline_width = self._queue_available_width(self._sidebar_visible_width)
-        left.place(
-            relx=1.0, x=0, y=-1, anchor="ne",
-            width=initial_timeline_width,
-            relheight=1.0, height=2
-        )
-        self._seq_timeline_content_width = initial_timeline_width
+        initial_width = self._queue_available_width(self._sidebar_visible_width)
+        left.place(relx=1.0, x=0, y=-1, anchor='ne', width=initial_width,
+                   relheight=1.0, height=2)
+        self._seq_timeline_content_width = initial_width
         self._place_sequencer_timeline()
-        head = sequent_dock_header(left, "Macro Chain", "STAGE TIMELINE")
-        self.chain_badge = tk.Label(head, text="0 Stages", bg=BG_INPUT,
-                                    fg=TEXT_MUTED, font=("Segoe UI", 8, "bold"),
+        head = sequent_dock_header(left, 'Automation Studio', 'COMPOSITION TIMELINE')
+        self.chain_badge = tk.Label(head, text='0 Clips', bg=BG_INPUT,
+                                    fg=TEXT_MUTED, font=('Segoe UI', 8, 'bold'),
                                     padx=8, pady=3)
         self.chain_badge.pack(side=tk.RIGHT, padx=(3, 9))
-        filebar = tk.Frame(left, bg=BG_PANEL, padx=11, pady=9)
-        filebar.pack(fill=tk.X)
-        self.chain_action_pillbar = SequentAnimatedPillBar(filebar, [
-            ("button.import-chain", "Import Chain", self.load_chain_from_file,
-             "Import a macro chain", "upload"),
-            ("button.export-chain", "Export Chain", self.save_chain_to_file,
-             "Export the macro chain", "download"),
+        tools = tk.Frame(left, bg=BG_PANEL, padx=10, pady=8)
+        tools.pack(fill=tk.X)
+        self.chain_action_pillbar = SequentAnimatedPillBar(tools, [
+            ('button.import-chain', 'Import Chain', self.load_chain_from_file,
+             'Import a macro chain', 'upload'),
+            ('button.export-chain', 'Export Chain', self.save_chain_to_file,
+             'Export the macro chain', 'download'),
         ])
         self.chain_action_pillbar.pack(side=tk.LEFT)
-        self.chain_scroll = ModernScrollableFrame(left, bg=BG_PANEL)
-        self.chain_scroll.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.studio_time_label = tk.Label(tools, text='Preview  0.00s',
+                                          bg=BG_PANEL, fg=TEXT_MUTED,
+                                          font=('Consolas', 9))
+        self.studio_time_label.pack(side=tk.RIGHT, padx=(8, 0))
+        for caption, callback in [('+', lambda: self.studio_timeline.zoom(1)),
+                                  ('−', lambda: self.studio_timeline.zoom(-1)),
+                                  ('Fit', lambda: self.studio_timeline.fit())]:
+            tk.Button(tools, text=caption, command=callback, font=('Segoe UI', 9),
+                      bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                      activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
+                      padx=7, pady=4).pack(side=tk.RIGHT, padx=2)
+        self.studio_timeline = StudioTimeline(
+            left, steps_getter=lambda: self.chain_steps,
+            presets_dir_getter=lambda: self.presets_dir,
+            colors_getter=lambda: {
+                'panel': BG_PANEL, 'background': BG_APP, 'row': BG_INPUT,
+                'grid': BG_BORDER, 'border': BG_BORDER, 'text': TEXT_PRIMARY,
+                'muted': TEXT_MUTED, 'accent': COLOR_ACCENT,
+                'success': COLOR_SUCCESS},
+            on_select=self.studio_select, on_scrub=self.studio_scrub)
+        self.studio_timeline.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        tk.Label(left, text='Double-click clip: expand actions    •    Click ruler: preview scrub (no execution)    •    Ctrl + wheel: zoom    •    Timing is estimated',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 anchor='w').pack(fill=tk.X, padx=13, pady=(0, 8))
         self.refresh_chain_ui()
+
+    def studio_scrub(self, seconds):
+        self.studio_scrub_time = max(0.0, float(seconds))
+        if hasattr(self, 'studio_time_label') and self.studio_time_label.winfo_exists():
+            self.studio_time_label.configure(text=f'Preview  {seconds:.2f}s')
+
+    def studio_select(self, index, action_index=None):
+        if not 0 <= index < len(self.chain_steps):
+            return
+        self.studio_selected_stage = index
+        self.studio_selected_action = action_index
+        stage = self.chain_steps[index]
+        self.studio_selection_label.configure(text=f"#{index + 1}  {stage['preset']}")
+        for entry, value in ((self.studio_loop_edit, stage['loops']),
+                             (self.studio_delay_edit, stage['delay_after'])):
+            entry.delete(0, tk.END)
+            entry.insert(0, str(value))
+        if action_index is None:
+            self.studio_action_detail.configure(
+                text='Double-click the clip to reveal its actions.\n'
+                     'Select an action row to inspect source fields.')
+        else:
+            actions, error = load_preset_actions(self.presets_dir, stage['preset'])
+            if 0 <= action_index < len(actions):
+                action = actions[action_index]
+                details = json.dumps(action, indent=2, ensure_ascii=False)
+                if len(details) > 450:
+                    details = details[:450] + '\n… (preview shortened)'
+                self.studio_action_detail.configure(
+                    text=f'Action {action_index + 1}: {action.get("type", "unknown")}\n'
+                         + details)
+            else:
+                self.studio_action_detail.configure(text=error or 'Action unavailable')
+
+    def studio_apply_stage_properties(self):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording:
+            self.update_status('Stop execution before editing clips', COLOR_DANGER)
+            return
+        if index is None or not 0 <= index < len(self.chain_steps):
+            self.update_status('Select a composition clip first', COLOR_DANGER)
+            return
+        try:
+            loops = int(self.studio_loop_edit.get().strip())
+            delay = float(self.studio_delay_edit.get().strip())
+            if not 1 <= loops <= 100000 or not math.isfinite(delay) or not 0 <= delay <= 86400:
+                raise ValueError('Values out of range')
+        except (ValueError, OverflowError):
+            self.update_status('Enter loops 1–100000 and delay 0–86400s', COLOR_DANGER)
+            return
+        stage = self.chain_steps[index]
+        stage['loops'], stage['delay_after'] = loops, delay
+        self.refresh_chain_ui()
+        self.update_status('Clip properties updated', COLOR_SUCCESS)
+
+    def studio_reorder(self, direction):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording or index is None:
+            return
+        if 0 <= index < len(self.chain_steps):
+            target = index + direction
+            if 0 <= target < len(self.chain_steps):
+                self.chain_steps[index], self.chain_steps[target] = (
+                    self.chain_steps[target], self.chain_steps[index])
+                self.studio_selected_stage = target
+                self.studio_selected_action = None
+                self.studio_timeline.expanded.clear()
+                self.refresh_chain_ui()
+
+    def studio_remove_selected(self):
+        index = getattr(self, 'studio_selected_stage', None)
+        if self.chain_running or self.playing or self.recording or index is None:
+            return
+        if 0 <= index < len(self.chain_steps):
+            self.chain_steps.pop(index)
+            self.studio_selected_stage = min(index, len(self.chain_steps) - 1) if self.chain_steps else None
+            self.studio_selected_action = None
+            self.studio_timeline.expanded.clear()
+            self.refresh_chain_ui()
+            self.update_status('Composition clip removed', TEXT_MUTED)
 
     def refresh_sequencer_preset_dropdown(self):
         menu = self.seq_preset_menu["menu"]
@@ -13535,6 +13997,8 @@ class BuiltInMacroApp:
             return
 
         self.chain_steps.append({"preset": preset, "loops": loops, "delay_after": delay})
+        self.studio_selected_stage = len(self.chain_steps) - 1
+        self.studio_selected_action = None
         self.refresh_chain_ui()
         self.update_status(f"Added '{preset}' to Chain", COLOR_SUCCESS)
 
@@ -13550,95 +14014,42 @@ class BuiltInMacroApp:
         target = idx + direction
         if 0 <= target < len(self.chain_steps):
             self.chain_steps[idx], self.chain_steps[target] = self.chain_steps[target], self.chain_steps[idx]
+            self.studio_timeline.expanded.clear()
             self.refresh_chain_ui()
 
     def clear_chain(self):
         if self.chain_running: return
         self.chain_steps.clear()
+        self.studio_selected_stage = None
+        self.studio_selected_action = None
+        self.studio_timeline.expanded.clear()
         self.refresh_chain_ui()
         self.update_status("Cleared chain stages", TEXT_MUTED)
 
     def refresh_chain_ui(self):
-        container = self.chain_scroll.scrollable_frame
-        for w in container.winfo_children():
-            w.destroy()
-
+        """Refresh the Automation Studio without modifying chain semantics."""
         count = len(self.chain_steps)
-        self.chain_badge.config(
-            text=f"{count} Stage{'s' if count != 1 else ''}",
-            fg=COLOR_SUCCESS if count > 0 else TEXT_MUTED
-        )
-
-        if not self.chain_steps:
-            tk.Label(
-                container, text="// Chain is empty. Add presets above to build a pipeline.",
-                font=("Consolas", 9), bg=BG_APP, fg=TEXT_MUTED
-            ).pack(anchor="w", padx=10, pady=20)
-            return
-
-        for idx, stage in enumerate(self.chain_steps):
-            is_active = (self.chain_running and self.current_chain_stage == idx)
-            card_bg = BG_HEADER if is_active else BG_PANEL
-            border = COLOR_SUCCESS if is_active else BG_BORDER
-
-            card = ModernCard(container, bg_card=card_bg, border_color=border)
-            card.pack(fill=tk.X, pady=(0, 6))
-
-            row = tk.Frame(card, bg=card_bg, padx=10, pady=8)
-            row.pack(fill=tk.X)
-
-            # Stage number badge
-            num_lbl = tk.Label(
-                row, text=f"Stage #{idx + 1}", font=("Segoe UI", 8, "bold"),
-                bg=COLOR_ACCENT if not is_active else COLOR_SUCCESS,
-                fg=TEXT_ON_ACCENT if not is_active else "#ffffff", padx=6, pady=2
-            )
-            num_lbl.pack(side=tk.LEFT, padx=(0, 10))
-
-            # Preset Name
-            tk.Label(
-                row, text=stage["preset"], font=("Consolas", 10, "bold"),
-                bg=card_bg, fg=TEXT_PRIMARY
-            ).pack(side=tk.LEFT, padx=(0, 12))
-
-            # Loops Badge
-            tk.Label(
-                row, text=f"{stage['loops']}x Loop", font=("Segoe UI", 8, "bold"),
-                bg=BG_INPUT, fg=SYNTAX_PURPLE, padx=6, pady=2,
-                highlightbackground=BG_BORDER, highlightthickness=1
-            ).pack(side=tk.LEFT, padx=(0, 6))
-
-            # Post-Delay Badge
-            tk.Label(
-                row, text=f"+{stage['delay_after']:.1f}s Delay", font=("Segoe UI", 8, "bold"),
-                bg=BG_INPUT, fg=SYNTAX_BLUE, padx=6, pady=2,
-                highlightbackground=BG_BORDER, highlightthickness=1
-            ).pack(side=tk.LEFT)
-
-            # Delete Stage Button
-            btn_del = SequentIcon(row, 'trash', bg=card_bg, color=TEXT_MUTED,
-                                  size=16, override_key='button.remove-stage',
-                                  slot_label='Remove chain stage')
-            btn_del.pack(side=tk.RIGHT, padx=(4, 0))
-            btn_del.bind("<Button-1>", lambda e, i=idx: self.remove_chain_stage(i))
-            btn_del.bind("<Enter>", lambda e, w=btn_del: w.paint(bg=COLOR_DANGER, color='white'))
-            btn_del.bind("<Leave>", lambda e, w=btn_del, bg=card_bg: w.paint(bg=bg, color=TEXT_MUTED))
-
-            # Move Down Button
-            if idx < count - 1:
-                btn_down = SequentIcon(row, 'down', bg=BG_INPUT, color=TEXT_MUTED,
-                                       size=16, override_key='button.move-stage-down',
-                                       slot_label='Move chain stage down')
-                btn_down.pack(side=tk.RIGHT, padx=(2, 2))
-                btn_down.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, 1))
-
-            # Move Up Button
-            if idx > 0:
-                btn_up = SequentIcon(row, 'up', bg=BG_INPUT, color=TEXT_MUTED,
-                                       size=16, override_key='button.move-stage-up',
-                                       slot_label='Move chain stage up')
-                btn_up.pack(side=tk.RIGHT, padx=(2, 2))
-                btn_up.bind("<Button-1>", lambda e, i=idx: self.move_chain_stage(i, -1))
+        if hasattr(self, 'chain_badge') and self.chain_badge.winfo_exists():
+            self.chain_badge.configure(
+                text=f"{count} Clip{'s' if count != 1 else ''}",
+                fg=COLOR_SUCCESS if count else TEXT_MUTED)
+        timeline = getattr(self, 'studio_timeline', None)
+        if timeline is not None and timeline.winfo_exists():
+            index = getattr(self, 'studio_selected_stage', None)
+            if index is not None and index >= count:
+                index = count-1 if count else None
+                self.studio_selected_stage = index
+                self.studio_selected_action = None
+            timeline.selected_stage = index
+            timeline.selected_action = getattr(self, 'studio_selected_action', None)
+            timeline.running_stage = self.current_chain_stage if self.chain_running else -1
+            timeline.redraw()
+            if index is not None:
+                self.studio_select(index, self.studio_selected_action)
+            elif hasattr(self, 'studio_selection_label'):
+                self.studio_selection_label.configure(text='Select a clip on the timeline')
+                self.studio_action_detail.configure(
+                    text='Double-click a clip to inspect its actions.')
 
     def save_chain_to_file(self):
         if not self.chain_steps:
@@ -13687,6 +14098,9 @@ class BuiltInMacroApp:
                                 "delay_after": max(0.0, float(item.get("delay_after", 1.0)))
                             })
                     self.chain_steps = validated
+                    self.studio_selected_stage = 0 if validated else None
+                    self.studio_selected_action = None
+                    self.studio_timeline.expanded.clear()
                     self.refresh_chain_ui()
                     self.update_status("Imported Chain", COLOR_SUCCESS)
                 else:
@@ -17069,7 +17483,7 @@ try {{
     def _set_tab_heading(self, tab_name):
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
@@ -17088,7 +17502,7 @@ try {{
 
         headings = {
             "playback": ("Playback", "Record, edit and execute actions"),
-            "sequencer": ("Sequencer", "Arrange presets into repeatable pipelines"),
+            "sequencer": ("Automation Studio", "Compose macro chains on a visual timeline"),
             "debug_tools": ("Debug Tools", "Inspect, troubleshoot and organize Sequent workflows"),
             "settings": ("Settings", "Customize your automation workspace"),
         }
