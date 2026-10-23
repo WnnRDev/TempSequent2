@@ -14008,8 +14008,51 @@ class BuiltInMacroApp:
                       bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
                       activebackground=BG_HOVER, activeforeground=TEXT_PRIMARY,
                       padx=7, pady=4).pack(side=tk.RIGHT, padx=2)
+        # Resolve-inspired workspace: a resizeable browser/viewer above the timeline.
+        # The inspector remains the existing right-hand dock, preserving its commands.
+        self.studio_vertical_pane = tk.PanedWindow(
+            left, orient=tk.VERTICAL, sashwidth=7, sashrelief=tk.FLAT,
+            bg=BG_BORDER, bd=0, showhandle=False)
+        self.studio_vertical_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        self.studio_top_pane = tk.PanedWindow(
+            self.studio_vertical_pane, orient=tk.HORIZONTAL, sashwidth=7,
+            sashrelief=tk.FLAT, bg=BG_BORDER, bd=0, showhandle=False)
+        self.studio_vertical_pane.add(self.studio_top_pane, minsize=90, stretch='never')
+        library = tk.Frame(self.studio_top_pane, bg=BG_INPUT)
+        viewer = tk.Frame(self.studio_top_pane, bg=BG_INPUT)
+        self.studio_top_pane.add(library, minsize=150)
+        self.studio_top_pane.add(viewer, minsize=160)
+        tk.Label(library, text='MACRO LIBRARY', anchor='w', bg=BG_INPUT,
+                 fg=TEXT_MUTED, font=('Segoe UI', 9, 'bold')).pack(fill=tk.X, padx=10, pady=(8, 6))
+        library_tools = tk.Frame(library, bg=BG_INPUT)
+        library_tools.pack(fill=tk.X, padx=8)
+        tk.Button(library_tools, text='Refresh', command=self.studio_refresh_library,
+                  bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                  relief='flat', bd=0, cursor='hand2').pack(side=tk.LEFT)
+        tk.Button(library_tools, text='Add Selected', command=self.studio_add_library_preset,
+                  bg=BG_PANEL, fg=TEXT_PRIMARY, activebackground=BG_HOVER,
+                  relief='flat', bd=0, cursor='hand2').pack(side=tk.RIGHT)
+        self.studio_library_list = tk.Listbox(
+            library, bg=BG_INPUT, fg=TEXT_PRIMARY, selectbackground=COLOR_ACCENT,
+            selectforeground='#FFFFFF', highlightthickness=0, bd=0,
+            font=('Segoe UI', 9), exportselection=False, activestyle='none')
+        self.studio_library_list.pack(fill=tk.BOTH, expand=True, padx=7, pady=(6, 7))
+        self.studio_library_list.bind('<Double-Button-1>',
+                                      lambda _e: self.studio_add_library_preset())
+        tk.Label(viewer, text='EXECUTION PREVIEW  •  SAFE / READ-ONLY',
+                 anchor='w', bg=BG_INPUT, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9, 'bold')).pack(fill=tk.X, padx=10, pady=(8, 6))
+        self.studio_preview_canvas = tk.Canvas(
+            viewer, bg=BG_APP, bd=0, highlightthickness=0)
+        self.studio_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        self.studio_preview_canvas.bind('<Configure>',
+                                        lambda _e: self.studio_draw_preview())
+        self.studio_preview_caption = tk.Label(
+            viewer, text='Select a macro clip or a recorded event to inspect it.',
+            bg=BG_INPUT, fg=TEXT_MUTED, font=('Segoe UI', 8), anchor='w')
+        self.studio_preview_caption.pack(fill=tk.X, padx=10, pady=(0, 8))
         self.studio_timeline = StudioTimeline(
-            left, steps_getter=lambda: self.chain_steps,
+            self.studio_vertical_pane, steps_getter=lambda: self.chain_steps,
             presets_dir_getter=lambda: self.presets_dir,
             colors_getter=lambda: {
                 'panel': BG_PANEL, 'background': BG_APP, 'row': BG_INPUT,
@@ -14017,11 +14060,105 @@ class BuiltInMacroApp:
                 'muted': TEXT_MUTED, 'accent': COLOR_ACCENT,
                 'success': COLOR_SUCCESS},
             on_select=self.studio_select, on_scrub=self.studio_scrub)
-        self.studio_timeline.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        self.studio_vertical_pane.add(self.studio_timeline, minsize=130, stretch='always')
+        self.studio_refresh_library()
+        self.root.after_idle(self.studio_restore_layout)
         tk.Label(left, text='Double-click clip: three tracks    •    Click diamonds: inspect events    •    Ruler: preview only    •    Ctrl + wheel: zoom    •    Dense markers cluster visually',
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  anchor='w').pack(fill=tk.X, padx=13, pady=(0, 8))
         self.refresh_chain_ui()
+
+    def studio_restore_layout(self):
+        """Apply sensible first-open sash positions after geometry is measured."""
+        pane = getattr(self, 'studio_vertical_pane', None)
+        if not pane or not pane.winfo_exists():
+            return
+        try:
+            height = pane.winfo_height()
+            width = self.studio_top_pane.winfo_width()
+            if height > 280:
+                pane.sash_place(0, 1, max(105, min(255, int(height * .32))))
+            if width > 350:
+                self.studio_top_pane.sash_place(0, max(150, int(width * .36)), 1)
+        except tk.TclError:
+            pass
+
+    def studio_refresh_library(self):
+        """Read available JSON presets without loading or executing them."""
+        widget = getattr(self, 'studio_library_list', None)
+        if widget is None or not widget.winfo_exists():
+            return
+        previous = widget.get(widget.curselection()[0]) if widget.curselection() else None
+        widget.delete(0, tk.END)
+        from pathlib import Path
+        try:
+            names = sorted((f.stem for f in Path(self.presets_dir).glob('*.json')
+                            if f.name.lower() != 'globals.json'), key=str.casefold)
+        except (OSError, TypeError):
+            names = []
+        for name in names:
+            widget.insert(tk.END, name)
+        if previous in names:
+            widget.selection_set(names.index(previous))
+
+    def studio_add_library_preset(self):
+        """Route through the existing stage creation callback and defaults."""
+        widget = getattr(self, 'studio_library_list', None)
+        if widget is None or not widget.curselection():
+            self.update_status('Select a macro in the Studio Library', COLOR_DANGER)
+            return
+        name = widget.get(widget.curselection()[0])
+        self.seq_preset_var.set(name)
+        self.add_chain_stage()
+
+    def studio_draw_preview(self):
+        """Non-executing visualization of the selected event and its coordinates."""
+        canvas = getattr(self, 'studio_preview_canvas', None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        canvas.delete('all')
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width < 20 or height < 20:
+            return
+        cx, cy = width/2, height/2
+        canvas.create_line(cx, 14, cx, height-14, fill=BG_BORDER, dash=(3, 5))
+        canvas.create_line(14, cy, width-14, cy, fill=BG_BORDER, dash=(3, 5))
+        stage_index = getattr(self, 'studio_selected_stage', None)
+        action_index = getattr(self, 'studio_selected_action', None)
+        if stage_index is None or not 0 <= stage_index < len(self.chain_steps):
+            canvas.create_text(cx, cy, text='SELECT A CLIP', fill=TEXT_MUTED,
+                               font=('Segoe UI', 11, 'bold'))
+            return
+        stage = self.chain_steps[stage_index]
+        canvas.create_text(12, 13, anchor='nw', text=str(stage['preset'])[:65],
+                           fill=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'))
+        if action_index is None:
+            canvas.create_text(cx, cy, text='Select a keyframe to inspect its data',
+                               fill=TEXT_MUTED, font=('Segoe UI', 9))
+            return
+        actions, error = load_preset_actions(self.presets_dir, stage['preset'])
+        if not 0 <= action_index < len(actions):
+            return
+        action = actions[action_index]
+        canvas.create_text(12, 36, anchor='nw', text=f'Event {action_index+1}: {action.get("type", "unknown")}',
+                           fill=TEXT_MUTED, font=('Segoe UI', 9))
+        # This is an indicative coordinate diagram, not a screenshot or input injection.
+        data = action.get('params', action)
+        try:
+            x = float(data.get('x', action.get('x')))
+            y = float(data.get('y', action.get('y')))
+        except (TypeError, ValueError, AttributeError):
+            canvas.create_text(cx, cy, text='No coordinate preview for this event',
+                               fill=TEXT_MUTED, font=('Segoe UI', 9))
+            return
+        # Scale arbitrary desktop coordinates into a reference grid only.
+        px = max(20, min(width-20, 20 + (x / max(1920.0, abs(x)+100.0)) * (width-40)))
+        py = max(40, min(height-20, 40 + (y / max(1080.0, abs(y)+100.0)) * (height-60)))
+        canvas.create_oval(px-6, py-6, px+6, py+6, fill=COLOR_ACCENT, outline='')
+        canvas.create_line(px-14, py, px+14, py, fill=TEXT_PRIMARY)
+        canvas.create_line(px, py-14, px, py+14, fill=TEXT_PRIMARY)
+        canvas.create_text(px, min(height-8,py+18), text=f'({x:g}, {y:g})',
+                           fill=TEXT_PRIMARY, font=('Consolas', 9))
 
     def studio_scrub(self, seconds):
         self.studio_scrub_time = max(0.0, float(seconds))
@@ -14034,6 +14171,7 @@ class BuiltInMacroApp:
         self.studio_selected_stage = index
         self.studio_selected_action = action_index
         stage = self.chain_steps[index]
+        self.studio_draw_preview()
         self.studio_selection_label.configure(text=f"#{index + 1}  {stage['preset']}")
         for entry, value in ((self.studio_loop_edit, stage['loops']),
                              (self.studio_delay_edit, stage['delay_after'])):
@@ -14188,6 +14326,8 @@ class BuiltInMacroApp:
             timeline.selected_action = getattr(self, 'studio_selected_action', None)
             timeline.running_stage = self.current_chain_stage if self.chain_running else -1
             timeline.redraw()
+            if hasattr(self, 'studio_preview_canvas'):
+                self.studio_draw_preview()
             if index is not None:
                 self.studio_select(index, self.studio_selected_action)
             elif hasattr(self, 'studio_selection_label'):
