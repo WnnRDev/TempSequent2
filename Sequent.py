@@ -4463,12 +4463,169 @@ def sequent_xlsx_write(path,columns,rows):
         book.writestr('xl/_rels/workbook.xml.rels',relationships)
         book.writestr('xl/worksheets/sheet1.xml',_seq_et.tostring(ws,encoding='utf-8',xml_declaration=True))
 
+# --- Compare Text & Branch: standard-library multi-line validation ---
+SEQUENT_COMPARE_MODES = ('Exact Match', 'Contains', 'Line-by-Line', 'Similarity')
+SEQUENT_COMPARE_SOURCES = ('Literal Text', 'Variable', 'Clipboard', 'Text File')
+SEQUENT_COMPARE_OUTCOMES = ('Continue', 'Stop with Error', 'Stop Macro',
+                            'Jump to Label', 'Run Saved Macro', 'Set Variable')
+SEQUENT_COMPARE_LIMIT = 2 * 1024 * 1024  # Bound difflib time/memory on large inputs
+
+
+def sequent_compare_template(app, template):
+    """Resolve ${name} placeholders strictly; absent values are errors, not blank matches."""
+    def replace(match):
+        raw = match.group(1)
+        bare, scope = variable_identity(raw)
+        sentinel = object()
+        if raw.startswith('global.'):
+            value = get_variable(app, bare, 'global', sentinel)
+        else:
+            value = app.variables.get(bare, sentinel)
+            if value is sentinel:
+                value = get_variable(app, bare, 'global', sentinel)
+        if value is sentinel:
+            raise MacroExecutionError(f'Compare Text: variable {raw!r} does not exist')
+        return str(value)
+    return re.sub(r'\$\{([A-Za-z_][\w.]*)\}', replace, str(template))
+
+
+def sequent_compare_resolve(app, action, side, interpolate=None):
+    """Resolve a configured text operand at execution time; report missing inputs as errors."""
+    source = action.get(side + '_source', 'Literal Text')
+    value = str(action.get(side + '_value', ''))
+    if source == 'Literal Text':
+        result = sequent_compare_template(app, value)
+    elif source == 'Variable':
+        name, scope = variable_identity(value.strip(), action.get(side + '_scope', 'local'))
+        sentinel = object()
+        result = get_variable(app, name, scope, default=sentinel)
+        if result is sentinel:
+            raise MacroExecutionError(f'Compare Text: {side} {scope} variable {name!r} does not exist')
+    elif source == 'Clipboard':
+        result = get_clipboard_text()
+        if not isinstance(result, str) or not result:
+            raise MacroExecutionError(f'Compare Text: {side} clipboard is empty or unavailable')
+    elif source == 'Text File':
+        filename = sequent_compare_template(app, value)
+        path = sequent_text_file_path(app, filename)
+        try:
+            if os.path.getsize(path) > SEQUENT_COMPARE_LIMIT:
+                raise MacroExecutionError('Compare Text: text file exceeds the 2 MiB comparison limit')
+            with open(path, 'r', encoding='utf-8-sig', newline='') as stream:
+                result = stream.read(SEQUENT_COMPARE_LIMIT + 1)
+        except (OSError, UnicodeError) as exc:
+            raise MacroExecutionError(f'Compare Text: unable to read {side} text file: {exc}') from exc
+    else:
+        raise MacroExecutionError(f'Compare Text: unknown {side} source {source!r}')
+    result = str(result)
+    if len(result) > SEQUENT_COMPARE_LIMIT:
+        raise MacroExecutionError('Compare Text: input exceeds the 2 MiB comparison limit')
+    return result
+
+
+def sequent_compare_text(expected, actual, *, mode='Exact Match',
+                         ignore_case=False, trim_lines=False,
+                         normalize_whitespace=False, ignore_line_breaks=False,
+                         threshold=95):
+    """Return a structured comparison with bounded, human-readable line differences.
+
+    Normalizations are always opt-in. Exact Match is strict by default.
+    'Contains' means actual contains expected (the expected value is the needle).
+    """
+    if mode not in SEQUENT_COMPARE_MODES:
+        raise MacroExecutionError(f'Compare Text: unsupported mode {mode!r}')
+    expected, actual = str(expected), str(actual)
+    if len(expected) > SEQUENT_COMPARE_LIMIT or len(actual) > SEQUENT_COMPARE_LIMIT:
+        raise MacroExecutionError('Compare Text: input exceeds the 2 MiB comparison limit')
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise MacroExecutionError('Compare Text: similarity threshold must be a number') from exc
+    if not 0 <= threshold <= 100 or not math.isfinite(threshold):
+        raise MacroExecutionError('Compare Text: similarity threshold must be 0–100')
+
+    def normalize(text):
+        if ignore_line_breaks:
+            text = re.sub(r'\r\n|\r|\n', ' ', text)
+        # Exact comparison preserves CRLF vs LF unless normalization is requested.
+        if trim_lines:
+            text = '\n'.join(line.strip() for line in text.splitlines())
+        if normalize_whitespace:
+            text = '\n'.join(' '.join(line.split()) for line in text.split('\n'))
+        if ignore_case:
+            text = text.casefold()
+        return text
+
+    left, right = normalize(expected), normalize(actual)
+    left_lines, right_lines = left.split('\n'), right.split('\n')
+    first = next((i for i in range(max(len(left_lines), len(right_lines)))
+                  if (left_lines[i] if i < len(left_lines) else None) !=
+                  (right_lines[i] if i < len(right_lines) else None)), None)
+    different_lines = sum(1 for i in range(max(len(left_lines), len(right_lines)))
+                          if (left_lines[i] if i < len(left_lines) else None) !=
+                          (right_lines[i] if i < len(right_lines) else None))
+    # Similarity can be comparatively expensive. Keep inputs bounded more tightly in this mode.
+    if mode == 'Similarity' and max(len(left), len(right)) > 20000:
+        raise MacroExecutionError('Compare Text: similarity input must be 20,000 characters or fewer')
+    similarity = (difflib.SequenceMatcher(None, left, right, autojunk=True).ratio() * 100
+                  if mode == 'Similarity' else None)
+    if mode in ('Exact Match', 'Line-by-Line'):
+        matched = left == right
+    elif mode == 'Contains':
+        if not left:
+            raise MacroExecutionError('Compare Text: Contains requires nonempty expected text')
+        matched = left in right
+    else:
+        matched = similarity >= threshold
+    diff = '\n'.join(list(difflib.unified_diff(
+        [line[:2000] for line in left_lines[:250]],
+        [line[:2000] for line in right_lines[:250]],
+        fromfile='Expected', tofile='Actual', lineterm='', n=2))[:80])
+    if max(len(left_lines), len(right_lines)) > 250:
+        diff += '\n[Inspector preview limited to first 250 lines; long lines are truncated]'
+    if len(diff) > 20000:
+        diff = diff[:20000] + '\n[Inspector preview truncated]'
+    return {'matched':matched, 'mode':mode, 'difference_count':different_lines,
+            'first_different_line': first + 1 if first is not None else 0,
+            'expected_line':left_lines[first] if first is not None and first < len(left_lines) else '',
+            'actual_line':right_lines[first] if first is not None and first < len(right_lines) else '',
+            'similarity':similarity, 'expected':expected, 'actual':actual,
+            'diff':diff}
+
+
+def sequent_compare_store(app, result, error=''):
+    """Publish values to LOCAL variables; no global disk writes or sensitive trace logs."""
+    values = {
+        '_compare_match': 'true' if result and result['matched'] else 'false',
+        '_compare_status': 'error' if error else ('match' if result and result['matched'] else 'mismatch'),
+        '_compare_error': error,
+        '_compare_difference_count': str(result['difference_count']) if result else '0',
+        '_compare_first_difference': str(result['first_different_line']) if result else '0',
+        '_compare_expected_line': result['expected_line'] if result else '',
+        '_compare_actual_line': result['actual_line'] if result else '',
+        '_compare_similarity': (f"{result['similarity']:.2f}" if result and result['similarity'] is not None else ''),
+    }
+    app.variables.update(values)
+    # Retain full text ONLY in memory for an opt-in Difference Inspector.
+    app._last_text_comparison = dict(result) if result else {'error':error}
+
+
+def sequent_compare_outcome(action, key):
+    mode = action.get(key, 'Continue' if key == 'on_match' else 'Stop with Error')
+    if mode not in SEQUENT_COMPARE_OUTCOMES:
+        raise MacroExecutionError(f'Compare Text: invalid {key}: {mode!r}')
+    target = str(action.get(key + '_target', '')).strip()
+    if mode in ('Run Saved Macro', 'Jump to Label', 'Set Variable') and not target:
+        raise MacroExecutionError(f'Compare Text: {key} requires a target')
+    return mode, target
+
+
 DYNAMIC_ACTION_TYPES = frozenset({
     'ui_element', 'smart_wait', 'ocr_extract', 'if_dynamic', 'else_dynamic',
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable'
+    'load_text_variable', 'compare_text'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -5401,8 +5558,8 @@ class SequentDynamicEngine:
             name = action.get('var_name','ocr_value')
             self._assign_variable(name, extracted, action.get('var_scope'))
             result = {'value':extracted,'variable':name}
-        elif typ in ('run_macro', 'macro_return'):
-            raise MacroExecutionError('Macro call/return actions require the workflow interpreter')
+        elif typ in ('run_macro', 'macro_return', 'compare_text'):
+            raise MacroExecutionError('Macro call/return and Compare Text & Branch require the workflow interpreter')
         elif typ == 'text_process':
             source = get_variable(self.app, action.get('source_var', ''), action.get('source_scope', 'local'))
             transformed = sequent_text_transform(
@@ -5572,6 +5729,64 @@ class SequentDynamicEngine:
             executed += 1
             if executed > max_steps: raise MacroExecutionError('Workflow exceeded 50,000 steps')
             if on_step: on_step(index, action)
+            if typ == 'compare_text':
+                result = None
+                compare_error = ''
+                retries = max(0, min(10, int(action.get('retry_count', 0))))
+                for attempt in range(retries + 1):
+                    try:
+                        expected = sequent_compare_resolve(self.app, action, 'left', self.interpolate)
+                        actual = sequent_compare_resolve(self.app, action, 'right', self.interpolate)
+                        result = sequent_compare_text(
+                            expected, actual, mode=action.get('mode', 'Exact Match'),
+                            ignore_case=bool(action.get('ignore_case', False)),
+                            trim_lines=bool(action.get('trim_lines', False)),
+                            normalize_whitespace=bool(action.get('normalize_whitespace', False)),
+                            ignore_line_breaks=bool(action.get('ignore_line_breaks', False)),
+                            threshold=action.get('threshold', 95))
+                        compare_error = ''
+                        break
+                    except MacroCancelled:
+                        raise
+                    except (MacroExecutionError, ValueError, TypeError, OSError, UnicodeError) as exc:
+                        compare_error = str(exc) or type(exc).__name__
+                        if attempt < retries:
+                            self._pause(float(action.get('retry_delay', 0.25)), idle=idle)
+                sequent_compare_store(self.app, result, compare_error)
+                outcome_key = ('on_error' if compare_error else
+                               'on_match' if result['matched'] else 'on_mismatch')
+                behavior, target = sequent_compare_outcome(action, outcome_key)
+                if hasattr(self.app, 'trace_action'):
+                    self.app.trace_action('compare_text',
+                        'ERROR' if compare_error else 'MATCH' if result['matched'] else 'MISMATCH')
+                if behavior == 'Continue':
+                    index += 1
+                    continue
+                if behavior == 'Set Variable':
+                    set_variable(self.app, target,
+                        str(action.get(outcome_key + '_value', 'true')).replace('${result}',
+                        'error' if compare_error else 'match' if result['matched'] else 'mismatch'),
+                        action.get(outcome_key + '_scope', 'local'))
+                    index += 1
+                    continue
+                if behavior == 'Jump to Label':
+                    destination = next((i for i, item in enumerate(actions)
+                        if item.get('type') == 'label' and item.get('name') == target), None)
+                    if destination is None:
+                        raise MacroExecutionError(f'Compare Text: label {target!r} not found')
+                    frames.clear()
+                    index = destination + 1
+                    continue
+                if behavior == 'Run Saved Macro':
+                    if target not in self.app.get_preset_names():
+                        raise MacroExecutionError(f'Compare Text: macro {target!r} not found')
+                    return {'switch':'preset', 'target':target}
+                if behavior == 'Stop Macro':
+                    return {'cancelled':True}
+                if behavior == 'Stop with Error':
+                    reason = compare_error if compare_error else 'text matched' if result['matched'] else 'text mismatch'
+                    raise MacroExecutionError(f'Compare Text: {reason}; stopped by {outcome_key}')
+                raise MacroExecutionError('Compare Text: unknown branch behavior')
             if typ == 'if_dynamic':
                 branch,end = dynamic_matching_block(actions,index,'if_dynamic','end_if','else_dynamic')
                 condition = self.evaluate(action)
@@ -5836,6 +6051,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Run Macro", "Run a saved macro and return, or switch to it.", "RM"),
             ("Return From Macro", "Return a text value to the calling macro.", "RM"),
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
+            ("Compare Text & Branch", "Validate words or paragraphs, show differences, and route results.", "CT"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
             ("Jump to Label", "Continue execution at a named label.", "JL"),
@@ -6986,6 +7202,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Delay": self._render_delay_view,
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
+            "Compare Text & Branch": self._render_compare_text_view,
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
@@ -7021,6 +7238,230 @@ class VSCodeQueueViewer(tk.Frame):
         tk.Label(row, text='Local: this session   |   Global: saved for other macros',
                  font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
         return var
+
+    def _render_compare_text_view(self, line_num, edit_idx=None):
+        """Editable, paragraph-friendly Compare Text & Branch action."""
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'compare_text':
+            old = {}
+        controls = {}
+        label_font = ('Segoe UI', 8, 'bold')
+
+        def heading(text):
+            tk.Label(body, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=label_font, anchor='w').pack(fill=tk.X, pady=(10, 3))
+
+        def menu(parent, variable, values):
+            widget = tk.OptionMenu(parent, variable, *values)
+            widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+            widget['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
+            widget.pack(fill=tk.X, pady=(0, 4))
+            return widget
+
+        def entry(parent, value=''):
+            widget = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                              font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                              highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            widget.insert(0, str(value))
+            widget.pack(fill=tk.X, ipady=4, pady=(0, 4))
+            return widget
+
+        def operand(side, title):
+            heading(title)
+            source = tk.StringVar(value=old.get(side + '_source', 'Literal Text'))
+            menu(body, source, SEQUENT_COMPARE_SOURCES)
+            group = tk.Frame(body, bg=BG_PANEL)
+            group.pack(fill=tk.X)
+            value = str(old.get(side + '_value', ''))
+            scope = tk.StringVar(value=str(old.get(side + '_scope','local')).title())
+            state = {'widget':None, 'value':value}
+            def render(*_):
+                prior_widget = state['widget']
+                if isinstance(prior_widget, tk.Text):
+                    state['value'] = prior_widget.get('1.0', 'end-1c')
+                elif prior_widget is not None:
+                    state['value'] = prior_widget.get()
+                previous = state['value']
+                for child in group.winfo_children(): child.destroy()
+                kind = source.get()
+                if kind == 'Literal Text':
+                    widget = tk.Text(group, height=4, wrap='word', bg=BG_INPUT,
+                                     fg=TEXT_PRIMARY, font=('Consolas', 9),
+                                     insertbackground=TEXT_PRIMARY, bd=0,
+                                     highlightthickness=1, highlightbackground=BG_BORDER)
+                    widget.insert('1.0', previous)
+                    widget.pack(fill=tk.X)
+                elif kind == 'Variable':
+                    tk.Label(group, text='Variable name:', bg=BG_PANEL,
+                             fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                    widget = entry(group, previous)
+                    menu(group, scope, ('Local', 'Global'))
+                elif kind == 'Text File':
+                    widget = entry(group, previous)
+                    def browse():
+                        chosen = filedialog.askopenfilename(parent=self.sub_menu,
+                                  title='Select UTF-8 text to compare')
+                        if chosen:
+                            widget.delete(0, tk.END)
+                            widget.insert(0, chosen)
+                    ModernButton(group, text='Browse Text File', bg_color=BG_BORDER,
+                                 hover_color=BG_HOVER, command=browse).pack(fill=tk.X)
+                else:
+                    widget = None
+                    tk.Label(group, text='Reads the clipboard at playback time.',
+                        bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                state['widget'] = widget
+            source.trace_add('write', render)
+            render()
+            controls[side] = (source, scope, state)
+
+        operand('left', 'EXPECTED TEXT / SOURCE A')
+        operand('right', 'ACTUAL TEXT / SOURCE B')
+        heading('Comparison mode')
+        mode = tk.StringVar(value=old.get('mode', 'Exact Match'))
+        menu(body, mode, SEQUENT_COMPARE_MODES)
+        advanced = tk.Frame(body, bg=BG_PANEL)
+        def toggle_advanced():
+            if advanced.winfo_manager():
+                advanced.pack_forget()
+            else:
+                advanced.pack(fill=tk.X, pady=(4, 7), after=advanced_button)
+        advanced_button = ModernButton(body, text='Advanced Comparison Options',
+                                       bg_color=BG_BORDER, hover_color=BG_HOVER,
+                                       command=toggle_advanced)
+        advanced_button.pack(fill=tk.X, pady=(3, 5))
+        tk.Label(advanced, text='SIMILARITY THRESHOLD (0–100%)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font, anchor='w').pack(fill=tk.X, pady=(10, 3))
+        threshold = entry(advanced, old.get('threshold', 95))
+        tk.Label(advanced, text='NORMALIZATION — OFF BY DEFAULT', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font, anchor='w').pack(fill=tk.X, pady=(10,3))
+        flags = {}
+        for key, title in (('ignore_case','Ignore capitalization'),
+                           ('trim_lines','Trim beginning/end of each line'),
+                           ('normalize_whitespace','Collapse repeated whitespace'),
+                           ('ignore_line_breaks','Treat line breaks as spaces')):
+            v = tk.BooleanVar(value=bool(old.get(key, False)))
+            tk.Checkbutton(advanced, text=title, variable=v, bg=BG_PANEL,
+                           fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+                           font=('Segoe UI', 9)).pack(anchor='w')
+            flags[key] = v
+        heading('ON MATCH / ON MISMATCH / ON INPUT ERROR')
+        tk.Label(body, text='Errors include missing variables, unreadable files and invalid settings. '
+                 'Run Saved Macro switches to the selected macro (no return).',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
+                 wraplength=440, justify='left').pack(anchor='w')
+        outcomes = {}
+        for key, title, default in (('on_match','ON MATCH','Continue'),
+                                    ('on_mismatch','ON MISMATCH','Stop with Error'),
+                                    ('on_error','ON ERROR','Stop with Error')):
+            heading(title)
+            kind = tk.StringVar(value=old.get(key, default))
+            menu(body, kind, SEQUENT_COMPARE_OUTCOMES)
+            target = entry(body, old.get(key + '_target', ''))
+            tk.Label(body, text='Target: label, saved macro, or variable name when applicable',
+                     bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+            new_value = entry(body, old.get(key + '_value', '${result}'))
+            scope = tk.StringVar(value=str(old.get(key + '_scope','local')).title())
+            menu(body, scope, ('Local','Global'))
+            outcomes[key] = (kind, target, new_value, scope)
+
+        tk.Label(advanced, text='Retry comparison errors (0–10)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font).pack(anchor='w', pady=(10,3))
+        retries = entry(advanced, old.get('retry_count', 0))
+        tk.Label(advanced, text='Seconds between retries (0–60)', bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=label_font).pack(anchor='w', pady=(6,3))
+        retry_delay = entry(advanced, old.get('retry_delay', 0.25))
+        if (old.get('mode') == 'Similarity' or old.get('retry_count',0) or
+            any(bool(old.get(key,False)) for key in ('ignore_case','trim_lines',
+                'normalize_whitespace','ignore_line_breaks'))):
+            advanced.pack(fill=tk.X, pady=(4,7), after=advanced_button)
+        mode.trace_add('write', lambda *_: advanced.pack(fill=tk.X, pady=(4,7), after=advanced_button)
+                       if mode.get() == 'Similarity' and not advanced.winfo_manager() else None)
+        info = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                        wraplength=430, justify='left', font=('Segoe UI', 8))
+        info.pack(fill=tk.X, pady=(8, 3))
+
+        def collect():
+            action = {'type':'compare_text', 'mode':mode.get(), 'threshold':float(threshold.get()),
+                      'retry_count':int(retries.get()), 'retry_delay':float(retry_delay.get())}
+            if not 0 <= action['retry_count'] <= 10 or not 0 <= action['retry_delay'] <= 60:
+                raise MacroExecutionError('Retry count must be 0–10, delay 0–60 seconds')
+            for side, (kind, scope, state) in controls.items():
+                widget = state['widget']
+                action[side + '_source'] = kind.get()
+                action[side + '_scope'] = scope.get().lower()
+                action[side + '_value'] = (widget.get('1.0','end-1c') if isinstance(widget, tk.Text)
+                                          else widget.get() if widget is not None else '')
+            for key, v in flags.items(): action[key] = v.get()
+            for key, (kind, target, new_value, scope) in outcomes.items():
+                action[key] = kind.get()
+                action[key + '_target'] = target.get().strip()
+                action[key + '_value'] = new_value.get()
+                action[key + '_scope'] = scope.get().lower()
+                sequent_compare_outcome(action, key)
+            # Validate options before saving or showing a preview.
+            sequent_compare_text('test', 'test', mode=action['mode'], threshold=action['threshold'])
+            return action
+
+        def preview():
+            try:
+                action = collect()
+                left = sequent_compare_resolve(self.app, action, 'left', self.app.dynamic_engine.interpolate)
+                right = sequent_compare_resolve(self.app, action, 'right', self.app.dynamic_engine.interpolate)
+                result = sequent_compare_text(left, right, mode=action['mode'],
+                    threshold=action['threshold'], **{k:v.get() for k,v in flags.items()})
+                # Preview does not set variables or execute branches.
+                inspector.config(state=tk.NORMAL)
+                inspector.delete('1.0',tk.END)
+                inspector.insert('1.0',result['diff'] or '(No line differences to show)')
+                inspector.config(state='disabled')
+                status.config(text=('MATCH' if result['matched'] else 'MISMATCH') +
+                    f"  |  {result['difference_count']} differing lines" +
+                    (f"  |  {result['similarity']:.1f}% similar" if result['similarity'] is not None else ''),
+                    fg=COLOR_SUCCESS if result['matched'] else COLOR_DANGER)
+                info.config(text='')
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                info.config(text=str(exc),fg=COLOR_DANGER)
+        ModernButton(body, text='Preview Difference (no macro execution)',
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=preview).pack(fill=tk.X, pady=(8, 3))
+        status = tk.Label(body,text='',bg=BG_PANEL,fg=TEXT_MUTED,font=('Segoe UI',9,'bold'))
+        status.pack(anchor='w')
+        inspector = tk.Text(body, height=7, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
+                            font=('Consolas', 8), bd=0, highlightthickness=1,
+                            highlightbackground=BG_BORDER)
+        inspector.pack(fill=tk.X,pady=(4,8))
+        inspector.config(state='disabled')
+        if edit_idx is None:
+            heading('Insert position')
+            pos = tk.StringVar(value=f'Before Line {line_num}')
+            menu(body,pos,(f'Before Line {line_num}',f'After Line {line_num}'))
+
+        def save():
+            try:
+                action = collect()
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                info.config(text=str(exc),fg=COLOR_DANGER)
+                return
+            if edit_idx is not None:
+                self.app.recorded_actions[edit_idx] = action
+                idx = edit_idx
+            else:
+                after = pos.get().startswith('After')
+                idx = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                idx = max(0, min(idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.app.update_status('Compare Text & Branch saved', COLOR_SUCCESS)
+            self.close_sub_menu()
+        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Compare Text & Branch',
+                     bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X,pady=(3,12))
 
     def _render_gate_check_view(self, line_num, edit_idx=None):
         body = self.action_content_frame
@@ -11728,7 +12169,8 @@ class BuiltInMacroApp:
         choices = (('Live Variable Explorer', 'Inspect and edit Local / Global values', 'variable', 'variables'),
                    ('Execution Timeline', 'Review macro actions, timing and failures', 'timeline', 'timeline'),
                    ('Preset Version History', 'Compare and restore autosaved revisions', 'history', 'history'),
-                   ('Preset Manager', 'Find, tag, favorite and duplicate presets', 'folder', 'presets'))
+                   ('Preset Manager', 'Find, tag, favorite and duplicate presets', 'folder', 'presets'),
+                   ('Difference Inspector', 'Inspect the latest full-text comparison', 'git-compare', 'compare'))
         for title, caption, glyph, tool in choices:
             card = tk.Frame(home, bg=BG_PANEL, highlightthickness=1, highlightbackground=BG_BORDER)
             card.pack(fill=tk.X, padx=23, pady=(12, 0))
@@ -11758,7 +12200,8 @@ class BuiltInMacroApp:
         actions = {'variables': self.open_variable_explorer,
                    'timeline': self.open_execution_timeline,
                    'history': self.open_preset_history,
-                   'presets': self.open_preset_manager}
+                   'presets': self.open_preset_manager,
+                   'compare': self.open_compare_inspector}
         self._debug_active_tool = key
         self._update_debug_nav()
         actions[key]()
@@ -11787,7 +12230,8 @@ class BuiltInMacroApp:
         choices = (('variables', 'Variables', 'variable'),
                    ('timeline', 'Timeline', 'timeline'),
                    ('history', 'Version History', 'history'),
-                   ('presets', 'Presets', 'folder'))
+                   ('presets', 'Presets', 'folder'),
+                   ('compare', 'Differences', 'git-compare'))
         for key, text, glyph in choices:
             button = sequent_toolbar_button(nav, text,
                           lambda choice=key: self._open_debug_tool(choice), icon=glyph)
@@ -11805,6 +12249,40 @@ class BuiltInMacroApp:
             self._open_debug_tool(selected)
         else:
             self._show_debug_overview()
+
+    def open_compare_inspector(self):
+        """Show the latest comparison in Debug Tools without writing text to logs."""
+        ui = self._new_debug_panel('Difference Inspector',
+                                   'Latest comparison from the running macro', 'git-compare')
+        if ui is None: return None
+        result = getattr(self, '_last_text_comparison', None)
+        if not result:
+            ui.label(ui.body, 'No comparisons have run in this session.',
+                     font=('Segoe UI', 10)).pack(anchor='w', padx=18, pady=18)
+            return ui
+        if result.get('error'):
+            ui.label(ui.body, 'Comparison error: ' + result['error'],
+                     font=('Segoe UI', 10)).pack(anchor='w', padx=18, pady=18)
+            return ui
+        description = ('MATCH' if result['matched'] else 'MISMATCH') + (
+            f"  |  {result['difference_count']} differing lines  |  "
+            f"first difference: line {result['first_different_line']}")
+        ui.label(ui.body, description, font=('Segoe UI', 10, 'bold')).pack(
+            anchor='w', padx=12, pady=(14, 6))
+        container = tk.Frame(ui.body, bg=BG_PANEL)
+        container.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0,12))
+        display = tk.Text(container, wrap='none', bg=BG_INPUT, fg=TEXT_PRIMARY,
+                          font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                          highlightthickness=0, bd=0)
+        vertical = tk.Scrollbar(container, orient='vertical', command=display.yview)
+        horizontal = tk.Scrollbar(container, orient='horizontal', command=display.xview)
+        display.config(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side=tk.RIGHT, fill=tk.Y)
+        horizontal.pack(side=tk.BOTTOM, fill=tk.X)
+        display.pack(fill=tk.BOTH, expand=True)
+        display.insert('1.0', result['diff'] or '(No line differences)')
+        display.config(state='disabled')
+        return ui
 
     def open_variable_explorer(self):
         ui = self._new_debug_panel( 'Live Variable Explorer',
@@ -13462,6 +13940,10 @@ class BuiltInMacroApp:
                 return (f'{mode}: {target}' if target and mode in
                         ('Run Saved Macro', 'Jump to Label') else mode)
             return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
+        if act_type == 'compare_text':
+            left = action.get('left_source', 'Literal Text')
+            right = action.get('right_source', 'Literal Text')
+            return f"text.compare({left} vs {right}, {action.get('mode','Exact Match')})"
         if act_type == 'run_macro':
             target = str(action.get('preset', '')).strip()
             mode = action.get('mode', 'Run & Return')
@@ -13599,7 +14081,7 @@ class BuiltInMacroApp:
 
     def get_action_color(self, action):
         act_type = action.get("type", "") if action else ""
-        if act_type in ("label", "goto", "if_var", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
+        if act_type in ("label", "goto", "if_var", "compare_text", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type in DYNAMIC_ACTION_TYPES: return SYNTAX_GREEN if act_type not in DYNAMIC_FLOW_TYPES else SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
         if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
