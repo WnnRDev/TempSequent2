@@ -4797,6 +4797,58 @@ def dynamic_compare(actual, op, expected):
     raise MacroExecutionError(f'Unsupported comparison operator: {op}')
 
 
+def sequent_if_variable_match(app, action, interpolate):
+    """Evaluate legacy IF-variable conditions and new variable-to-variable ones.
+
+    Literal comparisons retain the original case-insensitive behavior. A new
+    variable reference uses a strict value lookup and case-sensitive == / !=
+    by default, so a missing variable never silently equals an empty string.
+    """
+    lhs = action.get('var_name', '')
+    scope = action.get('var_scope')
+    source = action.get('match_source', 'text')
+    if source == 'variable':
+        rhs_name = str(action.get('match_var_name', '')).strip()
+        if not rhs_name:
+            raise MacroExecutionError('IF Variable: comparison variable name is required')
+        missing = object()
+        actual = get_variable(app, lhs, scope, default=missing)
+        expected = get_variable(app, rhs_name, action.get('match_var_scope', 'local'), default=missing)
+        if actual is missing:
+            raise MacroExecutionError(f'IF Variable: source variable {lhs!r} is not defined')
+        if expected is missing:
+            raise MacroExecutionError(f'IF Variable: comparison variable {rhs_name!r} is not defined')
+        operator = action.get('op', '==')
+        if action.get('case_sensitive', True) and operator in ('==', '!='):
+            return (str(actual) == str(expected)) if operator == '==' else (str(actual) != str(expected))
+        return dynamic_compare(actual, operator, expected)
+    if source != 'text':
+        raise MacroExecutionError(f'IF Variable: unsupported comparison source {source!r}')
+    return dynamic_compare(get_variable(app, lhs, scope),
+                           action.get('op', '=='), interpolate(action.get('val', '')))
+
+
+def sequent_if_set_value(app, action):
+    """Perform a validated, scoped IF-variable assignment with no imports."""
+    destination = str(action.get('target', '')).strip()
+    if not destination:
+        raise MacroExecutionError('IF Variable: Set Variable needs a destination name')
+    source = action.get('set_value_source', 'text')
+    if source == 'variable':
+        variable_name = str(action.get('set_source_name', '')).strip()
+        if not variable_name:
+            raise MacroExecutionError('IF Variable: assignment source name is required')
+        missing = object()
+        value = get_variable(app, variable_name, action.get('set_source_scope', 'local'), default=missing)
+        if value is missing:
+            raise MacroExecutionError(f'IF Variable: assignment source {variable_name!r} is not defined')
+    elif source == 'text':
+        value = action.get('set_value', '')
+    else:
+        raise MacroExecutionError(f'IF Variable: unsupported assignment source {source!r}')
+    set_variable(app, destination, value, action.get('target_scope', 'local'))
+
+
 def dynamic_matching_block(actions, start, opening, closing, middle=None):
     """Locate same-level ELSE/END even with nested blocks."""
     depth = 0
@@ -5901,10 +5953,18 @@ class SequentDynamicEngine:
                 return {'completed':True, 'return_value':value,
                         'next_index':index + 1}
             if typ=='if_var':
-                actual=str(get_variable(self.app, action.get('var_name',''), action.get('var_scope')))
-                if dynamic_compare(actual,action.get('op','=='),self.interpolate(action.get('val',''))):
-                    # Old macros and the editor both default to preset routing.
+                if sequent_if_variable_match(self.app, action, self.interpolate):
+                    # Preserve legacy actions, whose default outcome is a preset switch.
                     target_type=action.get('target_type','preset')
+                    if target_type=='continue':
+                        index+=1;continue
+                    if target_type=='set_variable':
+                        sequent_if_set_value(self.app, action)
+                        index+=1;continue
+                    if target_type=='stop':
+                        return {'cancelled':True}
+                    if target_type=='error':
+                        raise MacroExecutionError('IF Variable condition matched; configured to stop with error')
                     if target_type=='label':
                         target=next((i for i,a in enumerate(actions) if a.get('type')=='label' and a.get('name')==action.get('target')),None)
                         if target is None:raise MacroExecutionError('IF Variable label not found')
@@ -6054,9 +6114,8 @@ class VSCodeQueueViewer(tk.Frame):
         ("Logic & Flow", (
             ("Run Macro", "Run a saved macro and return, or switch to it.", "RM"),
             ("Return From Macro", "Return a text value to the calling macro.", "RM"),
-            ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
+            ("If Variable Condition", "Compare a variable to text or another variable; then run an action.", "IF"),
             ("Compare Text & Branch", "Validate words or paragraphs, show differences, and route results.", "CT"),
-            ("Compare Variables", "IF two variables match, THEN choose what happens; otherwise continue.", "CV"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
             ("Jump to Label", "Continue execution at a named label.", "JL"),
@@ -8546,170 +8605,247 @@ class VSCodeQueueViewer(tk.Frame):
 
 
     def _render_if_var_view(self, line_num, edit_idx=None):
+        """Unified IF / THEN form for literal and variable comparisons.
+
+        Old if_var actions retain their JSON keys (var_name/op/val/target*) and
+        additional keys are added only for new features. Legacy compare_variables
+        actions remain editable through their original dedicated editor.
+        """
         body = self.action_content_frame
-        curr_act = self.app.recorded_actions[edit_idx] if (edit_idx is not None and 0 <= edit_idx < len(self.app.recorded_actions)) else None
+        old = (self.app.recorded_actions[edit_idx].copy() if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'if_var':
+            old = {}
 
-        cond_row = tk.Frame(body, bg=BG_PANEL)
-        cond_row.pack(fill=tk.X, pady=(0, 4))
+        def label(parent, text):
+            tk.Label(parent, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X, pady=(4, 2))
 
-        v_left = tk.Frame(cond_row, bg=BG_PANEL)
-        v_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        tk.Label(v_left, text="Variable:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        var_entry = tk.Entry(v_left, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        var_entry.pack(fill=tk.X, ipady=2)
-        var_entry.insert(0, variable_identity(curr_act.get("var_name", "status"), curr_act.get("var_scope"))[0] if curr_act else "status")
-        scope_var = self._add_variable_scope_picker(body, curr_act)
+        def note(parent, text):
+            tk.Label(parent, text=text, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), anchor='w', justify='left', wraplength=425).pack(fill=tk.X, pady=(0, 4))
 
-        v_mid = tk.Frame(cond_row, bg=BG_PANEL)
-        v_mid.pack(side=tk.LEFT, padx=2)
-        tk.Label(v_mid, text="Condition:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        op_var = tk.StringVar(value=curr_act.get("op", "==") if (curr_act and curr_act.get("type") == "if_var") else "==")
-        op_menu = tk.OptionMenu(v_mid, op_var, "==", "!=", "contains", "startswith", "endswith", "regex", "not empty")
-        op_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        op_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        op_menu.pack(fill=tk.X)
+        def entry(parent, value=''):
+            e = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                         font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                         bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
+            e.insert(0, str(value))
+            e.pack(fill=tk.X, ipady=4, pady=(0, 4))
+            return e
 
-        v_right = tk.Frame(cond_row, bg=BG_PANEL)
-        v_right.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-        tk.Label(v_right, text="Match Value:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(0, 2))
-        val_entry = tk.Entry(v_right, bg=BG_INPUT, fg=SYNTAX_GREEN, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-        val_entry.pack(fill=tk.X, ipady=2)
-        val_entry.insert(0, curr_act.get("val", "RTS") if (curr_act and curr_act.get("type") == "if_var") else "RTS")
+        def pick(parent, state, values):
+            dropdown = tk.OptionMenu(parent, state, *values)
+            dropdown.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=('Segoe UI', 9),
+                            bd=0, highlightbackground=BG_BORDER,
+                            highlightthickness=1, cursor='hand2')
+            dropdown['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                    activebackground=COLOR_ACCENT)
+            dropdown.pack(fill=tk.X, pady=(0, 4))
+            return dropdown
 
-        tk.Label(body, text="If Condition is Met, Perform Action:", font=("Segoe UI", 8, "bold"), bg=BG_PANEL, fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, pady=(6, 2))
+        def scope_picker(parent, name, default='local'):
+            box = tk.Frame(parent, bg=BG_PANEL, width=106)
+            box.pack(side=tk.RIGHT, padx=(5, 0))
+            label(box, 'Scope')
+            state = tk.StringVar(master=body, value=str(default).title())
+            pick(box, state, ('Local', 'Global'))
+            return state
 
-        init_tgt_type = curr_act.get("target_type", "preset") if (curr_act and curr_act.get("type") == "if_var") else "preset"
-        init_mode = "Jump to Label" if init_tgt_type == "label" else ("Browse & Run File" if init_tgt_type == "file" else "Switch to Preset")
+        def name_and_scope(parent, caption, value, scope='local'):
+            row = tk.Frame(parent, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(0, 4))
+            scope_var = scope_picker(row, caption, scope)
+            field = tk.Frame(row, bg=BG_PANEL)
+            field.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            label(field, caption)
+            name = entry(field, value)
+            return name, scope_var
 
-        action_mode_var = tk.StringVar(value=init_mode)
-        mode_menu = tk.OptionMenu(body, action_mode_var, "Switch to Preset", "Browse & Run File", "Jump to Label", command=lambda m: render_target_input(m))
-        mode_menu.config(bg=BG_INPUT, fg=SYNTAX_BLUE, font=("Segoe UI", 8, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-        mode_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-        mode_menu.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(body, text='IF  ·  Compare', bg=BG_PANEL, fg=TEXT_PRIMARY,
+                 font=('Segoe UI', 10, 'bold'), anchor='w').pack(fill=tk.X, pady=(0, 4))
+        initial_lhs, initial_lhs_scope = variable_identity(
+            old.get('var_name') or 'status', old.get('var_scope'))
+        lhs, lhs_scope = name_and_scope(body, 'Variable A',
+                                        old.get('var_name', '') if not old else initial_lhs,
+                                        initial_lhs_scope)
 
+        operators = ('==', '!=', 'contains', 'startswith', 'endswith', 'regex', 'not empty')
+        compare_row = tk.Frame(body, bg=BG_PANEL)
+        compare_row.pack(fill=tk.X)
+        op_box = tk.Frame(compare_row, bg=BG_PANEL)
+        op_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        label(op_box, 'Condition')
+        op = tk.StringVar(master=body, value=old.get('op', '=='))
+        pick(op_box, op, operators)
+        mode_box = tk.Frame(compare_row, bg=BG_PANEL)
+        mode_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        label(mode_box, 'Compare against')
+        source = tk.StringVar(master=body, value=('Another Variable' if
+                    old.get('match_source') == 'variable' else 'Text'))
+        pick(mode_box, source, ('Text', 'Another Variable'))
+
+        compare_target = tk.Frame(body, bg=BG_PANEL)
+        compare_target.pack(fill=tk.X)
+        compare_controls = {}
+        def render_comparison(*_):
+            for child in compare_target.winfo_children(): child.destroy()
+            if source.get() == 'Another Variable':
+                v, sc = name_and_scope(compare_target, 'Variable B',
+                    old.get('match_var_name', ''), old.get('match_var_scope', 'local'))
+                compare_controls['variable'] = (v, sc)
+                note(compare_target, 'Both values are read when the macro runs. Missing variables cause an error.')
+            else:
+                label(compare_target, 'Match text')
+                v = entry(compare_target, old.get('val', ''))
+                compare_controls['text'] = v
+            # Keep the inactive inputs untouched if the user changes modes.
+        source.trace_add('write', render_comparison)
+        render_comparison()
+
+        tk.Label(body, text='THEN  ·  If the condition matches', bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=('Segoe UI', 10, 'bold'),
+                 anchor='w').pack(fill=tk.X, pady=(10, 4))
+        target_names = {
+            'preset':'Switch to Preset', 'file':'Browse & Run File',
+            'label':'Jump to Label', 'set_variable':'Set Variable',
+            'continue':'Continue', 'stop':'Stop Macro', 'error':'Stop with Error'}
+        reverse_names = {v:k for k,v in target_names.items()}
+        current_type = old.get('target_type', 'continue')
+        chosen = tk.StringVar(master=body, value=target_names.get(current_type, 'Continue'))
+        pick(body, chosen, tuple(target_names.values()))
         target_container = tk.Frame(body, bg=BG_PANEL)
-        target_container.pack(fill=tk.X, pady=(0, 6))
+        target_container.pack(fill=tk.X, pady=(0, 4))
+        controls = {}
+        current_target = str(old.get('target', ''))
+        current_value = str(old.get('set_value', ' '))
 
-        target_state = {
-            "type": init_tgt_type, 
-            "target": curr_act.get("target", "") if (curr_act and curr_act.get("type") == "if_var") else ""
-        }
-
-        def render_target_input(mode):
-            for child in target_container.winfo_children():
-                child.destroy()
-
-            if mode == "Switch to Preset":
-                target_state["type"] = "preset"
-                presets = self.app.get_preset_names()
-                curr_target = target_state["target"] if target_state["target"] in presets else (presets[0] if presets else "-- No Presets Found --")
-                p_var = tk.StringVar(value=curr_target)
-                target_state["target"] = curr_target
-
-                def on_p_select(val): target_state["target"] = val
-                p_menu = tk.OptionMenu(target_container, p_var, *(presets if presets else ["-- No Presets Found --"]), command=on_p_select)
-                p_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                p_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-                p_menu.pack(fill=tk.X)
-
-            elif mode == "Browse & Run File":
-                target_state["type"] = "file"
-                f_row = tk.Frame(target_container, bg=BG_PANEL)
-                f_row.pack(fill=tk.X)
-
-                file_display = os.path.basename(target_state["target"]) if target_state["target"] else "Select macro file..."
-                lbl_file = tk.Label(f_row, text=file_display, font=("Consolas", 8), bg=BG_INPUT, fg=SYNTAX_GREEN if target_state["target"] else TEXT_MUTED, anchor="w", padx=6, pady=3, highlightbackground=BG_BORDER, highlightthickness=1)
-                lbl_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-
-                def browse_file():
-                    self.app.root.attributes('-topmost', False)
-                    try:
-                        chosen = filedialog.askopenfilename(
-                            parent=self.sub_menu, title="Select Macro to Execute", initialdir=self.app.presets_dir,
-                            filetypes=[("JSON Macro", "*.json"), ("All Files", "*.*")]
-                        )
-                    finally:
-                        self.app.root.attributes('-topmost', True)
-                    if chosen:
-                        target_state["target"] = os.path.abspath(chosen)
-                        lbl_file.config(text=os.path.basename(chosen), fg=SYNTAX_GREEN)
-
-                btn_b = tk.Label(f_row, text="Browse", font=("Segoe UI", 8, "bold"), bg=COLOR_ACCENT, fg=TEXT_ON_ACCENT, cursor="hand2", padx=8, pady=3)
-                btn_b.pack(side=tk.RIGHT)
-                btn_b.bind("<Button-1>", lambda e: browse_file())
-
-            elif mode == "Jump to Label":
-                target_state["type"] = "label"
-                labels = [a.get("name", "").strip() for a in self.app.recorded_actions if a.get("type") == "label" and a.get("name")]
-                if labels:
-                    curr_lbl = target_state["target"] if target_state["target"] in labels else labels[0]
-                    l_var = tk.StringVar(value=curr_lbl)
-                    target_state["target"] = curr_lbl
-                    def on_l_select(val): target_state["target"] = val
-                    l_menu = tk.OptionMenu(target_container, l_var, *labels, command=on_l_select)
-                    l_menu.config(bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat", cursor="hand2")
-                    l_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT, bd=1, relief="flat")
-                    l_menu.pack(fill=tk.X)
-                else:
-                    l_entry = tk.Entry(target_container, bg=BG_INPUT, fg=SYNTAX_PURPLE, font=("Consolas", 9, "bold"), insertbackground=TEXT_PRIMARY, bd=0, highlightbackground=BG_BORDER, highlightthickness=1)
-                    l_entry.insert(0, target_state["target"] or "checkpoint_1")
-                    l_entry.pack(fill=tk.X, ipady=3)
-                    def update_tgt(e=None): target_state["target"] = l_entry.get().strip()
-                    l_entry.bind("<KeyRelease>", update_tgt)
-                    target_state["target"] = target_state["target"] or "checkpoint_1"
-
-        render_target_input(init_mode)
+        def render_target(*_):
+            for child in target_container.winfo_children(): child.destroy()
+            controls.clear()
+            kind = reverse_names.get(chosen.get(), 'continue')
+            if kind == 'set_variable':
+                initial_name = current_target or (compare_controls.get('variable', (None,))[0].get()
+                                    if source.get() == 'Another Variable' else '')
+                dest, sc = name_and_scope(target_container, 'Variable to update',
+                              initial_name, old.get('target_scope', 'local'))
+                controls['dest'] = (dest, sc)
+                label(target_container, 'Set value to')
+                initial_value = ('Another Variable' if old.get('set_value_source') == 'variable'
+                    else 'One space' if current_value == ' ' else
+                    'Empty text' if current_value == '' else 'Custom text')
+                value_mode = tk.StringVar(master=body, value=initial_value)
+                controls['value_mode'] = value_mode
+                pick(target_container, value_mode,
+                     ('One space', 'Empty text', 'Custom text', 'Another Variable'))
+                value_box = tk.Frame(target_container, bg=BG_PANEL)
+                value_box.pack(fill=tk.X)
+                def render_value(*_):
+                    for child in value_box.winfo_children(): child.destroy()
+                    if value_mode.get() == 'Custom text':
+                        label(value_box, 'New text')
+                        controls['set_text'] = entry(value_box,
+                            current_value if current_value not in (' ', '') else '')
+                    elif value_mode.get() == 'Another Variable':
+                        nv, ns = name_and_scope(value_box, 'Read value from',
+                            old.get('set_source_name', ''), old.get('set_source_scope','local'))
+                        controls['set_source'] = (nv, ns)
+                value_mode.trace_add('write', render_value)
+                render_value()
+            elif kind == 'label':
+                label(target_container, 'Label name')
+                controls['target'] = entry(target_container, current_target)
+            elif kind == 'preset':
+                label(target_container, 'Saved macro')
+                names = list(self.app.get_preset_names())
+                state = tk.StringVar(master=body, value=current_target or
+                                     (names[0] if names else ''))
+                if names: pick(target_container, state, tuple(names))
+                else: controls['target_entry'] = entry(target_container, state.get())
+                controls['target_state'] = state
+            elif kind == 'file':
+                label(target_container, 'Macro JSON file')
+                path = entry(target_container, current_target)
+                controls['target'] = path
+                def browse():
+                    file_path = filedialog.askopenfilename(
+                        parent=self.sub_menu, title='Select Macro to Execute',
+                        initialdir=self.app.presets_dir,
+                        filetypes=[('JSON Macro','*.json'), ('All Files','*.*')])
+                    if file_path:
+                        path.delete(0, tk.END); path.insert(0, file_path)
+                ModernButton(target_container, text='Browse…',
+                             bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                             command=browse).pack(anchor='w', pady=(1, 4))
+        chosen.trace_add('write', render_target)
+        render_target()
+        note(body, 'If the condition is false, Sequent continues to the next action.')
 
         if edit_idx is None:
-            pos_var = tk.StringVar(value=f"Before Line {line_num}")
-            pos_menu = tk.OptionMenu(body, pos_var, f"Before Line {line_num}", f"After Line {line_num}")
-            pos_menu.config(bg=BG_INPUT, fg=TEXT_PRIMARY, font=("Segoe UI", 8), highlightthickness=1, highlightbackground=BG_BORDER, bd=0, relief="flat")
-            pos_menu["menu"].config(bg=BG_INPUT, fg=TEXT_PRIMARY, activebackground=COLOR_ACCENT)
-            pos_menu.pack(fill=tk.X, pady=(2, 8))
+            pos_var = tk.StringVar(master=body, value=f'Before Line {line_num}')
+            label(body, 'Insert position')
+            pick(body, pos_var, (f'Before Line {line_num}', f'After Line {line_num}'))
 
         def submit():
-            v_name = var_entry.get().strip()
-            op = op_var.get()
-            val = val_entry.get().strip()
-            t_type = target_state["type"]
-            t_val = target_state["target"]
-
-            if not v_name or not t_val or t_val == "-- No Presets Found --":
+            variable_a = lhs.get().strip()
+            if not variable_a:
+                messagebox.showerror('IF Variable', 'Enter Variable A.', parent=self.sub_menu)
                 return
-
+            result = old.copy()
+            result.update(type='if_var', var_name=variable_a,
+                          var_scope=lhs_scope.get().lower(), op=op.get())
+            if source.get() == 'Another Variable':
+                reference, reference_scope = compare_controls['variable']
+                if not reference.get().strip():
+                    messagebox.showerror('IF Variable', 'Enter Variable B.', parent=self.sub_menu)
+                    return
+                result.update(match_source='variable', match_var_name=reference.get().strip(),
+                              match_var_scope=reference_scope.get().lower(), case_sensitive=True)
+            else:
+                result.update(match_source='text', val=compare_controls['text'].get())
+            mode = reverse_names[chosen.get()]
+            result['target_type'] = mode
+            if mode == 'set_variable':
+                name, scope_state = controls['dest']
+                destination = name.get().strip()
+                if not destination:
+                    messagebox.showerror('IF Variable', 'Enter the variable to update.', parent=self.sub_menu)
+                    return
+                result.update(target=destination, target_scope=scope_state.get().lower())
+                vmode = controls['value_mode'].get()
+                result['set_value_source'] = 'variable' if vmode == 'Another Variable' else 'text'
+                if vmode == 'Another Variable':
+                    other, other_scope = controls['set_source']
+                    if not other.get().strip():
+                        messagebox.showerror('IF Variable', 'Enter the value source variable.', parent=self.sub_menu)
+                        return
+                    result.update(set_source_name=other.get().strip(),
+                                  set_source_scope=other_scope.get().lower())
+                else:
+                    result['set_value'] = (' ' if vmode == 'One space' else '' if vmode == 'Empty text'
+                        else controls['set_text'].get())
+            elif mode in ('preset', 'file', 'label'):
+                tgt = controls['target_state'].get() if mode == 'preset' and 'target_state' in controls else controls['target'].get()
+                if not tgt.strip():
+                    messagebox.showerror('IF Variable', 'Select a target for this action.', parent=self.sub_menu)
+                    return
+                result['target'] = tgt.strip()
             if edit_idx is not None:
-                self.app.recorded_actions[edit_idx] = {
-                    "type": "if_var",
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "op": op,
-                    "val": val,
-                    "target_type": t_type,
-                    "target": t_val
-                }
+                self.app.recorded_actions[edit_idx] = result
                 self.app.display_actions_in_queue(self.app.recorded_actions)
                 self.app.set_active_action_index(edit_idx)
-                self.app.update_status(f"Updated Branch for '{v_name}'", COLOR_SUCCESS)
+                self.app.update_status('Updated IF Variable Condition', COLOR_SUCCESS)
             else:
-                is_after = "After" in pos_var.get()
-                insert_idx = 0 if line_num <= 1 else (line_num - 1 if is_after else line_num - 2)
-                insert_idx = max(0, min(insert_idx, len(self.app.recorded_actions)))
-
-                self.app.recorded_actions.insert(insert_idx, {
-                    "type": "if_var",
-                    "var_name": v_name,
-                    "var_scope": scope_var.get().lower(),
-                    "op": op,
-                    "val": val,
-                    "target_type": t_type,
-                    "target": t_val
-                })
+                after = 'After' in pos_var.get()
+                ix = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                ix = max(0, min(ix, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(ix, result)
                 self.app.display_actions_in_queue(self.app.recorded_actions)
-                self.app.update_status(f"Added Conditional Branch for '{v_name}'", COLOR_SUCCESS)
+                self.app.update_status('Added IF Variable Condition', COLOR_SUCCESS)
             self.close_sub_menu()
 
-        btn_txt = "Save Changes" if edit_idx is not None else "Add Conditional Branch"
-        ModernButton(body, text=btn_txt, bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT, hover_color="#1d8a4b" if edit_idx is not None else COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X)
+        ModernButton(body, text=('Save Changes' if edit_idx is not None else 'Add IF Variable Condition'),
+                     bg_color=COLOR_SUCCESS if edit_idx is not None else COLOR_ACCENT,
+                     hover_color=COLOR_ACCENT_HOV, command=submit).pack(fill=tk.X, pady=(8, 0))
 
 
     def _render_request_input_view(self, line_num, edit_idx=None):
@@ -14921,18 +15057,22 @@ class BuiltInMacroApp:
             preview = (msg[:24] + "..") if len(msg) > 26 else msg
             return f"ui.disclaimer('{preview}')"
         elif act_type == "if_var":
-            op = action.get("op", "==")
-            v_name = action.get("var_name", "status")
-            v_val = action.get("val", "")
-            t_type = action.get("target_type", "preset")
-            tgt = action.get("target", "")
-            if t_type == "label":
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ goto '{tgt}')"
-            elif t_type == "preset":
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ preset '{tgt}')"
-            elif t_type == "file":
-                fname = os.path.basename(tgt)
-                return f"flow.if('{v_name}' {op} '{v_val}' ➔ run '{fname}')"
+            op = action.get('op', '==')
+            v_name = action.get('var_name', 'status')
+            rhs = (action.get('match_var_name', '') if action.get('match_source') == 'variable'
+                   else repr(action.get('val', '')))
+            t_type = action.get('target_type', 'preset')
+            tgt = action.get('target', '')
+            if t_type == 'set_variable':
+                value = ('@' + action.get('set_source_name','') if action.get('set_value_source') == 'variable'
+                         else repr(action.get('set_value', '')))
+                return f'flow.if({v_name} {op} {rhs} ➔ set {tgt} = {value})'
+            if t_type == 'continue': return f'flow.if({v_name} {op} {rhs} ➔ continue)'
+            if t_type == 'stop': return f'flow.if({v_name} {op} {rhs} ➔ stop)'
+            if t_type == 'error': return f'flow.if({v_name} {op} {rhs} ➔ error)'
+            if t_type == 'label': return f'flow.if({v_name} {op} {rhs} ➔ goto {tgt})'
+            if t_type == 'preset': return f'flow.if({v_name} {op} {rhs} ➔ preset {tgt})'
+            if t_type == 'file': return f'flow.if({v_name} {op} {rhs} ➔ run {os.path.basename(tgt)})'
         elif act_type == "drag": 
             return f"mouse.drag(({action.get('start_x')},{action.get('start_y')}) ➔ ({action.get('end_x')},{action.get('end_y')}))"
         elif act_type == "scroll": 
