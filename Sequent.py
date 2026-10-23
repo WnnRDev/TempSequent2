@@ -4625,7 +4625,7 @@ DYNAMIC_ACTION_TYPES = frozenset({
     'end_if', 'loop_start', 'loop_end', 'find_image', 'recovery',
     'data_load', 'data_save', 'data_set', 'trigger_start', 'key_action', 'set_variable',
     'search_area', 'if_var', 'label', 'goto', 'clip_fallback', 'gate_check', 'run_macro', 'text_process', 'macro_return',
-    'load_text_variable', 'compare_text'
+    'load_text_variable', 'compare_text', 'compare_variables'
 })
 DYNAMIC_FLOW_TYPES = frozenset({'if_dynamic','else_dynamic','end_if','loop_start','loop_end'})
 
@@ -5558,7 +5558,7 @@ class SequentDynamicEngine:
             name = action.get('var_name','ocr_value')
             self._assign_variable(name, extracted, action.get('var_scope'))
             result = {'value':extracted,'variable':name}
-        elif typ in ('run_macro', 'macro_return', 'compare_text'):
+        elif typ in ('run_macro', 'macro_return', 'compare_text', 'compare_variables'):
             raise MacroExecutionError('Macro call/return and Compare Text & Branch require the workflow interpreter')
         elif typ == 'text_process':
             source = get_variable(self.app, action.get('source_var', ''), action.get('source_scope', 'local'))
@@ -5729,7 +5729,11 @@ class SequentDynamicEngine:
             executed += 1
             if executed > max_steps: raise MacroExecutionError('Workflow exceeded 50,000 steps')
             if on_step: on_step(index, action)
-            if typ == 'compare_text':
+            if typ in ('compare_text', 'compare_variables'):
+                if typ == 'compare_variables' and (
+                    action.get('left_source', 'Variable') != 'Variable' or
+                    action.get('right_source', 'Variable') != 'Variable'):
+                    raise MacroExecutionError('Compare Variables requires two variable sources')
                 result = None
                 compare_error = ''
                 retries = max(0, min(10, int(action.get('retry_count', 0))))
@@ -6052,6 +6056,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Return From Macro", "Return a text value to the calling macro.", "RM"),
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
             ("Compare Text & Branch", "Validate words or paragraphs, show differences, and route results.", "CT"),
+            ("Compare Variables & Branch", "Compare two Local/Global variables and branch on the result.", "CV"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
             ("Jump to Label", "Continue execution at a named label.", "JL"),
@@ -6786,6 +6791,8 @@ class VSCodeQueueViewer(tk.Frame):
             "delay": "Delay",
             "disclaimer": "Disclaimer / Warning",
             "if_var": "If Variable Condition",
+            "compare_text": "Compare Text & Branch",
+            "compare_variables": "Compare Variables & Branch",
             "read_clipboard": "Read Clipboard",
             "clip_fallback": "Clipboard Branch / Fallback",
             "gate_check": "Gate Check",
@@ -7161,6 +7168,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
             "Compare Text & Branch": self._render_compare_text_view,
+            "Compare Variables & Branch": self._render_compare_variables_view,
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
@@ -7197,12 +7205,15 @@ class VSCodeQueueViewer(tk.Frame):
                  font=('Segoe UI', 8), bg=BG_PANEL, fg=TEXT_MUTED).pack(anchor='w')
         return var
 
-    def _render_compare_text_view(self, line_num, edit_idx=None):
+    def _render_compare_variables_view(self, line_num, edit_idx=None):
+        return self._render_compare_text_view(line_num, edit_idx, variables_only=True)
+
+    def _render_compare_text_view(self, line_num, edit_idx=None, variables_only=False):
         """Editable, paragraph-friendly Compare Text & Branch action."""
         body = self.action_content_frame
         old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
                and 0 <= edit_idx < len(self.app.recorded_actions) else {})
-        if old.get('type') != 'compare_text':
+        if old.get('type') != ('compare_variables' if variables_only else 'compare_text'):
             old = {}
         controls = {}
         label_font = ('Segoe UI', 8, 'bold')
@@ -7229,8 +7240,10 @@ class VSCodeQueueViewer(tk.Frame):
 
         def operand(side, title):
             heading(title)
-            source = tk.StringVar(value=old.get(side + '_source', 'Literal Text'))
-            menu(body, source, SEQUENT_COMPARE_SOURCES)
+            source = tk.StringVar(value=('Variable' if variables_only else
+                                         old.get(side + '_source', 'Literal Text')))
+            if not variables_only:
+                menu(body, source, SEQUENT_COMPARE_SOURCES)
             group = tk.Frame(body, bg=BG_PANEL)
             group.pack(fill=tk.X)
             value = str(old.get(side + '_value', ''))
@@ -7276,8 +7289,8 @@ class VSCodeQueueViewer(tk.Frame):
             render()
             controls[side] = (source, scope, state)
 
-        operand('left', 'EXPECTED TEXT / SOURCE A')
-        operand('right', 'ACTUAL TEXT / SOURCE B')
+        operand('left', 'VARIABLE A (EXPECTED)' if variables_only else 'EXPECTED TEXT / SOURCE A')
+        operand('right', 'VARIABLE B (ACTUAL)' if variables_only else 'ACTUAL TEXT / SOURCE B')
         heading('Comparison mode')
         mode = tk.StringVar(value=old.get('mode', 'Exact Match'))
         menu(body, mode, SEQUENT_COMPARE_MODES)
@@ -7344,13 +7357,14 @@ class VSCodeQueueViewer(tk.Frame):
         info.pack(fill=tk.X, pady=(8, 3))
 
         def collect():
-            action = {'type':'compare_text', 'mode':mode.get(), 'threshold':float(threshold.get()),
+            action = {'type': 'compare_variables' if variables_only else 'compare_text',
+                      'mode':mode.get(), 'threshold':float(threshold.get()),
                       'retry_count':int(retries.get()), 'retry_delay':float(retry_delay.get())}
             if not 0 <= action['retry_count'] <= 10 or not 0 <= action['retry_delay'] <= 60:
                 raise MacroExecutionError('Retry count must be 0–10, delay 0–60 seconds')
             for side, (kind, scope, state) in controls.items():
                 widget = state['widget']
-                action[side + '_source'] = kind.get()
+                action[side + '_source'] = 'Variable' if variables_only else kind.get()
                 action[side + '_scope'] = scope.get().lower()
                 action[side + '_value'] = (widget.get('1.0','end-1c') if isinstance(widget, tk.Text)
                                           else widget.get() if widget is not None else '')
@@ -7415,9 +7429,10 @@ class VSCodeQueueViewer(tk.Frame):
                 self.app.recorded_actions.insert(idx, action)
             self.app.display_actions_in_queue(self.app.recorded_actions)
             self.app.set_active_action_index(idx)
-            self.app.update_status('Compare Text & Branch saved', COLOR_SUCCESS)
+            self.app.update_status(('Compare Variables' if variables_only else 'Compare Text') + ' & Branch saved', COLOR_SUCCESS)
             self.close_sub_menu()
-        ModernButton(body,text='Save Changes' if edit_idx is not None else 'Add Compare Text & Branch',
+        ModernButton(body,text='Save Changes' if edit_idx is not None else
+                     ('Add Compare Variables & Branch' if variables_only else 'Add Compare Text & Branch'),
                      bg_color=COLOR_ACCENT,hover_color=COLOR_ACCENT_HOV,
                      command=save).pack(fill=tk.X,pady=(3,12))
 
@@ -11632,7 +11647,7 @@ No third-party packages or Windows drivers are required.
 ACTION_COLORS = {
     'move': '#497CA7', 'click': '#497CA7', 'drag': '#497CA7',
     'scroll': '#497CA7', 'key': '#8563B3', 'hotkey': '#8563B3',
-    'delay': '#6E7682', 'compare_text': '#B18A4B', 'if_var': '#B18A4B',
+    'delay': '#6E7682', 'compare_text': '#B18A4B', 'compare_variables': '#B18A4B', 'if_var': '#B18A4B',
     'goto': '#B18A4B', 'label': '#B18A4B', 'set_variable': '#39977F',
     'read_clipboard': '#39977F', 'find_text': '#497CA7',
     'find_image': '#497CA7', 'find_color': '#497CA7',
@@ -11672,7 +11687,7 @@ def action_keyframes(action):
         return [('Click', 0.0)]
     if kind == 'key':
         return [('Key', 0.0)]
-    if kind == 'compare_text':
+    if kind in ('compare_text', 'compare_variables'):
         return [('Compare', 0.0), ('Branch', 1.0)]
     if kind == 'delay':
         return [('Start', 0.0), ('End', 1.0)]
@@ -14596,7 +14611,10 @@ class BuiltInMacroApp:
                 return (f'{mode}: {target}' if target and mode in
                         ('Run Saved Macro', 'Jump to Label') else mode)
             return f'{name} | Found: {describe(found, found_target)} | Not found: {describe(missing, missing_target)}'
-        if act_type == 'compare_text':
+        if act_type in ('compare_text', 'compare_variables'):
+            if act_type == 'compare_variables':
+                return (f"variables.compare({action.get('left_value','')!r}, "
+                        f"{action.get('right_value','')!r}, {action.get('mode','Exact Match')})")
             left = action.get('left_source', 'Literal Text')
             right = action.get('right_source', 'Literal Text')
             return f"text.compare({left} vs {right}, {action.get('mode','Exact Match')})"
@@ -14737,7 +14755,7 @@ class BuiltInMacroApp:
 
     def get_action_color(self, action):
         act_type = action.get("type", "") if action else ""
-        if act_type in ("label", "goto", "if_var", "compare_text", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
+        if act_type in ("label", "goto", "if_var", "compare_text", "compare_variables", "read_clipboard", "type_variable", "prompt_input"): return SYNTAX_PURPLE
         if act_type in DYNAMIC_ACTION_TYPES: return SYNTAX_GREEN if act_type not in DYNAMIC_FLOW_TYPES else SYNTAX_PURPLE
         if act_type == "disclaimer": return SYNTAX_ORANGE
         if act_type in ("wait_pixel", "wait_text", "find_color", "find_text"): return COLOR_SUCCESS
