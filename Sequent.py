@@ -11644,6 +11644,10 @@ def preview_duration(action):
     if not isinstance(action, dict):
         return 0.35
     kind = action.get('type', '')
+    # The recorder samples movement roughly every 30 ms. Giving each point
+    # the generic 350 ms placeholder massively stretches real recordings.
+    if kind == 'move':
+        return 0.03  # preview spacing only; never changes playback speed
     try:
         if kind == 'delay':
             value = float(action.get('seconds', 1.0))
@@ -11674,6 +11678,54 @@ def action_keyframes(action):
         return [('Start', 0.0), ('End', 1.0)]
     return [('Event', 0.0)]
 
+
+
+# Exactly three lanes per expanded composition. A recorded mouse sample is
+# ONE point on a lane, never an entire new row/clip in the timeline.
+STUDIO_TRACKS = (
+    ('movement', 'Mouse Movement', '#70B7EF'),
+    ('clicks', 'Mouse Clicks', '#E1AB68'),
+    ('logic', 'Macro Logic', '#AC91DE'),
+)
+
+
+def studio_action_track_events(action):
+    """Return (track, 0..1 fraction, label) for one recorded action.
+
+    The original action is not changed. A drag spans two mouse tracks:
+    position endpoints and press/release discrete input events.
+    """
+    if not isinstance(action, dict):
+        return [('logic', 0.0, 'Event')]
+    kind = str(action.get('type', '')).lower()
+    if kind == 'move':
+        return [('movement', 0.0, 'Cursor position')]
+    if kind == 'drag':
+        return [('movement', 0.0, 'Drag start'),
+                ('movement', 1.0, 'Drag end'),
+                ('clicks', 0.0, 'Mouse down'),
+                ('clicks', 1.0, 'Mouse up')]
+    if kind in ('click', 'double_click', 'mouse_down', 'mouse_up', 'scroll', 'wheel'):
+        return [('clicks', 0.0, 'Scroll' if kind in ('scroll', 'wheel') else kind.replace('_', ' ').title())]
+    return [('logic', fraction, label) for label, fraction in action_keyframes(action)]
+
+
+def studio_track_events(actions):
+    """Full-fidelity event references on only three parallel visual tracks.
+
+    Each event carries its ORIGINAL action index so selection can inspect its
+    source JSON. Zoom-dependent marker clustering happens *only when drawn*.
+    """
+    tracks = {name: [] for name, _, _ in STUDIO_TRACKS}
+    seconds = 0.0
+    for index, action in enumerate(actions):
+        duration = preview_duration(action)
+        for name, fraction, label in studio_action_track_events(action):
+            tracks[name].append((seconds + duration * fraction, index, label))
+        seconds += duration
+    for points in tracks.values():
+        points.sort(key=lambda item: item[0])
+    return tracks
 
 def load_preset_actions(presets_dir, preset_name):
     """Read known local .json presets, without allowing path traversal."""
@@ -11719,13 +11771,17 @@ def preview_sequence(steps, presets_dir):
 
 
 class StudioTimeline(tk.Frame):
-    """Canvas-based chain timeline, nested preset actions, markers and scrub preview."""
+    """Three-lane macro timeline. Event diamonds share tracks, not rows.
 
-    LABEL_W = 154
+    Preset and chain JSON remain the single source of truth. No timeline input
+    executes a macro. Overlapping markers are clustered *only visually*.
+    """
+
+    LABEL_W = 178
     TOP = 35
     ROW_H = 44
-    ACTION_H = 28
-    MAX_DETAIL_ACTIONS = 80
+    TRACK_H = 39
+    MARKER_PIXEL_GAP = 7
 
     def __init__(self, parent, *, steps_getter, presets_dir_getter,
                  colors_getter, on_select, on_scrub):
@@ -11740,10 +11796,14 @@ class StudioTimeline(tk.Frame):
         self.expanded = set()
         self.selected_stage = None
         self.selected_action = None
+        self.selected_marker_info = None
         self.playhead = 0.0
         self.running_stage = -1
         self.plans = []
         self._hit = []
+        self._preview_key = None
+        self._preview_plans = []
+        self.last_drawn_marker_count = 0
         self.canvas = tk.Canvas(self, bg=colors['background'], bd=0,
                                 highlightthickness=0, relief='flat', cursor='crosshair')
         self.xbar = tk.Scrollbar(self, orient='horizontal', command=self.canvas.xview)
@@ -11763,20 +11823,20 @@ class StudioTimeline(tk.Frame):
         self.canvas.bind('<Configure>', lambda e: self.redraw(), add='+')
 
     def _mouse_wheel(self, event):
-        if event.state & 0x0004:  # Ctrl + wheel: zoom about the left edge.
+        if event.state & 0x0004:
             self.zoom(1 if event.delta > 0 else -1)
         else:
             self.canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
         return 'break'
 
     def zoom(self, step):
-        self.scale = min(240.0, max(12.0, self.scale * (1.24 if step > 0 else 1 / 1.24)))
+        self.scale = min(1500.0, max(0.06, self.scale * (1.45 if step > 0 else 1/1.45)))
         self.redraw()
 
     def fit(self):
         total = sum(plan['duration'] for plan in self.plans) or 4.0
         available = max(120, self.canvas.winfo_width() - self.LABEL_W - 70)
-        self.scale = max(12.0, min(180.0, available / total))
+        self.scale = max(0.06, min(1500.0, available / total))
         self.redraw()
         self.canvas.xview_moveto(0)
 
@@ -11787,66 +11847,145 @@ class StudioTimeline(tk.Frame):
             self.expanded.add(index)
         self.redraw()
 
-    def _paint_diamond(self, x, y, color, *, size=4):
+    def _get_plans(self):
+        # Cache preset parsing and keyframe indexing across scrub/zoom redraws.
+        # Detect saved file changes even if the chain list itself is unchanged.
+        steps = self.steps_getter()
+        folder = self.presets_dir_getter()
+        signatures = []
+        names = set()
+        for step in steps:
+            name = str(step.get('preset', ''))
+            names.add(name)
+            signatures.append((name, repr(step.get('loops')), repr(step.get('delay_after'))))
+        file_states = []
+        for name in sorted(names):
+            try:
+                stat = os.stat(os.path.join(folder, name + '.json'))
+                file_states.append((name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                file_states.append((name, None, None))
+        key = (os.path.realpath(folder), tuple(signatures), tuple(file_states))
+        if key != self._preview_key:
+            self._preview_plans = preview_sequence(steps, folder)
+            self._preview_key = key
+        return self._preview_plans
+
+    def _paint_diamond(self, x, y, color, *, size=4, outline=''):
         self.canvas.create_polygon(x, y-size, x+size, y, x, y+size, x-size, y,
-                                   fill=color, outline='')
+                                   fill=color, outline=outline)
+
+    def _paint_keyframes(self, plan, lane, y_center, lane_color, left_visible, right_visible):
+        """Paint one diamond per point if zoom allows, otherwise a density cluster.
+
+        This changes only paint density, never the underlying action list.
+        Every emitted hit target refers to an original saved action index.
+        """
+        import bisect
+        events = plan.get('_lane_events', {}).get(lane, ())
+        if not events:
+            return
+        times = plan['_lane_times'][lane]
+        local_l = max(0.0, (left_visible - self.LABEL_W) / self.scale - plan['start'])
+        local_r = (right_visible - self.LABEL_W) / self.scale - plan['start']
+        start = bisect.bisect_left(times, local_l - 12/self.scale)
+        stop = bisect.bisect_right(times, local_r + 12/self.scale)
+        # Pixel buckets represent overlapping markers. Zoom in to see each.
+        bucket = None
+        def paint(entry):
+            px, sample_index, label, count = entry
+            selected = plan['index'] == self.selected_stage and sample_index == self.selected_action
+            size = 6 if selected else 4
+            if count > 1:
+                size += 1
+            self._paint_diamond(px, y_center, '#FFFFFF' if selected else lane_color,
+                                size=size, outline=lane_color if selected else '')
+            # Don't draw counts over every dense bucket; that would recreate
+            # the same unreadable visual clutter we're avoiding. The inspector
+            # reports the precise overlap count when a cluster is selected.
+            note = dict(track=lane, label=label, clustered=count,
+                        action_index=sample_index, stage_index=plan['index'])
+            self._hit.append((px-6, y_center-13, px+13, y_center+11,
+                              plan['index'], sample_index, note))
+            self.last_drawn_marker_count += 1
+
+        for i in range(start, stop):
+            seconds, source_index, label = events[i]
+            px = self.LABEL_W + (plan['start']+seconds)*self.scale
+            bucket_id = int(px / self.MARKER_PIXEL_GAP)
+            if bucket is None or bucket[0] != bucket_id:
+                if bucket is not None:
+                    paint((bucket[1], bucket[2], bucket[3], bucket[4]))
+                bucket = [bucket_id, px, source_index, label, 1]
+            else:
+                bucket[4] += 1
+                # Preserve a selected original point when painting a dense group.
+                if source_index == self.selected_action and plan['index'] == self.selected_stage:
+                    bucket[2], bucket[3] = source_index, label
+        if bucket is not None:
+            paint((bucket[1], bucket[2], bucket[3], bucket[4]))
 
     def redraw(self):
         if not self.canvas.winfo_exists():
             return
         colors = self.colors_getter()
-        self.canvas.configure(bg=colors['background'])
         c = self.canvas
+        c.configure(bg=colors['background'])
         c.delete('all')
         self._hit = []
-        self.plans = preview_sequence(self.steps_getter(), self.presets_dir_getter())
+        self.last_drawn_marker_count = 0
+        self.plans = self._get_plans()
         total = sum(plan['duration'] for plan in self.plans)
-        content_w = max(c.winfo_width(), self.LABEL_W + 220 + total * self.scale)
+        content_w = max(c.winfo_width(), self.LABEL_W + 220 + total*self.scale)
         y = self.TOP
         rows = []
         for plan in self.plans:
-            height = self.ROW_H
-            if plan['index'] in self.expanded:
-                height += self.ACTION_H * min(len(plan['actions']), self.MAX_DETAIL_ACTIONS)
-                if len(plan['actions']) > self.MAX_DETAIL_ACTIONS:
-                    height += self.ACTION_H
+            height = self.ROW_H + (len(STUDIO_TRACKS) * self.TRACK_H if plan['index'] in self.expanded else 0)
             rows.append((plan, y, height))
             y += height
         content_h = max(c.winfo_height(), y + 34)
-        c.configure(scrollregion=(0, 0, content_w + 24, content_h))
-        # ruler and 0.5/1/2/5s graduated ticks
-        c.create_rectangle(0, 0, content_w + 24, self.TOP, fill=colors['panel'], outline='')
-        c.create_rectangle(0, self.TOP, self.LABEL_W, content_h, fill=colors['panel'], outline='')
-        c.create_text(13, 18, anchor='w', text='TRACK / COMPOSITION', fill=colors['muted'],
-                      font=('Segoe UI', 8, 'bold'))
-        tick = next((v for v in (0.5, 1, 2, 5, 10, 30, 60, 120, 300)
-                     if v * self.scale >= 48), 600)
-        for idx in range(min(400, int(total / tick) + 3)):
-            t = idx * tick
-            x = self.LABEL_W + t * self.scale
+        c.configure(scrollregion=(0, 0, content_w+24, content_h))
+        left_visible = c.canvasx(0)
+        right_visible = c.canvasx(c.winfo_width())
+        # Time ruler and composition/track column.
+        c.create_rectangle(0, 0, content_w+24, self.TOP,
+                           fill=colors['panel'], outline='')
+        c.create_rectangle(0, self.TOP, self.LABEL_W, content_h,
+                           fill=colors['panel'], outline='')
+        c.create_text(13, 18, anchor='w', text='COMPOSITION / TRACKS',
+                      fill=colors['muted'], font=('Segoe UI', 8, 'bold'))
+        tick = next((v for v in (0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1200, 3600, 7200, 18000)
+                     if v*self.scale >= 55), 36000)
+        start_tick = max(0, int((left_visible-self.LABEL_W)/self.scale/tick)-1)
+        end_tick = min(start_tick + 500, max(start_tick+1, int((right_visible-self.LABEL_W)/self.scale/tick)+3))
+        for index in range(start_tick, end_tick):
+            seconds = index*tick
+            x = self.LABEL_W + seconds*self.scale
             c.create_line(x, self.TOP, x, content_h, fill=colors['grid'], dash=(2, 5))
-            c.create_text(x + 4, 18, anchor='w', text=f'{t:g}s', fill=colors['muted'],
-                          font=('Consolas', 8))
+            c.create_text(x+4, 18, anchor='w', text=f'{seconds:g}s',
+                          fill=colors['muted'], font=('Consolas', 8))
         c.create_line(self.LABEL_W, 0, self.LABEL_W, content_h, fill=colors['border'])
+
         for plan, top, height in rows:
             idx = plan['index']
-            bg = colors['row'] if idx % 2 else colors['background']
-            c.create_rectangle(0, top, content_w, top+height, fill=bg, outline='')
-            c.create_rectangle(0, top, self.LABEL_W, top + self.ROW_H,
+            c.create_rectangle(0, top, content_w, top+height,
+                               fill=colors['row'] if idx%2 else colors['background'], outline='')
+            c.create_rectangle(0, top, self.LABEL_W, top+self.ROW_H,
                                fill=colors['panel'], outline=colors['grid'])
             selected = idx == self.selected_stage
             glyph = '▾' if idx in self.expanded else '▸'
-            c.create_text(10, top+22, anchor='w', text=glyph, fill=colors['accent'],
-                          font=('Segoe UI', 13, 'bold'))
-            stage_label = (plan['name'][:16] + '…') if len(plan['name']) > 17 else plan['name']
-            c.create_text(29, top+17, anchor='w', text=stage_label, fill=colors['text'],
-                          font=('Segoe UI', 9, 'bold'))
+            c.create_text(10, top+22, anchor='w', text=glyph,
+                          fill=colors['accent'], font=('Segoe UI', 13, 'bold'))
+            stage_label = (plan['name'][:17]+'…') if len(plan['name'])>18 else plan['name']
+            c.create_text(29, top+17, anchor='w', text=stage_label,
+                          fill=colors['text'], font=('Segoe UI', 9, 'bold'))
             c.create_text(29, top+32, anchor='w',
-                          text=f"{len(plan['actions'])} actions  ·  {plan['loops']}×",
+                          text=f"{len(plan['actions']):,} events  ·  {plan['loops']}×",
                           fill=colors['muted'], font=('Segoe UI', 8))
-            x0 = self.LABEL_W + plan['start'] * self.scale
-            x1 = x0 + plan['duration'] * self.scale
-            c.create_rectangle(x0+2, top+7, x1-2, top+37, width=2 if selected else 1,
+            x0 = self.LABEL_W + plan['start']*self.scale
+            x1 = x0 + plan['duration']*self.scale
+            c.create_rectangle(x0+2, top+7, x1-2, top+37,
+                               width=2 if selected else 1,
                                outline=colors['accent'] if selected else '#5A83AE',
                                fill='#344B69' if selected else '#304157')
             c.create_text(x0+11, top+21, anchor='w', text=stage_label,
@@ -11858,78 +11997,74 @@ class StudioTimeline(tk.Frame):
             if idx == self.running_stage:
                 c.create_rectangle(x0+2, top+7, x1-2, top+37,
                                    outline=colors['success'], width=3)
-            self._hit.append((x0, top, x1, top+self.ROW_H, idx, None))
-            self._hit.append((0, top, self.LABEL_W, top+self.ROW_H, idx, None))
+            self._hit.append((x0,top,x1,top+self.ROW_H,idx,None,None))
+            self._hit.append((0,top,self.LABEL_W,top+self.ROW_H,idx,None,None))
             if idx not in self.expanded:
                 continue
-            pos = x0
-            for j, action in enumerate(plan['actions'][:self.MAX_DETAIL_ACTIONS]):
-                action_top = top + self.ROW_H + j * self.ACTION_H
-                kind = str(action.get('type', 'action'))
-                duration = preview_duration(action)
-                ax0, ax1 = pos, pos + duration*self.scale
-                c.create_rectangle(0, action_top, self.LABEL_W, action_top+self.ACTION_H,
+            if '_lane_events' not in plan:
+                plan['_lane_events'] = studio_track_events(plan['actions'])
+                plan['_lane_times'] = {name: [event[0] for event in events]
+                                       for name, events in plan['_lane_events'].items()}
+            for track_index, (lane,label,lane_color) in enumerate(STUDIO_TRACKS):
+                track_top = top+self.ROW_H+track_index*self.TRACK_H
+                track_mid = track_top+self.TRACK_H/2
+                c.create_rectangle(0,track_top,content_w,track_top+self.TRACK_H,
+                                   fill=colors['row'] if track_index%2 else colors['background'],
+                                   outline='')
+                c.create_rectangle(0,track_top,self.LABEL_W,track_top+self.TRACK_H,
                                    fill=colors['panel'], outline=colors['grid'])
-                c.create_text(18, action_top+14, anchor='w',
-                              text=f'{j+1:02d}  {kind[:17]}', fill=colors['text'],
-                              font=('Consolas', 8))
-                # The first loop is expanded; repeated runs remain summarized in parent.
-                shown_right = max(ax0 + 5, min(ax1, x1-3))
-                if shown_right > ax0 + 4:
-                    color = ACTION_COLORS.get(kind, '#62758A')
-                    c.create_rectangle(ax0+2, action_top+5, shown_right-2, action_top+23,
-                                       fill=color, outline=(colors['accent'] if
-                                       (idx, j) == (self.selected_stage, self.selected_action)
-                                       else ''))
-                    for _, frac in action_keyframes(action):
-                        px = ax0 + 5 + max(0.0, shown_right - ax0 - 10) * frac
-                        self._paint_diamond(px, action_top+14, '#E6EDF7', size=3)
-                self._hit.append((0, action_top, self.LABEL_W, action_top+self.ACTION_H, idx, j))
-                self._hit.append((ax0, action_top, max(ax0+8, ax1), action_top+self.ACTION_H, idx, j))
-                pos += duration * self.scale
-            if len(plan['actions']) > self.MAX_DETAIL_ACTIONS:
-                c.create_text(20, top+height-14, anchor='w',
-                              text=f"… {len(plan['actions'])-self.MAX_DETAIL_ACTIONS} more actions",
-                              fill=colors['muted'], font=('Segoe UI', 8))
+                count = len(plan['_lane_events'][lane])
+                c.create_rectangle(12, track_mid-5, 17, track_mid+5,
+                                   fill=lane_color, outline='')
+                c.create_text(25,track_mid-5,anchor='w',text=label,
+                              fill=colors['text'],font=('Segoe UI', 9))
+                c.create_text(self.LABEL_W-9,track_mid+9,anchor='e',
+                              text=f'{count:,}',fill=colors['muted'],font=('Consolas', 8))
+                c.create_line(self.LABEL_W, track_mid, content_w, track_mid,
+                              fill=colors['grid'], dash=(2, 4))
+                self._hit.append((0,track_top,self.LABEL_W,track_top+self.TRACK_H,idx,None,None))
+                self._paint_keyframes(plan,lane,track_mid,lane_color,
+                                      left_visible,right_visible)
         if not self.plans:
-            c.create_text(self.LABEL_W + 26, self.TOP + 40, anchor='w',
+            c.create_text(self.LABEL_W+26,self.TOP+40,anchor='w',
                           text='No clips yet. Select a preset and add a stage.',
-                          fill=colors['muted'], font=('Segoe UI', 10))
-        marker_x = self.LABEL_W + self.playhead * self.scale
-        c.create_line(marker_x, 7, marker_x, content_h, fill='#F27A75', width=2,
+                          fill=colors['muted'],font=('Segoe UI', 10))
+        marker_x = self.LABEL_W+self.playhead*self.scale
+        c.create_line(marker_x,7,marker_x,content_h,fill='#F27A75',width=2,
                       tags=('studio_playhead',))
-        c.create_polygon(marker_x-7, 7, marker_x+7, 7, marker_x, 18,
-                         fill='#F27A75', outline='', tags=('studio_playhead',))
+        c.create_polygon(marker_x-7,7,marker_x+7,7,marker_x,18,
+                         fill='#F27A75',outline='',tags=('studio_playhead',))
 
     def _scrub(self, event):
         pos = self.canvas.canvasx(event.x)
-        self.playhead = max(0.0, (pos - self.LABEL_W) / self.scale)
+        self.playhead = max(0.0,(pos-self.LABEL_W)/self.scale)
         self.redraw()
         self.on_scrub(self.playhead)
 
     def _click(self, event):
-        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        x,y = self.canvas.canvasx(event.x),self.canvas.canvasy(event.y)
         if y < self.TOP:
             self._scrub(event)
             return 'break'
-        for x0,y0,x1,y1,idx,j in reversed(self._hit):
+        for x0,y0,x1,y1,idx,j,note in reversed(self._hit):
             if x0 <= x <= x1 and y0 <= y <= y1:
-                self.selected_stage, self.selected_action = idx, j
+                self.selected_stage,self.selected_action = idx,j
+                self.selected_marker_info = note
                 self.redraw()
-                self.on_select(idx, j)
+                self.on_select(idx,j)
                 return 'break'
         return 'break'
 
-    def _double_click(self, event):
-        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        for x0,y0,x1,y1,idx,j in reversed(self._hit):
+    def _double_click(self,event):
+        x,y = self.canvas.canvasx(event.x),self.canvas.canvasy(event.y)
+        for x0,y0,x1,y1,idx,j,note in reversed(self._hit):
             if j is None and x0 <= x <= x1 and y0 <= y <= y1:
                 self.toggle_expand(idx)
                 return 'break'
         return 'break'
 
-    def _scrub_drag(self, event):
-        if self.canvas.canvasy(event.y) < self.TOP:
+    def _scrub_drag(self,event):
+        if self.canvas.canvasy(event.y)<self.TOP:
             self._scrub(event)
             return 'break'
 
@@ -13827,7 +13962,7 @@ class BuiltInMacroApp:
                   activebackground=BG_HOVER, bd=0, relief='flat').pack(
                       fill=tk.X, pady=(6, 8), ipady=5)
         self.studio_action_detail = tk.Label(
-            config, text='Double-click a clip to inspect its actions.',
+            config, text='Double-click a clip to expand three tracks. Click diamonds to inspect events.',
             anchor='nw', justify=tk.LEFT, bg=BG_PANEL, fg=TEXT_MUTED,
             wraplength=238, font=('Consolas', 8))
         self.studio_action_detail.pack(fill=tk.X, pady=(5, 10))
@@ -13883,7 +14018,7 @@ class BuiltInMacroApp:
                 'success': COLOR_SUCCESS},
             on_select=self.studio_select, on_scrub=self.studio_scrub)
         self.studio_timeline.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
-        tk.Label(left, text='Double-click clip: expand actions    •    Click ruler: preview scrub (no execution)    •    Ctrl + wheel: zoom    •    Timing is estimated',
+        tk.Label(left, text='Double-click clip: three tracks    •    Click diamonds: inspect events    •    Ruler: preview only    •    Ctrl + wheel: zoom    •    Dense markers cluster visually',
                  bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  anchor='w').pack(fill=tk.X, padx=13, pady=(0, 8))
         self.refresh_chain_ui()
@@ -13906,8 +14041,9 @@ class BuiltInMacroApp:
             entry.insert(0, str(value))
         if action_index is None:
             self.studio_action_detail.configure(
-                text='Double-click the clip to reveal its actions.\n'
-                     'Select an action row to inspect source fields.')
+                text='Double-click the clip to show Mouse Movement,\n'
+                     'Mouse Clicks, and Macro Logic tracks.\n'
+                     'Select a diamond to inspect its original event.')
         else:
             actions, error = load_preset_actions(self.presets_dir, stage['preset'])
             if 0 <= action_index < len(actions):
@@ -13915,8 +14051,16 @@ class BuiltInMacroApp:
                 details = json.dumps(action, indent=2, ensure_ascii=False)
                 if len(details) > 450:
                     details = details[:450] + '\n… (preview shortened)'
+                note = getattr(self.studio_timeline, 'selected_marker_info', None)
+                prefix = ''
+                if note and note.get('action_index') == action_index and note.get('stage_index') == index:
+                    track_title = dict(movement='Mouse Movement', clicks='Mouse Clicks',
+                                       logic='Macro Logic').get(note['track'], note['track'])
+                    prefix = f"{track_title}: {note['label']}\n"
+                    if note['clustered'] > 1:
+                        prefix += f"{note['clustered']:,} markers overlap here — zoom in to inspect individually.\n"
                 self.studio_action_detail.configure(
-                    text=f'Action {action_index + 1}: {action.get("type", "unknown")}\n'
+                    text=prefix+f'Action {action_index + 1}: {action.get("type", "unknown")}\n'
                          + details)
             else:
                 self.studio_action_detail.configure(text=error or 'Action unavailable')
