@@ -6056,7 +6056,7 @@ class VSCodeQueueViewer(tk.Frame):
             ("Return From Macro", "Return a text value to the calling macro.", "RM"),
             ("If Variable Condition", "Branch based on a variable comparison.", "IF"),
             ("Compare Text & Branch", "Validate words or paragraphs, show differences, and route results.", "CT"),
-            ("Compare Variables & Branch", "Compare two Local/Global variables and branch on the result.", "CV"),
+            ("Compare Variables", "IF two variables match, THEN choose what happens; otherwise continue.", "CV"),
             ("Gate Check", "Stop, switch, or continue based on variable status.", "GC"),
             ("Label Marker", "Create a named location in the queue.", "LM"),
             ("Jump to Label", "Continue execution at a named label.", "JL"),
@@ -6792,7 +6792,7 @@ class VSCodeQueueViewer(tk.Frame):
             "disclaimer": "Disclaimer / Warning",
             "if_var": "If Variable Condition",
             "compare_text": "Compare Text & Branch",
-            "compare_variables": "Compare Variables & Branch",
+            "compare_variables": "Compare Variables",
             "read_clipboard": "Read Clipboard",
             "clip_fallback": "Clipboard Branch / Fallback",
             "gate_check": "Gate Check",
@@ -7168,7 +7168,7 @@ class VSCodeQueueViewer(tk.Frame):
             "Disclaimer / Warning": self._render_disclaimer_view,
             "If Variable Condition": self._render_if_var_view,
             "Compare Text & Branch": self._render_compare_text_view,
-            "Compare Variables & Branch": self._render_compare_variables_view,
+            "Compare Variables": self._render_compare_variables_view,
             "Read Clipboard": self._render_read_clipboard_view,
             "Clipboard Branch / Fallback": self._render_clipboard_fallback_view,
             "Request Input": self._render_request_input_view,
@@ -7206,7 +7206,286 @@ class VSCodeQueueViewer(tk.Frame):
         return var
 
     def _render_compare_variables_view(self, line_num, edit_idx=None):
-        return self._render_compare_text_view(line_num, edit_idx, variables_only=True)
+        """Compact IF / THEN / ELSE editor for variable-to-variable comparisons.
+
+        Stored actions intentionally reuse the existing compare_variables JSON
+        fields and execution engine. Advanced/legacy branches remain editable.
+        """
+        body = self.action_content_frame
+        old = (self.app.recorded_actions[edit_idx] if edit_idx is not None
+               and 0 <= edit_idx < len(self.app.recorded_actions) else {})
+        if old.get('type') != 'compare_variables':
+            old = {}
+
+        def title(parent, name, *, muted=False):
+            tk.Label(parent, text=name, bg=BG_PANEL,
+                     fg=TEXT_MUTED if muted else TEXT_PRIMARY,
+                     font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill=tk.X, pady=(8, 3))
+
+        def note(parent, message):
+            tk.Label(parent, text=message, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), justify='left', anchor='w',
+                     wraplength=425).pack(fill=tk.X, pady=(0, 4))
+
+        def dropdown(parent, state, values):
+            widget = tk.OptionMenu(parent, state, *values)
+            widget.config(bg=BG_INPUT, fg=TEXT_PRIMARY, bd=0, cursor='hand2',
+                          highlightthickness=1, highlightbackground=BG_BORDER)
+            widget['menu'].config(bg=BG_INPUT, fg=TEXT_PRIMARY,
+                                  activebackground=COLOR_ACCENT)
+            widget.pack(fill=tk.X, pady=(0, 4))
+            return widget
+
+        def textfield(parent, value=''):
+            widget = tk.Entry(parent, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                              font=('Consolas', 9), insertbackground=TEXT_PRIMARY,
+                              highlightthickness=1, highlightbackground=BG_BORDER, bd=0)
+            widget.insert(0, str(value))
+            widget.pack(fill=tk.X, ipady=5, pady=(0, 4))
+            return widget
+
+        title(body, 'IF  ·  Compare these variables')
+        note(body, 'Enter variable names, not their values. Sequent reads both when this action runs.')
+        sources = {}
+        for side, label in (('left', 'Variable A'), ('right', 'Variable B')):
+            row = tk.Frame(body, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=(1, 2))
+            name_box = tk.Frame(row, bg=BG_PANEL)
+            name_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+            tk.Label(name_box, text=label, bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8, 'bold'), anchor='w').pack(fill=tk.X)
+            name = textfield(name_box, old.get(side + '_value', ''))
+            scope_box = tk.Frame(row, bg=BG_PANEL, width=100, height=58)
+            scope_box.pack(side=tk.RIGHT)
+            scope_box.pack_propagate(False)
+            tk.Label(scope_box, text='Scope', bg=BG_PANEL, fg=TEXT_MUTED,
+                     font=('Segoe UI', 8), anchor='w').pack(fill=tk.X)
+            scope = tk.StringVar(master=body, value=str(old.get(side + '_scope', 'local')).title())
+            dropdown(scope_box, scope, ('Local', 'Global'))
+            sources[side] = (name, scope)
+            if side == 'left':
+                tk.Label(body, text='equals', bg=BG_PANEL, fg=COLOR_ACCENT,
+                         font=('Segoe UI', 9, 'bold'), anchor='center').pack(fill=tk.X, pady=(0, 2))
+
+        ACTION_CHOICES = ('Set Variable', 'Continue', 'Jump to Label',
+                          'Run Saved Macro', 'Stop Macro', 'Stop with Error')
+
+        def outcome_editor(parent, key, default):
+            """Only display inputs relevant to the chosen branch behavior."""
+            chosen = tk.StringVar(master=body, value=old.get(key, default))
+            if chosen.get() not in ACTION_CHOICES:
+                chosen.set(default)
+            dropdown(parent, chosen, ACTION_CHOICES)
+            dynamic = tk.Frame(parent, bg=BG_PANEL)
+            dynamic.pack(fill=tk.X)
+            previous_target = str(old.get(key + '_target', ''))
+            previous_scope = str(old.get(key + '_scope', 'local')).lower()
+            right_name = str(old.get('right_value', ''))
+            left_name = str(old.get('left_value', ''))
+            initial_choice = ('Variable B' if not previous_target or
+                              (previous_target == right_name and previous_scope ==
+                               str(old.get('right_scope', 'local')).lower()) else
+                              'Variable A' if previous_target == left_name and
+                              previous_scope == str(old.get('left_scope', 'local')).lower() else
+                              'Other variable')
+            target_choice = tk.StringVar(master=body, value=initial_choice)
+            value_from_old = str(old.get(key + '_value', ' ' if key == 'on_match' else '${result}'))
+            value_kind = tk.StringVar(master=body, value=('One space' if value_from_old == ' ' else
+                                              'Empty text' if value_from_old == '' else
+                                              'Custom text'))
+            custom_value = value_from_old if value_kind.get() == 'Custom text' else ''
+            other_target = previous_target if initial_choice == 'Other variable' else ''
+            other_scope = tk.StringVar(master=body, value=previous_scope.title())
+            state = {'target':None, 'value':None}
+
+            def render(*_):
+                # Keep custom text when switching between value representations.
+                if state['value'] is not None:
+                    nonlocal_custom[0] = state['value'].get()
+                if state['target'] is not None:
+                    nonlocal_target[0] = state['target'].get()
+                for item in dynamic.winfo_children(): item.destroy()
+                state['target'] = None
+                state['value'] = None
+                behavior = chosen.get()
+                if behavior == 'Set Variable':
+                    tk.Label(dynamic, text='Change', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    dropdown(dynamic, target_choice, ('Variable B', 'Variable A', 'Other variable'))
+                    if target_choice.get() == 'Other variable':
+                        state['target'] = textfield(dynamic, nonlocal_target[0])
+                        tk.Label(dynamic, text='Destination scope', bg=BG_PANEL,
+                                 fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+                        dropdown(dynamic, other_scope, ('Local', 'Global'))
+                    tk.Label(dynamic, text='To', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    dropdown(dynamic, value_kind, ('One space', 'Empty text', 'Custom text'))
+                    if value_kind.get() == 'Custom text':
+                        state['value'] = textfield(dynamic, nonlocal_custom[0])
+                    else:
+                        note(dynamic, ('Stores one literal space character (" ").' if
+                              value_kind.get() == 'One space' else
+                              'Clears the variable completely (empty string).'))
+                elif behavior in ('Jump to Label', 'Run Saved Macro'):
+                    tk.Label(dynamic, text='Label name' if behavior == 'Jump to Label'
+                             else 'Saved macro name', bg=BG_PANEL, fg=TEXT_MUTED,
+                             font=('Segoe UI', 8)).pack(anchor='w')
+                    state['target'] = textfield(dynamic, nonlocal_target[0])
+                # Continue/Stop/Stop with Error require no extra fields.
+
+            nonlocal_custom = [custom_value]
+            nonlocal_target = [other_target if chosen.get() == 'Set Variable' else previous_target]
+            chosen.trace_add('write', render)
+            target_choice.trace_add('write', render)
+            value_kind.trace_add('write', render)
+            render()
+
+            def read():
+                behavior = chosen.get()
+                target = ''
+                scope = 'local'
+                value = ''
+                if behavior == 'Set Variable':
+                    selection = target_choice.get()
+                    if selection in ('Variable A', 'Variable B'):
+                        side = 'left' if selection == 'Variable A' else 'right'
+                        target = sources[side][0].get().strip()
+                        scope = sources[side][1].get().lower()
+                    else:
+                        target = state['target'].get().strip() if state['target'] else ''
+                        scope = other_scope.get().lower()
+                    value = (' ' if value_kind.get() == 'One space' else
+                             '' if value_kind.get() == 'Empty text' else
+                             state['value'].get() if state['value'] else nonlocal_custom[0])
+                elif behavior in ('Jump to Label', 'Run Saved Macro'):
+                    target = state['target'].get().strip() if state['target'] else ''
+                return behavior, target, value, scope
+            return read, chosen
+
+        title(body, 'THEN  ·  When they match')
+        note(body, 'What should happen when Variable A equals Variable B?')
+        on_match, match_kind = outcome_editor(body, 'on_match', 'Set Variable')
+        title(body, 'ELSE  ·  When they do not match')
+        note(body, 'Continue leaves both variables unchanged.')
+        on_mismatch, mismatch_kind = outcome_editor(body, 'on_mismatch', 'Continue')
+
+        advanced = tk.Frame(body, bg=BG_PANEL)
+        def toggle_advanced():
+            if advanced.winfo_manager(): advanced.pack_forget()
+            else: advanced.pack(fill=tk.X, pady=(5, 8), after=advanced_button)
+        advanced_button = ModernButton(body, text='▸ Advanced options (optional)',
+                                        bg_color=BG_BORDER, hover_color=BG_HOVER,
+                                        command=toggle_advanced)
+        advanced_button.pack(fill=tk.X, pady=(9, 4))
+        title(advanced, 'How to compare')
+        note(advanced, 'Exact Match checks every character, including spaces and capitalization.')
+        mode = tk.StringVar(master=body, value=old.get('mode', 'Exact Match'))
+        dropdown(advanced, mode, SEQUENT_COMPARE_MODES)
+        title(advanced, 'If the variable cannot be read')
+        note(advanced, 'Missing variables are errors, not mismatches.')
+        on_error, error_kind = outcome_editor(advanced, 'on_error', 'Stop with Error')
+        title(advanced, 'Optional text adjustments')
+        flags = {}
+        for key, caption in (('ignore_case', 'Ignore capitalization'),
+                             ('trim_lines', 'Trim start/end of each line'),
+                             ('normalize_whitespace', 'Collapse repeated spaces'),
+                             ('ignore_line_breaks', 'Ignore line breaks')):
+            state = tk.BooleanVar(master=body, value=bool(old.get(key, False)))
+            tk.Checkbutton(advanced, text=caption, variable=state, bg=BG_PANEL,
+                           fg=TEXT_PRIMARY, selectcolor=BG_INPUT,
+                           activebackground=BG_PANEL, activeforeground=TEXT_PRIMARY,
+                           font=('Segoe UI', 9)).pack(anchor='w')
+            flags[key] = state
+        tk.Label(advanced, text='Similarity percentage (only for Similarity mode)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        threshold = textfield(advanced, old.get('threshold', 95))
+        tk.Label(advanced, text='Retry missing/invalid inputs (0–10 attempts)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        retries = textfield(advanced, old.get('retry_count', 0))
+        tk.Label(advanced, text='Seconds between retries (0–60)',
+                 bg=BG_PANEL, fg=TEXT_MUTED, font=('Segoe UI', 8)).pack(anchor='w')
+        retry_delay = textfield(advanced, old.get('retry_delay', 0.25))
+        if (mode.get() != 'Exact Match' or
+            error_kind.get() != 'Stop with Error' or
+            int(old.get('retry_count', 0) or 0) or
+            any(bool(old.get(k)) for k in flags)):
+            advanced.pack(fill=tk.X, pady=(5, 8), after=advanced_button)
+
+        message = tk.Label(body, text='', bg=BG_PANEL, fg=COLOR_DANGER,
+                           font=('Segoe UI', 8), wraplength=425, justify='left')
+        message.pack(fill=tk.X, pady=(4, 5))
+
+        def collect():
+            # Editing must preserve any other fields saved by older versions.
+            action = dict(old)
+            action.update(type='compare_variables', mode=mode.get(),
+                          threshold=float(threshold.get()), retry_count=int(retries.get()),
+                          retry_delay=float(retry_delay.get()))
+            if not 0 <= action['retry_count'] <= 10 or not 0 <= action['retry_delay'] <= 60:
+                raise MacroExecutionError('Retry count must be 0–10 and retry delay 0–60 seconds')
+            for side, (name, scope) in sources.items():
+                bare, actual_scope = variable_identity(name.get().strip(), scope.get())
+                action[side + '_source'] = 'Variable'
+                action[side + '_value'] = bare
+                action[side + '_scope'] = actual_scope
+            for key, state in flags.items(): action[key] = state.get()
+            for branch, reader in (('on_match', on_match),
+                                   ('on_mismatch', on_mismatch), ('on_error', on_error)):
+                behavior, target, value, scope = reader()
+                action[branch] = behavior
+                action[branch + '_target'] = target
+                action[branch + '_value'] = value
+                action[branch + '_scope'] = scope
+                sequent_compare_outcome(action, branch)
+            sequent_compare_text('test', 'test', mode=action['mode'],
+                                 threshold=action['threshold'])
+            return action
+
+        def preview():
+            try:
+                action = collect()
+                a = sequent_compare_resolve(self.app, action, 'left')
+                b = sequent_compare_resolve(self.app, action, 'right')
+                result = sequent_compare_text(a, b, mode=action['mode'],
+                           threshold=action['threshold'],
+                           **{key: flag.get() for key, flag in flags.items()})
+                matched = result['matched']
+                response = action['on_match'] if matched else action['on_mismatch']
+                message.config(text=('MATCH — ' if matched else 'NO MATCH — ') +
+                               response + ' would run. Preview makes no changes.',
+                               fg=COLOR_SUCCESS if matched else COLOR_DANGER)
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                message.config(text='Cannot preview: ' + str(exc), fg=COLOR_DANGER)
+
+        ModernButton(body, text='Check current values (preview only)',
+                     bg_color=BG_BORDER, hover_color=BG_HOVER,
+                     command=preview).pack(fill=tk.X, pady=(4, 5))
+        if edit_idx is None:
+            title(body, 'Insert action')
+            position = tk.StringVar(master=body, value=f'Before Line {line_num}')
+            dropdown(body, position, (f'Before Line {line_num}', f'After Line {line_num}'))
+
+        def save():
+            try:
+                action = collect()
+            except (MacroExecutionError, ValueError, TypeError, OSError) as exc:
+                message.config(text=str(exc), fg=COLOR_DANGER)
+                return
+            if edit_idx is not None:
+                idx = edit_idx
+                self.app.recorded_actions[idx] = action
+            else:
+                after = position.get().startswith('After')
+                idx = 0 if line_num <= 1 else (line_num - 1 if after else line_num - 2)
+                idx = max(0, min(idx, len(self.app.recorded_actions)))
+                self.app.recorded_actions.insert(idx, action)
+            self.app.display_actions_in_queue(self.app.recorded_actions)
+            self.app.set_active_action_index(idx)
+            self.app.update_status('Compare Variables saved', COLOR_SUCCESS)
+            self.close_sub_menu()
+        ModernButton(body, text='Save Changes' if edit_idx is not None else 'Add Compare Variables',
+                     bg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOV,
+                     command=save).pack(fill=tk.X, pady=(3, 12))
 
     def _render_compare_text_view(self, line_num, edit_idx=None, variables_only=False):
         """Editable, paragraph-friendly Compare Text & Branch action."""
